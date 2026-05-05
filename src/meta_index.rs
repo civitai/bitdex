@@ -18,7 +18,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use roaring::RoaringBitmap;
 
 use crate::cache::CanonicalClause;
-use crate::query::SortDirection;
+use crate::query::{FilterClause, SortDirection};
 
 /// A cache/bound entry ID. Sequential allocation, recycled on eviction.
 pub type CacheEntryId = u32;
@@ -59,6 +59,36 @@ struct EntryRegistration {
     clause_keys: Vec<ClauseKey>,
     field_keys: Vec<FieldKey>,
     sort_key: Option<SortKey>,
+}
+
+/// Collect all leaf field names from a FilterClause tree recursively.
+///
+/// Compound clauses (And/Or/Not) have an empty `field` in their CanonicalClause
+/// representation, so they only register under FieldKey(""). This helper walks
+/// the actual FilterClause tree to extract the real leaf field names so we can
+/// register compound-clause entries under the fields they actually reference.
+pub fn collect_leaf_fields(clause: &FilterClause, out: &mut HashSet<String>) {
+    match clause {
+        FilterClause::Eq(f, _)
+        | FilterClause::NotEq(f, _)
+        | FilterClause::In(f, _)
+        | FilterClause::NotIn(f, _)
+        | FilterClause::Gt(f, _)
+        | FilterClause::Gte(f, _)
+        | FilterClause::Lt(f, _)
+        | FilterClause::Lte(f, _)
+        | FilterClause::IsNull(f)
+        | FilterClause::IsNotNull(f)
+        | FilterClause::BucketBitmap { field: f, .. } => {
+            out.insert(f.clone());
+        }
+        FilterClause::Not(inner) => collect_leaf_fields(inner, out),
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            for c in parts {
+                collect_leaf_fields(c, out);
+            }
+        }
+    }
 }
 
 /// Meta-index: maps filter/sort components to sets of cache entry IDs.
@@ -113,12 +143,18 @@ impl MetaIndex {
     /// Register a cache/bound entry with the meta-index.
     ///
     /// `filter_clauses` are the canonical filter key components.
+    /// `original_filter_clauses` is the raw FilterClause tree (if available).
+    ///   When provided, leaf fields from compound clauses (And/Or/Not) are
+    ///   also registered under their real field names, not just FieldKey("").
+    ///   Pass `None` for legacy callers that don't have the original tree
+    ///   (e.g. `form_and_store`, restored entries pre-B8).
     /// `sort_field` and `direction` are the sort specification (if any).
     ///
     /// Returns the allocated entry ID.
     pub fn register(
         &mut self,
         filter_clauses: &[CanonicalClause],
+        original_filter_clauses: Option<&[FilterClause]>,
         sort_field: Option<&str>,
         sort_direction: Option<SortDirection>,
     ) -> CacheEntryId {
@@ -144,6 +180,28 @@ impl MetaIndex {
                     .or_default()
                     .insert(id);
                 field_keys.push(fk);
+            }
+        }
+
+        // Additionally walk leaf fields from the original FilterClause tree so
+        // compound clauses (which have field="" in canonical form) get registered
+        // under their real inner field names. Write-path lookups use field names,
+        // so without this, mutations on fields inside Not(And(In(f1), In(f2)))
+        // never reach entries that reference those fields.
+        if let Some(orig) = original_filter_clauses {
+            let mut leaf_fields = HashSet::new();
+            for clause in orig {
+                collect_leaf_fields(clause, &mut leaf_fields);
+            }
+            for field in leaf_fields {
+                if seen_fields.insert(field.clone()) {
+                    let fk = FieldKey(field);
+                    self.field_bitmaps
+                        .entry(fk.clone())
+                        .or_default()
+                        .insert(id);
+                    field_keys.push(fk);
+                }
             }
         }
 
@@ -305,10 +363,19 @@ impl MetaIndex {
 
     /// Register an entry with a specific ID (for restoring from disk).
     /// Updates next_id if needed. Does NOT allocate from free_ids.
+    ///
+    /// `original_filter_clauses`: pass `None` here for now — the FilterClause
+    /// tree is not yet persisted in meta.bin (B8 will add that). On restore,
+    /// only canonical-clause field registration happens. Leaf-field registration
+    /// Compound clauses with `field=""` register under FieldKey(""); when the
+    /// caller has the restored `FilterClause` tree (B8 V2 meta.bin), pass it as
+    /// `original_clauses` so leaf fields of compound shapes are also registered
+    /// — matching the live `register()` path. V1 meta.bin and tests pass `None`.
     pub fn register_with_id(
         &mut self,
         id: CacheEntryId,
         filter_clauses: &[CanonicalClause],
+        original_clauses: Option<&[crate::query::FilterClause]>,
         sort_field: Option<&str>,
         sort_direction: Option<SortDirection>,
     ) {
@@ -336,6 +403,28 @@ impl MetaIndex {
                     .or_default()
                     .insert(id);
                 field_keys.push(fk);
+            }
+        }
+
+        // B4-equivalent leaf-field walk for restore: when the caller persisted
+        // the FilterClause tree (B8 V2), extract every leaf field name and
+        // register it. Without this, compound shapes restored from disk would
+        // only register the canonical-empty-string FieldKey and be invisible
+        // to write-path lookups.
+        if let Some(originals) = original_clauses {
+            let mut leaves = HashSet::new();
+            for clause in originals {
+                collect_leaf_fields(clause, &mut leaves);
+            }
+            for field in leaves {
+                if seen_fields.insert(field.clone()) {
+                    let fk = FieldKey(field);
+                    self.field_bitmaps
+                        .entry(fk.clone())
+                        .or_default()
+                        .insert(id);
+                    field_keys.push(fk);
+                }
             }
         }
 
@@ -468,6 +557,7 @@ mod tests {
 
         let id = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -494,8 +584,8 @@ mod tests {
     fn test_deregister_frees_id() {
         let mut mi = MetaIndex::new();
 
-        let id0 = mi.register(&[clause("nsfwLevel", "1")], None, None);
-        let id1 = mi.register(&[clause("nsfwLevel", "2")], None, None);
+        let id0 = mi.register(&[clause("nsfwLevel", "1")], None, None, None);
+        let id1 = mi.register(&[clause("nsfwLevel", "2")], None, None, None);
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
 
@@ -503,7 +593,7 @@ mod tests {
         assert_eq!(mi.entry_count(), 1);
 
         // Recycled ID should be reused
-        let id2 = mi.register(&[clause("onSite", "true")], None, None);
+        let id2 = mi.register(&[clause("onSite", "true")], None, None, None);
         assert_eq!(id2, 0); // recycled
     }
 
@@ -513,6 +603,7 @@ mod tests {
 
         let id = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -533,11 +624,13 @@ mod tests {
 
         let id_desc = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
         let id_asc = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Asc),
         );
@@ -555,6 +648,7 @@ mod tests {
         // Entry 0: nsfwLevel=1, sort=reactionCount Desc
         let id0 = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -562,6 +656,7 @@ mod tests {
         // Entry 1: nsfwLevel=1 + onSite=true, sort=reactionCount Desc
         let id1 = mi.register(
             &[clause("nsfwLevel", "1"), clause("onSite", "true")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -569,6 +664,7 @@ mod tests {
         // Entry 2: nsfwLevel=2, sort=reactionCount Desc
         let _id2 = mi.register(
             &[clause("nsfwLevel", "2")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -591,6 +687,7 @@ mod tests {
         // Entry 0: nsfwLevel=1 only
         let id0 = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -598,6 +695,7 @@ mod tests {
         // Entry 1: nsfwLevel=1 + onSite=true
         let id1 = mi.register(
             &[clause("nsfwLevel", "1"), clause("onSite", "true")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -624,6 +722,7 @@ mod tests {
 
         mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -643,6 +742,7 @@ mod tests {
 
         mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -663,16 +763,19 @@ mod tests {
         // Three entries all have nsfwLevel=1 but different sort fields
         let id0 = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
         let id1 = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("commentCount"),
             Some(SortDirection::Desc),
         );
         let id2 = mi.register(
             &[clause("nsfwLevel", "1")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Asc),
         );
@@ -695,6 +798,7 @@ mod tests {
         let mut mi = MetaIndex::new();
         mi.register(
             &[clause("nsfwLevel", "1"), clause("onSite", "true")],
+            None,
             Some("reactionCount"),
             Some(SortDirection::Desc),
         );
@@ -705,22 +809,22 @@ mod tests {
     fn test_id_recycling_order() {
         let mut mi = MetaIndex::new();
 
-        let id0 = mi.register(&[clause("a", "1")], None, None);
-        let id1 = mi.register(&[clause("b", "2")], None, None);
-        let id2 = mi.register(&[clause("c", "3")], None, None);
+        let id0 = mi.register(&[clause("a", "1")], None, None, None);
+        let id1 = mi.register(&[clause("b", "2")], None, None, None);
+        let id2 = mi.register(&[clause("c", "3")], None, None, None);
 
         // Deregister id1 and id0
         mi.deregister(id1);
         mi.deregister(id0);
 
         // Next allocations should reuse freed IDs (LIFO from free_ids)
-        let id3 = mi.register(&[clause("d", "4")], None, None);
-        let id4 = mi.register(&[clause("e", "5")], None, None);
+        let id3 = mi.register(&[clause("d", "4")], None, None, None);
+        let id4 = mi.register(&[clause("e", "5")], None, None, None);
         assert_eq!(id3, id0); // id0 was pushed last, popped first
         assert_eq!(id4, id1);
 
         // Next allocation should be fresh
-        let id5 = mi.register(&[clause("f", "6")], None, None);
+        let id5 = mi.register(&[clause("f", "6")], None, None, None);
         assert_eq!(id5, 3); // next_id was 3 after id0,id1,id2
         let _ = id2; // suppress warning
     }

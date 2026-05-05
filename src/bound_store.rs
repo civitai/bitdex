@@ -25,11 +25,12 @@ use roaring::RoaringBitmap;
 use crate::cache::CanonicalClause;
 use crate::error::{BitdexError, Result};
 use crate::meta_index::CacheEntryId;
-use crate::query::SortDirection;
+use crate::query::{FilterClause, SortDirection};
 
 // ── Meta File Format ────────────────────────────────────────────────────────
 //
-// [u32 version = 1]
+// V1: [u32 version = 1]
+// V2: [u32 version = 2]
 // [u32 num_entries]
 // [entries: N × {
 //     u32 entry_id
@@ -43,12 +44,17 @@ use crate::query::SortDirection;
 //     u32 min_tracked_value
 //     u64 total_matched
 //     u8  has_more
+//     --- V2 only ---
+//     u32 fc_len
+//     [u8] fc_bytes (msgpack-serialized Vec<FilterClause>, BucketBitmap.bitmap skipped)
 // }]
 // [u32 tombstone_bitmap_len]
 // [u8] tombstone_bitmap_bytes
 // [u32 next_entry_id]
 
-const META_VERSION: u32 = 1;
+/// V1: original format (no FilterClause tree).
+/// V2: adds `[u32 fc_len][u8... fc_bytes]` after `has_more` in each entry.
+const META_VERSION: u32 = 2;
 const SHARD_VERSION: u32 = 2; // v2: adds sorted_keys section
 
 /// Registration data for a single cache entry (persisted in meta.bin).
@@ -63,6 +69,11 @@ pub struct MetaEntry {
     pub min_tracked_value: u32,
     pub total_matched: u64,
     pub has_more: bool,
+    /// Original (pre-canonicalization) FilterClause tree for cache live-maintenance.
+    /// Persisted in meta.bin V2 as msgpack. `BucketBitmap::bitmap` is skipped on
+    /// serialize (Arc can't cross restarts); `resolve_bucket_clauses` re-fills it
+    /// at restore time. V1 meta.bin files produce `Vec::new()` here (graceful upgrade).
+    pub original_filter_clauses: Vec<FilterClause>,
 }
 
 /// Contents of a deserialized meta.bin file.
@@ -297,6 +308,12 @@ fn serialize_meta(meta: &MetaFile) -> Result<Vec<u8>> {
         buf.extend_from_slice(&entry.min_tracked_value.to_le_bytes());
         buf.extend_from_slice(&entry.total_matched.to_le_bytes());
         buf.push(if entry.has_more { 1 } else { 0 });
+
+        // V2: original FilterClause tree (BucketBitmap.bitmap skipped via #[serde(skip)])
+        let fc_bytes = rmp_serde::to_vec(&entry.original_filter_clauses)
+            .map_err(|e| BitdexError::Storage(format!("serialize original_filter_clauses: {e}")))?;
+        buf.extend_from_slice(&(fc_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&fc_bytes);
     }
 
     // Tombstone bitmap
@@ -317,9 +334,10 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
     let mut pos = 0;
 
     let version = read_u32(data, &mut pos)?;
-    if version != META_VERSION {
+    if version != 1 && version != META_VERSION {
         return Err(BitdexError::Storage(format!("unsupported meta version: {version}")));
     }
+    let is_v2 = version >= 2;
 
     let num_entries = read_u32(data, &mut pos)? as usize;
     let mut entries = Vec::with_capacity(num_entries);
@@ -369,6 +387,20 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
         let has_more = data[pos] != 0;
         pos += 1;
 
+        // V2: read original FilterClause tree. V1 files produce Vec::new() (graceful upgrade).
+        let original_filter_clauses = if is_v2 {
+            let fc_len = read_u32(data, &mut pos)? as usize;
+            if pos + fc_len > data.len() {
+                return Err(BitdexError::Storage("meta entry truncated (original_filter_clauses)".into()));
+            }
+            let clauses: Vec<FilterClause> = rmp_serde::from_slice(&data[pos..pos + fc_len])
+                .map_err(|e| BitdexError::Storage(format!("deserialize original_filter_clauses: {e}")))?;
+            pos += fc_len;
+            clauses
+        } else {
+            Vec::new()
+        };
+
         entries.push(MetaEntry {
             entry_id,
             sort_field,
@@ -379,6 +411,7 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
             min_tracked_value,
             total_matched,
             has_more,
+            original_filter_clauses,
         });
     }
 
@@ -683,6 +716,7 @@ mod tests {
             min_tracked_value: 500,
             total_matched: 12345,
             has_more: true,
+            original_filter_clauses: Vec::new(),
         }
     }
 
@@ -768,6 +802,7 @@ mod tests {
                 min_tracked_value: 0,
                 total_matched: 999999,
                 has_more: false,
+                original_filter_clauses: Vec::new(),
             }],
             tombstones: RoaringBitmap::new(),
             next_entry_id: 8,
@@ -1079,5 +1114,184 @@ mod tests {
 
         // Shards should also be purged
         assert!(store.list_shards().unwrap().is_empty());
+    }
+
+    // ── B8: meta.bin V2 + FilterClause tree tests ───────────────────────
+
+    fn make_filter_clause_eq(field: &str, val: i64) -> FilterClause {
+        FilterClause::Eq(field.to_string(), crate::query::Value::Integer(val))
+    }
+
+    fn make_filter_clause_in(field: &str, vals: &[i64]) -> FilterClause {
+        FilterClause::In(
+            field.to_string(),
+            vals.iter().map(|&v| crate::query::Value::Integer(v)).collect(),
+        )
+    }
+
+    /// Write a MetaFile with simple Eq/In clauses and confirm they round-trip byte-equal.
+    #[test]
+    fn test_meta_v2_round_trip_simple() {
+        let original_clauses = vec![
+            make_filter_clause_eq("nsfwLevel", 1),
+            make_filter_clause_in("baseModel", &[100, 200, 300]),
+        ];
+        let meta = MetaFile {
+            entries: vec![MetaEntry {
+                entry_id: 1,
+                sort_field: "sortAt".to_string(),
+                direction: SortDirection::Desc,
+                filter_clauses: vec![make_clause("nsfwLevel", "1")],
+                capacity: 4000,
+                max_capacity: 64000,
+                min_tracked_value: 0,
+                total_matched: 5000,
+                has_more: false,
+                original_filter_clauses: original_clauses.clone(),
+            }],
+            tombstones: RoaringBitmap::new(),
+            next_entry_id: 2,
+        };
+
+        let buf = serialize_meta(&meta).unwrap();
+        let restored = deserialize_meta(&buf).unwrap();
+
+        assert_eq!(restored.entries.len(), 1);
+        let entry = &restored.entries[0];
+        assert_eq!(entry.original_filter_clauses.len(), 2);
+        assert_eq!(entry.original_filter_clauses[0], original_clauses[0]);
+        assert_eq!(entry.original_filter_clauses[1], original_clauses[1]);
+    }
+
+    /// BucketBitmap: field + bucket_name round-trip, bitmap is empty after deserialization.
+    #[test]
+    fn test_meta_v2_round_trip_with_bucket_bitmap() {
+        use std::sync::Arc;
+        let real_bitmap = {
+            let mut bm = RoaringBitmap::new();
+            bm.insert(10);
+            bm.insert(20);
+            Arc::new(bm)
+        };
+        let original_clauses = vec![
+            FilterClause::BucketBitmap {
+                field: "sortAt".to_string(),
+                bucket_name: "7d".to_string(),
+                bitmap: Arc::clone(&real_bitmap),
+            },
+            make_filter_clause_eq("isPublished", 1),
+        ];
+        let meta = MetaFile {
+            entries: vec![MetaEntry {
+                entry_id: 5,
+                sort_field: "sortAt".to_string(),
+                direction: SortDirection::Desc,
+                filter_clauses: vec![make_clause("isPublished", "true")],
+                capacity: 4000,
+                max_capacity: 64000,
+                min_tracked_value: 0,
+                total_matched: 100,
+                has_more: false,
+                original_filter_clauses: original_clauses,
+            }],
+            tombstones: RoaringBitmap::new(),
+            next_entry_id: 6,
+        };
+
+        let buf = serialize_meta(&meta).unwrap();
+        let restored = deserialize_meta(&buf).unwrap();
+
+        let entry = &restored.entries[0];
+        assert_eq!(entry.original_filter_clauses.len(), 2);
+
+        // BucketBitmap: name + field preserved, bitmap is empty (not persisted)
+        match &entry.original_filter_clauses[0] {
+            FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+                assert_eq!(field, "sortAt");
+                assert_eq!(bucket_name, "7d");
+                assert!(bitmap.is_empty(), "bitmap should be empty after deserialization");
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+        // Second clause round-trips correctly
+        assert_eq!(entry.original_filter_clauses[1], make_filter_clause_eq("isPublished", 1));
+    }
+
+    /// Compound Not(And(In, In)) round-trips byte-equal.
+    #[test]
+    fn test_meta_v2_compound_round_trip() {
+        let compound = FilterClause::Not(Box::new(FilterClause::And(vec![
+            make_filter_clause_in("baseModel", &[1, 2, 3, 4]),
+            make_filter_clause_in("nsfwLevel", &[4, 8, 16]),
+        ])));
+        let original_clauses = vec![compound.clone()];
+        let meta = MetaFile {
+            entries: vec![MetaEntry {
+                entry_id: 9,
+                sort_field: "reactionCount".to_string(),
+                direction: SortDirection::Desc,
+                filter_clauses: vec![],
+                capacity: 4000,
+                max_capacity: 64000,
+                min_tracked_value: 0,
+                total_matched: 42,
+                has_more: true,
+                original_filter_clauses: original_clauses,
+            }],
+            tombstones: RoaringBitmap::new(),
+            next_entry_id: 10,
+        };
+
+        let buf = serialize_meta(&meta).unwrap();
+        let restored = deserialize_meta(&buf).unwrap();
+
+        let entry = &restored.entries[0];
+        assert_eq!(entry.original_filter_clauses.len(), 1);
+        assert_eq!(entry.original_filter_clauses[0], compound);
+    }
+
+    /// Loading a hand-crafted V1 byte-stream produces original_filter_clauses = Vec::new().
+    #[test]
+    fn test_load_v1_meta_treats_filter_clauses_as_empty() {
+        // Construct a minimal valid V1 meta.bin payload manually
+        let filter_clauses_v1 = vec![make_clause("nsfwLevel", "1")];
+        let key_bytes = rmp_serde::to_vec(&filter_clauses_v1).unwrap();
+        let sort_field = b"sortAt";
+        let mut bm_buf = Vec::new();
+        let mut tombstones = RoaringBitmap::new();
+        tombstones.serialize_into(&mut bm_buf).unwrap();
+
+        let mut buf = Vec::new();
+        // V1 header
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_entries = 1
+        // Entry
+        buf.extend_from_slice(&42u32.to_le_bytes()); // entry_id
+        buf.extend_from_slice(&(sort_field.len() as u16).to_le_bytes()); // sort_field_len
+        buf.extend_from_slice(sort_field); // sort_field
+        buf.push(0u8); // direction = Desc
+        buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes()); // key_len
+        buf.extend_from_slice(&key_bytes); // key
+        buf.extend_from_slice(&4000u32.to_le_bytes()); // capacity
+        buf.extend_from_slice(&64000u32.to_le_bytes()); // max_capacity
+        buf.extend_from_slice(&0u32.to_le_bytes()); // min_tracked_value
+        buf.extend_from_slice(&12345u64.to_le_bytes()); // total_matched
+        buf.push(1u8); // has_more = true
+        // No fc section in V1
+        // Tombstone bitmap
+        buf.extend_from_slice(&(bm_buf.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&bm_buf);
+        // next_entry_id
+        buf.extend_from_slice(&43u32.to_le_bytes());
+
+        let restored = deserialize_meta(&buf).unwrap();
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].entry_id, 42);
+        // V1 file: original_filter_clauses is empty (graceful upgrade)
+        assert!(
+            restored.entries[0].original_filter_clauses.is_empty(),
+            "V1 meta.bin should produce empty original_filter_clauses"
+        );
+        assert_eq!(restored.next_entry_id, 43);
     }
 }

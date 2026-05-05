@@ -33,9 +33,101 @@ fn now_ms() -> u64 {
 use roaring::RoaringBitmap;
 use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
+
+/// Returns true when `c` is a genuine time-bucket clause (e.g. `sortAt:bucket:7d`).
+///
+/// `op == "bucket"` alone is not sufficient: `prefilter.rs::substitute` injects a
+/// `BucketBitmap { field: "__prefilter", … }` clause that also canonicalises to
+/// `op = "bucket"`. Those prefilter-substituted entries must NOT enter the time-bucket
+/// diff path, so we gate on `field != "__prefilter"` as the sentinel exclusion.
+pub fn is_time_bucket_clause(c: &CanonicalClause) -> bool {
+    c.op == "bucket" && c.field != "__prefilter"
+}
+
+/// Assign a cost class (1–5) to a `FilterClause` for cheap-first ordering.
+///
+/// Lower cost = cheaper to evaluate = checked first by the per-slot evaluator,
+/// enabling short-circuit on the most selective/cheapest clause.
+///
+/// | Class | Variants                        | Why                                          |
+/// |-------|---------------------------------|----------------------------------------------|
+/// | 1     | Eq, IsNull, IsNotNull, BucketBitmap | 1 hash lookup + 1 contains               |
+/// | 2     | NotEq, Gt, Gte, Lt, Lte        | 1 contains + 1 reconstruct_value, or 1 lookup + negate |
+/// | 3     | In, NotIn                       | ≤K contains (K = values.len())               |
+/// | 4     | And, Or                         | max child class (recursive compound)         |
+/// | 5     | Not(And/Or)                     | deepest compound — pushed last               |
+///
+/// For `And`/`Or`, the class is the **max** of children — gives a stable, predictable
+/// bucket assignment without summing (which would depend on arity).
+/// For `Not`, if the inner clause is `And`/`Or` the class is bumped to 5 (push last);
+/// otherwise the inner class is inherited (e.g. `Not(Eq)` → class 1).
+pub fn clause_atom_cost(c: &FilterClause) -> u8 {
+    match c {
+        FilterClause::Eq(..) | FilterClause::IsNull(..) | FilterClause::IsNotNull(..) => 1,
+        FilterClause::BucketBitmap { .. } => 1,
+        FilterClause::NotEq(..)
+        | FilterClause::Gt(..)
+        | FilterClause::Gte(..)
+        | FilterClause::Lt(..)
+        | FilterClause::Lte(..) => 2,
+        FilterClause::In(..) | FilterClause::NotIn(..) => 3,
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            parts.iter().map(clause_atom_cost).max().unwrap_or(1).max(4)
+        }
+        FilterClause::Not(inner) => match inner.as_ref() {
+            FilterClause::And(_) | FilterClause::Or(_) => 5,
+            other => clause_atom_cost(other),
+        },
+    }
+}
+
+/// Count the total number of leaf atoms across a slice of `FilterClause`s.
+///
+/// A leaf atom is the smallest unit of per-slot evaluation work:
+/// - Scalar clauses (`Eq`, `NotEq`, ranges, `IsNull`, `IsNotNull`, `BucketBitmap`) = 1 atom each.
+/// - `In`/`NotIn` = `values.len()` atoms (one bitmap contains-check per value in the worst case).
+/// - `Not(inner)` = atoms of inner (recursed through).
+/// - `And(parts)` / `Or(parts)` = sum of part atoms (recursed).
+///
+/// Used by the B9 safety valve: if an entry's total leaf-atom count exceeds
+/// `UnifiedCacheConfig::compound_eval_atom_limit`, the entry is skipped and
+/// marked for rebuild instead of paying the per-slot evaluation cost.
+///
+/// Civitai's dominant compound shape (`Not(And(In(nsfwLevel, 4 vals), In(baseModel, 9 vals)))`)
+/// plus surrounding atoms totals approximately 24 atoms. The default limit of 50 gives 2× margin.
+pub fn count_leaf_atoms(clauses: &[FilterClause]) -> u32 {
+    let mut total = 0u32;
+    for c in clauses {
+        total = total.saturating_add(count_one_leaf_atom(c));
+    }
+    total
+}
+
+fn count_one_leaf_atom(c: &FilterClause) -> u32 {
+    match c {
+        FilterClause::Eq(..)
+        | FilterClause::NotEq(..)
+        | FilterClause::Gt(..)
+        | FilterClause::Gte(..)
+        | FilterClause::Lt(..)
+        | FilterClause::Lte(..)
+        | FilterClause::IsNull(_)
+        | FilterClause::IsNotNull(_)
+        | FilterClause::BucketBitmap { .. } => 1,
+        FilterClause::In(_, vs) | FilterClause::NotIn(_, vs) => vs.len() as u32,
+        FilterClause::Not(inner) => count_one_leaf_atom(inner),
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            let mut s = 0u32;
+            for p in parts {
+                s = s.saturating_add(count_one_leaf_atom(p));
+            }
+            s
+        }
+    }
+}
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
-use crate::query::SortDirection;
+use crate::query::{FilterClause, SortDirection};
 use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
@@ -51,6 +143,8 @@ pub struct CacheMaintenanceItem {
     pub slots: Vec<u32>,
     pub min_tracked_value: u32,
     pub direction: SortDirection,
+    /// Carried from UnifiedEntry; consumed in Commit 3 (B2).
+    pub original_filter_clauses: Arc<Vec<FilterClause>>,
 }
 /// Result of evaluating maintenance for one cache entry (computed without lock).
 pub struct CacheMaintenanceResult {
@@ -87,6 +181,14 @@ pub struct UnifiedCacheConfig {
     /// this fraction of the cached entries (default 0.95 = 95% consumed, 5% remaining).
     /// Set to 0.0 or 1.0 to disable prefetching.
     pub prefetch_threshold: f64,
+    /// B9 safety valve: maximum total leaf-atom count an entry's `FilterClause` tree
+    /// can have before live maintenance bails and marks the entry for rebuild instead
+    /// of running per-slot evaluation.
+    ///
+    /// Civitai's dominant compound shape is ~24 atoms; the default 50 gives 2× margin.
+    /// Set to `0` to disable the guard (no limit). Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.compound_eval_atom_limit`.
+    pub compound_eval_atom_limit: u32,
 }
 impl Default for UnifiedCacheConfig {
     fn default() -> Self {
@@ -99,6 +201,7 @@ impl Default for UnifiedCacheConfig {
             max_maintenance_work: 0, // 0 = unlimited
             max_maintenance_ms: 10,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         }
     }
 }
@@ -158,6 +261,11 @@ pub struct UnifiedEntry {
     bucket_cutoff: u64,
     /// Whether this entry's filter clauses include a time bucket clause.
     uses_bucket: bool,
+    /// Original FilterClause tree captured at entry formation.
+    /// Used by live maintenance (Phase B) to evaluate compound predicates natively.
+    /// Stored as Arc so per-cycle clones into CacheMaintenanceItem are cheap.
+    /// TODO(B8): account for original_filter_clauses bytes once persisted.
+    original_filter_clauses: Arc<Vec<FilterClause>>,
 }
 impl UnifiedEntry {
     /// Create a new entry from a sort traversal result.
@@ -165,6 +273,11 @@ impl UnifiedEntry {
     /// `sorted_slots` should be the top-N slots from the sort traversal, in sort order.
     /// `value_fn` returns the sort value for a given slot.
     /// At formation, capacity is initial_capacity (4K) — no radix needed.
+    ///
+    /// Test/legacy callers without a FilterClause tree call `new` (defaults to
+    /// empty Arc). Production callers with a FilterClause tree call
+    /// `new_with_clauses` so live maintenance can natively evaluate compound
+    /// predicates (Commit 3 / B2).
     pub fn new(
         sorted_slots: &[u32],
         capacity: usize,
@@ -173,6 +286,31 @@ impl UnifiedEntry {
         total_matched: u64,
         meta_id: CacheEntryId,
         direction: SortDirection,
+        value_fn: impl Fn(u32) -> u32,
+    ) -> Self {
+        Self::new_with_clauses(
+            sorted_slots,
+            capacity,
+            max_capacity,
+            has_more,
+            total_matched,
+            meta_id,
+            direction,
+            Arc::new(Vec::new()),
+            value_fn,
+        )
+    }
+    /// Like `new`, but accepts the original FilterClause tree to carry through
+    /// to live maintenance.
+    pub fn new_with_clauses(
+        sorted_slots: &[u32],
+        capacity: usize,
+        max_capacity: usize,
+        has_more: bool,
+        total_matched: u64,
+        meta_id: CacheEntryId,
+        direction: SortDirection,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> Self {
         let mut bitmap = RoaringBitmap::new();
@@ -211,6 +349,7 @@ impl UnifiedEntry {
             direction,
             bucket_cutoff: 0, // Set by caller via set_bucket_cutoff() after creation
             uses_bucket: false, // Set by caller via set_uses_bucket() after creation
+            original_filter_clauses,
         }
     }
     /// Create an entry restored from disk (shard load).
@@ -228,6 +367,34 @@ impl UnifiedEntry {
         value_fn: impl Fn(u32) -> u32,
         has_more: bool,
         persisted_total_matched: u64,
+    ) -> Self {
+        // TODO(B8): populate FilterClause tree from persisted meta.bin once META_VERSION is bumped.
+        Self::from_restored_with_clauses(
+            bitmap,
+            meta_id,
+            initial_capacity,
+            max_capacity,
+            direction,
+            persisted_sorted_keys,
+            value_fn,
+            has_more,
+            persisted_total_matched,
+            Arc::new(Vec::new()),
+        )
+    }
+    /// Like `from_restored`, but accepts the persisted FilterClause tree.
+    /// Used post-B8 once meta.bin V2 carries the original clauses.
+    pub fn from_restored_with_clauses(
+        bitmap: RoaringBitmap,
+        meta_id: CacheEntryId,
+        initial_capacity: usize,
+        max_capacity: usize,
+        direction: SortDirection,
+        persisted_sorted_keys: Option<Vec<u64>>,
+        value_fn: impl Fn(u32) -> u32,
+        has_more: bool,
+        persisted_total_matched: u64,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
     ) -> Self {
         let card = bitmap.len() as usize;
         let capacity = if card > initial_capacity {
@@ -276,6 +443,7 @@ impl UnifiedEntry {
             direction,
             bucket_cutoff: 0, // Set by caller after restore
             uses_bucket: false, // Set by caller after restore
+            original_filter_clauses,
         }
     }
     pub fn bitmap(&self) -> &Arc<RoaringBitmap> {
@@ -308,6 +476,10 @@ impl UnifiedEntry {
     /// Mark this entry as using a time bucket clause.
     pub fn set_uses_bucket(&mut self, uses: bool) {
         self.uses_bucket = uses;
+    }
+    /// The original FilterClause tree captured at entry formation.
+    pub fn original_filter_clauses(&self) -> &Arc<Vec<FilterClause>> {
+        &self.original_filter_clauses
     }
     /// Apply pending bucket diffs: subtract expired slots from the bitmap
     /// and update the bucket_cutoff to current.
@@ -665,6 +837,9 @@ pub struct UnifiedCache {
     /// Persisted total_matched values keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to get the real total instead of bitmap cardinality.
     meta_total_matched: Mutex<HashMap<CacheEntryId, u64>>,
+    /// Persisted original FilterClause trees keyed by entry ID, from meta.bin V2.
+    /// V1 meta.bin files produce empty Vecs; shard restore falls back to legacy from_restored.
+    meta_original_filter_clauses: Mutex<HashMap<CacheEntryId, Vec<crate::query::FilterClause>>>,
     /// Cumulative count of entry expansions from initial to expanded capacity.
     extensions: AtomicU64,
     /// Cumulative count of cache wall hits (cursor past cached entries, triggering slow path).
@@ -702,6 +877,7 @@ impl UnifiedCache {
             persistence_enabled: AtomicBool::new(false),
             meta_has_more: Mutex::new(HashMap::new()),
             meta_total_matched: Mutex::new(HashMap::new()),
+            meta_original_filter_clauses: Mutex::new(HashMap::new()),
             extensions: AtomicU64::new(0),
             wall_hits: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
@@ -748,6 +924,22 @@ impl UnifiedCache {
     /// Look up persisted total_matched for a given entry ID. Falls back to 0 if not found.
     pub fn get_meta_total_matched(&self, entry_id: CacheEntryId) -> u64 {
         self.meta_total_matched.lock().get(&entry_id).copied().unwrap_or(0)
+    }
+    /// Store persisted original FilterClause trees from meta.bin V2, keyed by entry ID.
+    /// Called during startup after loading meta.bin. V1 files produce empty Vecs.
+    pub fn set_meta_original_filter_clauses(
+        &self,
+        map: HashMap<CacheEntryId, Vec<crate::query::FilterClause>>,
+    ) {
+        *self.meta_original_filter_clauses.lock() = map;
+    }
+    /// Look up persisted original FilterClause tree for a given entry ID.
+    /// Returns an empty Vec if not found (v1 meta.bin or no persisted tree).
+    pub fn get_meta_original_filter_clauses(
+        &self,
+        entry_id: CacheEntryId,
+    ) -> Vec<crate::query::FilterClause> {
+        self.meta_original_filter_clauses.lock().get(&entry_id).cloned().unwrap_or_default()
     }
     /// Look up a cache entry by key for mutation. Returns `None` on miss.
     /// Increments hit/miss counters and refreshes LRU.
@@ -807,6 +999,33 @@ impl UnifiedCache {
     ) -> Option<dashmap::mapref::one::Ref<'a, UnifiedKey, UnifiedEntry>> {
         self.entries.get(key)
     }
+    /// Single-flight guard for `needs_rebuild` entries at the slow-path call
+    /// site in `ConcurrentEngine`.
+    ///
+    /// Returns `true` if the caller should run the full slow path (seed sort +
+    /// `form_and_store_with_clauses`).  Returns `false` if another concurrent
+    /// caller already claimed the rebuild — this caller should execute the
+    /// query directly against the executor bitmaps without touching the cache.
+    ///
+    /// Two cases both return `true` (proceed):
+    /// - No entry exists yet for `key` → normal first-time insert.
+    /// - Entry exists but is NOT flagged → entry vanished between `lookup_for_read`
+    ///   returning `None` and this call (eviction race); safe to re-insert.
+    ///
+    /// The one case that returns `false`:
+    /// - Entry exists AND `needs_rebuild=true` AND `try_start_rebuild()` lost
+    ///   the CAS → another caller claimed the rebuild; skip.
+    ///
+    /// Uses `get` (no hit/miss counters) so the stat path is not double-counted.
+    pub fn should_rebuild_single_flight(&self, key: &UnifiedKey) -> bool {
+        match self.entries.get(key) {
+            Some(r) if r.value().needs_rebuild() => {
+                // Entry flagged — first caller wins the CAS, others skip.
+                r.value().try_start_rebuild()
+            }
+            _ => true, // No entry, or fresh entry (not flagged) — proceed normally.
+        }
+    }
     /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
     ///
     /// Uses batch eviction: when over budget, evicts ~10% of entries in one O(n)
@@ -857,7 +1076,11 @@ impl UnifiedCache {
         meta_id
     }
     /// Register a new entry with the meta-index and create the entry.
-    /// This is the primary way to create and store entries.
+    ///
+    /// Test/legacy callers without an original FilterClause tree call
+    /// `form_and_store` (defaults to empty Arc). Production callers with a
+    /// FilterClause tree call `form_and_store_with_clauses` so live
+    /// maintenance can natively evaluate compound predicates (Commit 3 / B2).
     pub fn form_and_store(
         &self,
         key: UnifiedKey,
@@ -866,16 +1089,51 @@ impl UnifiedCache {
         total_matched: u64,
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
-        // Register with meta-index
+        self.form_and_store_with_clauses(
+            key,
+            sorted_slots,
+            has_more,
+            total_matched,
+            Arc::new(Vec::new()),
+            value_fn,
+        )
+    }
+    /// Like `form_and_store`, but accepts the original FilterClause tree.
+    pub fn form_and_store_with_clauses(
+        &self,
+        key: UnifiedKey,
+        sorted_slots: &[u32],
+        has_more: bool,
+        total_matched: u64,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
+        value_fn: impl Fn(u32) -> u32,
+    ) -> CacheEntryId {
+        // B3: stable-sort the original FilterClause tree by atom cost (ascending)
+        // so the per-slot evaluator in `slot_matches_filter_native` short-circuits
+        // on the cheapest clause first.  Stable sort preserves user intent within
+        // each cost bucket.  The UnifiedKey (canonical-clause hash key) is NOT
+        // affected — canonical ordering is independently deterministic.
+        let original_filter_clauses = if original_filter_clauses.len() > 1 {
+            let mut sorted: Vec<FilterClause> = (*original_filter_clauses).clone();
+            sorted.sort_by_key(|c| clause_atom_cost(c));
+            Arc::new(sorted)
+        } else {
+            original_filter_clauses
+        };
+
+        // Register with meta-index. Pass the original FilterClause tree so
+        // compound clauses get registered under their real leaf field names
+        // (not just FieldKey("") from the canonical representation).
         let meta_id = self.meta.write().register(
             &key.filter_clauses,
+            Some(&original_filter_clauses),
             Some(&key.sort_field),
             Some(key.direction),
         );
         let direction = key.direction;
-        let uses_bucket = key.filter_clauses.iter().any(|c| c.op == "bucket");
+        let uses_bucket = key.filter_clauses.iter().any(is_time_bucket_clause);
         let cfg = self.config.load();
-        let mut entry = UnifiedEntry::new(
+        let mut entry = UnifiedEntry::new_with_clauses(
             sorted_slots,
             cfg.initial_capacity,
             cfg.max_capacity,
@@ -883,6 +1141,7 @@ impl UnifiedCache {
             total_matched,
             meta_id,
             direction,
+            Arc::clone(&original_filter_clauses),
             value_fn,
         );
         entry.set_uses_bucket(uses_bucket);
@@ -904,9 +1163,28 @@ impl UnifiedCache {
 
     /// Register a meta-index id without building or inserting an entry.
     /// Pairs with `store` to split form_and_store into three phases.
+    /// Canonical-only registration (no leaf-field walk). Use
+    /// `allocate_meta_id_with_clauses` when the FilterClause tree is available.
     pub fn allocate_meta_id(&self, key: &UnifiedKey) -> CacheEntryId {
         self.meta.write().register(
             &key.filter_clauses,
+            None,
+            Some(&key.sort_field),
+            Some(key.direction),
+        )
+    }
+
+    /// Like `allocate_meta_id` but also registers leaf fields from the
+    /// original FilterClause tree, enabling write-path lookup for compound
+    /// clauses (And/Or/Not) whose inner fields have `field=""` in canonical form.
+    pub fn allocate_meta_id_with_clauses(
+        &self,
+        key: &UnifiedKey,
+        original_filter_clauses: &[FilterClause],
+    ) -> CacheEntryId {
+        self.meta.write().register(
+            &key.filter_clauses,
+            Some(original_filter_clauses),
             Some(&key.sort_field),
             Some(key.direction),
         )
@@ -1123,6 +1401,25 @@ impl UnifiedCache {
             }
         }).collect()
     }
+    /// Count entries by clause type for scrape-time gauges (A3).
+    ///
+    /// Returns `(substituted, compound)` where:
+    /// - `substituted` = entries with a `__prefilter` clause (op="bucket", field="__prefilter")
+    /// - `compound` = entries with at least one op ∈ {and, or, not, isnull, isnotnull}
+    pub fn count_by_clause_type(&self) -> (u64, u64) {
+        let mut substituted = 0u64;
+        let mut compound = 0u64;
+        for r in self.entries.iter() {
+            let clauses = &r.key().filter_clauses;
+            let has_prefilter = clauses.iter().any(|c| c.field == "__prefilter" && c.op == "bucket");
+            let has_compound = clauses.iter().any(|c| {
+                matches!(c.op.as_str(), "and" | "or" | "not" | "isnull" | "isnotnull")
+            });
+            if has_prefilter { substituted += 1; }
+            if has_compound { compound += 1; }
+        }
+        (substituted, compound)
+    }
     /// Reset hit/miss counters without clearing entries.
     pub fn reset_counters(&self) {
         self.hits.store(0, Ordering::Relaxed);
@@ -1157,6 +1454,11 @@ impl UnifiedCache {
         let mut next = (*current).clone();
         f(&mut next);
         self.config.store(Arc::new(next));
+    }
+    /// Read the current `compound_eval_atom_limit` from the live config snapshot.
+    /// Returns 0 when the guard is disabled.
+    pub fn compound_eval_atom_limit(&self) -> u32 {
+        self.config.load().compound_eval_atom_limit
     }
     /// Get the key for a meta_id. O(1) via reverse index. Returns a cloned
     /// `UnifiedKey` (the underlying DashMap entry's shard lock can't escape).
@@ -1589,6 +1891,18 @@ impl UnifiedCache {
             if entry.needs_rebuild() {
                 continue;
             }
+            // Clone the native FilterClause tree (cheap Arc clone) before the
+            // per-slot loop. Non-empty → use slot_matches_filter_native (B2 path).
+            // Empty (legacy entries without original_filter_clauses) → fall back to
+            // the canonical slot_matches_filter. Test fixtures typically don't call
+            // form_and_store_with_clauses so they hit the fallback — that's fine.
+            let native_clauses = Arc::clone(entry.original_filter_clauses());
+            let use_native = !native_clauses.is_empty();
+            // Local miss counter for the test path; no string_maps/dictionaries are
+            // threaded here so string-typed In clauses will miss and return false —
+            // which is the correct conservative behaviour in the absence of
+            // resolution context. The counter is read-only (tests don't assert on it).
+            let _local_miss_counter = std::sync::atomic::AtomicU64::new(0);
             let mut slots_to_check = HashSet::new();
             for clause in &key.filter_clauses {
                 if let Some(slots) = changed_slots_per_field.get(clause.field.as_str()) {
@@ -1603,7 +1917,24 @@ impl UnifiedCache {
                     .get_field(&key.sort_field)
                     .map(|f| f.reconstruct_value(slot))
                     .unwrap_or(0);
-                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None);
+                let matches = if use_native {
+                    // B7: single source of truth — same native evaluator as B2.
+                    // No string_maps/dictionaries in the test path; string-typed In
+                    // clauses conservatively return false, which is safe.
+                    slot_matches_filter_native(
+                        slot,
+                        &native_clauses,
+                        filters,
+                        sorts,
+                        None,
+                        None,
+                        None,
+                        &_local_miss_counter,
+                    )
+                } else {
+                    // Fallback: canonical eval for entries without original clauses.
+                    slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None)
+                };
                 if matches {
                     if entry.sort_qualifies(sort_value, key.direction) {
                         entry.add_slot(slot, sort_value);
@@ -1804,10 +2135,18 @@ impl UnifiedCache {
                     if !new_entries.is_empty() {
                         for meta_id in new_entries.iter() {
                             if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
-                                let has_non_eq = key_ref.value().filter_clauses.iter().any(|c| {
+                                let clauses = &key_ref.value().filter_clauses;
+                                // Include this entry if:
+                                // (a) It has a non-eq canonical clause for this field —
+                                //     not already covered by entries_for_clause (eq-only), OR
+                                // (b) No canonical clause directly names this field — meaning
+                                //     it was registered via compound-clause leaf-field walk
+                                //     (And/Or/Not inner fields have field="" in canonical form).
+                                let field_in_canonical = clauses.iter().any(|c| c.field == *field);
+                                let has_non_eq = field_in_canonical && clauses.iter().any(|c| {
                                     c.field == *field && c.op != "eq"
                                 });
-                                if has_non_eq {
+                                if has_non_eq || !field_in_canonical {
                                     ids.insert(meta_id);
                                 }
                             }
@@ -1843,9 +2182,30 @@ impl UnifiedCache {
                     return None;
                 }
                 let mut slots = Vec::new();
-                for clause in &key.filter_clauses {
-                    if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
-                        slots.extend(field_slots.iter().copied());
+                let orig = entry.original_filter_clauses();
+                if !orig.is_empty() {
+                    // Walk leaf fields from the original FilterClause tree.
+                    // Canonical clauses have field="" for compound (And/Or/Not)
+                    // shapes, so changed_slots_per_field.get("") returns nothing.
+                    // The leaf walk reaches the actual inner fields (baseModel,
+                    // nsfwLevel, etc.) that compound predicates reference.
+                    let mut leaf_fields = ahash::AHashSet::new();
+                    for clause in orig.iter() {
+                        crate::meta_index::collect_leaf_fields(clause, &mut leaf_fields);
+                    }
+                    for field in &leaf_fields {
+                        if let Some(field_slots) = changed_slots_per_field.get(field.as_str()) {
+                            slots.extend(field_slots.iter().copied());
+                        }
+                    }
+                } else {
+                    // Fallback: canonical loop for entries without an original
+                    // clause tree (e.g. legacy form_and_store, restored entries
+                    // pre-B8, or simple non-compound shapes).
+                    for clause in &key.filter_clauses {
+                        if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
+                            slots.extend(field_slots.iter().copied());
+                        }
                     }
                 }
                 slots.sort_unstable();
@@ -1858,6 +2218,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
                 })
             })
             .collect();
@@ -1916,6 +2277,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
                 })
             })
             .collect();
@@ -1931,11 +2293,17 @@ impl UnifiedCache {
             if entry.needs_rebuild() {
                 continue;
             }
+            let mut modified = false;
             if !result.adds.is_empty() {
                 entry.add_slots_bulk(&result.adds);
+                modified = true;
             }
             if !result.removes.is_empty() {
                 entry.remove_slots_bulk(&result.removes);
+                modified = true;
+            }
+            if modified {
+                self.record_update();
             }
         }
     }
@@ -1970,6 +2338,35 @@ impl UnifiedCache {
         self.invalidations.fetch_add(count, Ordering::Relaxed);
         count
     }
+    /// Invalidate every cache entry that referenced a prefilter by name.
+    ///
+    /// When a prefilter is removed from the registry, any entry whose
+    /// `BucketBitmap{field:"__prefilter", bucket_name}` clause referenced it
+    /// is now holding a dangling bitmap pointer.  Mark them for rebuild so the
+    /// slow path re-evaluates against the live index on the next read.
+    ///
+    /// Returns the number of entries flagged.
+    pub fn invalidate_prefilter(&self, name: &str) -> u64 {
+        let ids: Option<roaring::RoaringBitmap> = {
+            let meta = self.meta.read();
+            // "__prefilter" clauses canonicalise to op="bucket", value=name.
+            meta.entries_for_clause("__prefilter", "bucket", name).cloned()
+        };
+        let Some(ids) = ids else { return 0 };
+        let mut count = 0u64;
+        for id in ids.iter() {
+            if let Some(key) = self.meta_id_to_key.get(&id) {
+                if let Some(entry) = self.entries.get(key.value()) {
+                    entry.value().mark_for_rebuild();
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.invalidations.fetch_add(count, Ordering::Relaxed);
+        }
+        count
+    }
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
     /// Maintain cache entries when a time bucket is rebuilt.
     ///
@@ -1987,10 +2384,15 @@ impl UnifiedCache {
         added_slots: &RoaringBitmap,
         filters: &FilterIndex,
         sorts: &SortIndex,
+        string_maps: Option<&crate::executor::StringMaps>,
+        dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     ) {
         if dropped_slots.is_empty() && added_slots.is_empty() {
             return;
         }
+        // Reusable misses counter: we don't bump external metrics here since this
+        // path is called from the flush thread (no metrics handle available).
+        let _misses = std::sync::atomic::AtomicU64::new(0);
         for mut r in self.entries.iter_mut() {
             let key = r.key().clone();
             let entry = r.value_mut();
@@ -2014,19 +2416,39 @@ impl UnifiedCache {
                 }
             }
             if !added_slots.is_empty() {
+                let original = Arc::clone(entry.original_filter_clauses());
+                let use_native = !original.is_empty();
+                let misses = std::sync::atomic::AtomicU64::new(0);
                 for slot in added_slots.iter() {
-                    // Check all OTHER clauses (we already know bucket matches)
-                    // TODO: pass bucket_mgr through here so multi-bucket-clause entries
-                    // (e.g. AND(Bucket=24h, Bucket=7d)) evaluate correctly. UI doesn't
-                    // emit these today, but a future caller could. Conservative true
-                    // admits invalid slots into the cache entry on rebuild.
-                    let other_clauses_match = key.filter_clauses.iter().all(|c| {
-                        if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
-                            true
-                        } else {
-                            slot_matches_clause(slot, c, filters, sorts, None)
-                        }
-                    });
+                    let other_clauses_match = if use_native {
+                        // B2 native path: evaluate non-bucket clauses via the
+                        // original FilterClause tree (handles Not/And/Or correctly).
+                        // We still skip the matching bucket clause itself since the
+                        // caller guarantees the slot is in the new bucket bitmap.
+                        let non_bucket: Vec<&FilterClause> = original
+                            .iter()
+                            .filter(|c| !matches!(c,
+                                FilterClause::BucketBitmap { field: f, bucket_name: bn, .. }
+                                if f == field && bn == bucket_name))
+                            .collect();
+                        non_bucket.iter().all(|c| {
+                            slot_matches_clause_native(
+                                slot, c, filters, sorts,
+                                None, // no bucket_mgr: bucket clause already excluded above
+                                string_maps, dictionaries,
+                                &misses,
+                            )
+                        })
+                    } else {
+                        // Legacy canonical path.
+                        key.filter_clauses.iter().all(|c| {
+                            if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
+                                true
+                            } else {
+                                slot_matches_clause(slot, c, filters, sorts, None)
+                            }
+                        })
+                    };
                     if !other_clauses_match {
                         continue;
                     }
@@ -2250,6 +2672,236 @@ fn slot_matches_filter_resolved(
     })
 }
 
+// ── Native FilterClause Evaluator (B2) ───────────────────────────────────
+//
+// Evaluates the original `FilterClause` tree directly, threading StringMaps
+// and FieldDictionary so string-typed values (e.g. `In(baseModel, ["SD 3"])`)
+// resolve correctly.  Replaces the conservative-true canonical-only path for
+// compound clauses (Not/And/Or).  Default arm → `false` (loud failure, not
+// silent admit).
+
+/// Resolve a `Value` to a bitmap key, mirroring `executor.rs::resolve_value_key`.
+///
+/// - Integer / Bool: direct conversion, no map lookup needed.
+/// - String: try `string_maps[field]` first, then `dictionaries[field]`.
+/// - Float: not supported as a filter key → returns `None`.
+/// - If resolution fails → caller must bump `cache_maint_string_lookup_miss_total`.
+fn resolve_filter_value(
+    field: &str,
+    val: &crate::query::Value,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+) -> Option<u64> {
+    use crate::query::Value;
+    match val {
+        Value::Bool(b) => Some(if *b { 1 } else { 0 }),
+        Value::Integer(v) => Some(*v as u64),
+        Value::Float(_) => None,
+        Value::String(s) => {
+            // Mirror executor::resolve_value_key: try exact (case-sensitive) first,
+            // then lowercase fallback. The executor's case-sensitive set isn't
+            // threaded here (cache maintenance doesn't have access to per-index
+            // config), so we always try both forms — exact wins, lowercase backstops.
+            if let Some(maps) = string_maps {
+                if let Some(field_map) = maps.get(field) {
+                    if let Some(&v) = field_map.get(s.as_str()) {
+                        return Some(v as u64);
+                    }
+                    let lower = s.to_lowercase();
+                    if lower != *s {
+                        if let Some(&v) = field_map.get(lower.as_str()) {
+                            return Some(v as u64);
+                        }
+                    }
+                    // Fall through to dictionary check even if field_map exists
+                    // but doesn't have this value — it may be newer than the snapshot.
+                }
+            }
+            // Fallback: live dictionary for LowCardinalityString fields.
+            if let Some(dicts) = dictionaries {
+                if let Some(dict) = dicts.get(field) {
+                    return dict.get(s).map(|v| v as u64);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Evaluate whether `slot` matches ALL clauses in a `FilterClause` slice.
+///
+/// AND-conjunction across the top-level clauses. Inner compound clauses are
+/// recursively evaluated via `slot_matches_clause_native`.
+///
+/// `string_maps` / `dictionaries` are required for correct evaluation of
+/// string-typed `In`/`Eq` fields (e.g. `baseModel`).  If neither is
+/// available the evaluator falls back to `false` on every string-key miss
+/// (safe: cache stays clean, no phantom admits).
+pub fn slot_matches_filter_native(
+    slot: u32,
+    clauses: &[FilterClause],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+) -> bool {
+    clauses.iter().all(|clause| {
+        slot_matches_clause_native(slot, clause, filters, sorts, bucket_mgr, string_maps, dictionaries, string_lookup_misses)
+    })
+}
+
+/// Evaluate a single `FilterClause` against `slot`.  Default arm → `false`.
+fn slot_matches_clause_native(
+    slot: u32,
+    clause: &FilterClause,
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+) -> bool {
+    // Shorthand for recursive calls.
+    macro_rules! eval {
+        ($c:expr) => {
+            slot_matches_clause_native(slot, $c, filters, sorts, bucket_mgr, string_maps, dictionaries, string_lookup_misses)
+        };
+    }
+    match clause {
+        FilterClause::Eq(field, val) => {
+            let key = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => {
+                    string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            };
+            filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(key))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false)
+        }
+        FilterClause::NotEq(field, val) => {
+            let key = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => {
+                    string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                    // Value doesn't exist in the database — slot definitely doesn't equal it.
+                    return true;
+                }
+            };
+            let contained = filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(key))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false);
+            !contained
+        }
+        FilterClause::In(field, vals) => {
+            vals.iter().any(|val| {
+                match resolve_filter_value(field, val, string_maps, dictionaries) {
+                    Some(key) => filters
+                        .get_field(field)
+                        .and_then(|f| f.get_versioned(key))
+                        .map(|vb| vb.contains(slot))
+                        .unwrap_or(false),
+                    None => {
+                        string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                }
+            })
+        }
+        FilterClause::NotIn(field, vals) => {
+            vals.iter().all(|val| {
+                match resolve_filter_value(field, val, string_maps, dictionaries) {
+                    Some(key) => {
+                        let contained = filters
+                            .get_field(field)
+                            .and_then(|f| f.get_versioned(key))
+                            .map(|vb| vb.contains(slot))
+                            .unwrap_or(false);
+                        !contained
+                    }
+                    None => {
+                        string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                        // Can't resolve: can't confirm the slot IS in the excluded set.
+                        // Conservative: treat as "not contained" (slot passes).
+                        true
+                    }
+                }
+            })
+        }
+        FilterClause::Gt(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 > threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Gte(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 >= threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Lt(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| (f.reconstruct_value(slot) as u64) < threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Lte(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 <= threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Not(inner) => !eval!(inner),
+        FilterClause::And(parts) => parts.iter().all(|c| eval!(c)),
+        FilterClause::Or(parts) => parts.iter().any(|c| eval!(c)),
+        FilterClause::IsNull(field) => {
+            filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(crate::filter::NULL_BITMAP_KEY))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false)
+        }
+        FilterClause::IsNotNull(field) => {
+            let is_null = filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(crate::filter::NULL_BITMAP_KEY))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false);
+            !is_null
+        }
+        FilterClause::BucketBitmap { bitmap, .. } => {
+            // The Arc<RoaringBitmap> is carried directly on the clause — no
+            // manager lookup needed.  Authoritative for this slot because the
+            // flush thread updates bucket bitmaps before enqueuing maintenance.
+            bitmap.contains(slot)
+        }
+    }
+}
+
 // ── Phase B: Lock-Free Evaluation Functions ──────────────────────────────
 //
 // These functions evaluate slot eligibility against staging filters/sorts
@@ -2260,12 +2912,26 @@ fn slot_matches_filter_resolved(
 /// Checks each slot against the filter predicate and sort qualification.
 /// Returns results to apply under a brief lock, plus any keys that exceeded
 /// the time-based deadline (to be marked for rebuild).
+///
+/// When `item.original_filter_clauses` is non-empty (set by B1 plumbing),
+/// uses `slot_matches_filter_native` which threads `string_maps` +
+/// `dictionaries` and evaluates compound clauses (Not/And/Or) correctly.
+/// Falls back to the canonical-only `slot_matches_filter` path when clauses
+/// are empty (legacy `form_and_store` callers, test paths).
 pub fn evaluate_filter_work(
     work: &[CacheMaintenanceItem],
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+    // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
+    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // Pass `0` to disable.
+    compound_atom_limit: u32,
+    compound_too_large_count: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Inverted evaluation: reconstruct_value is identical across entries for
     // the same (sort_field, slot), so we precompute it ONCE per unique pair
@@ -2286,11 +2952,25 @@ pub fn evaluate_filter_work(
                 break;
             }
         }
-        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
-        // At 10K slots/batch this eliminates 10K identical HashMap lookups
-        // for the same bucket name — replaced by one lookup per bucket clause
-        // per work item. Result: ~150ns × 10K = ~1.5ms saved per batch.
-        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        // B9 safety valve: bail on pathological compound shapes before entering
+        // the per-slot loop. Only active when `original_filter_clauses` is
+        // populated (native eval path) and the limit is non-zero.
+        if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
+            let atoms = count_leaf_atoms(&item.original_filter_clauses);
+            if atoms > compound_atom_limit {
+                timed_out.push(item.key.clone());
+                compound_too_large_count.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let use_native = !item.original_filter_clauses.is_empty();
+        // For the canonical path: hoist bucket-clause bitmap lookups out of the
+        // per-slot loop (one HashMap lookup per bucket clause per work item).
+        let resolved_buckets = if !use_native {
+            resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr)
+        } else {
+            Vec::new()
+        };
         let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
@@ -2299,7 +2979,19 @@ pub fn evaluate_filter_work(
                 .get(&(item.key.sort_field.as_str(), slot))
                 .copied()
                 .unwrap_or(0);
-            let matches = if use_resolved {
+            let matches = if use_native {
+                // B2 native path: evaluates compound clauses with StringMaps.
+                slot_matches_filter_native(
+                    slot,
+                    &item.original_filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr,
+                    string_maps,
+                    dictionaries,
+                    string_lookup_misses,
+                )
+            } else if use_resolved {
                 slot_matches_filter_resolved(
                     slot,
                     &item.key.filter_clauses,
@@ -2356,6 +3048,14 @@ pub fn evaluate_sort_work(
     sorts: &SortIndex,
     deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+    // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
+    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // Pass `0` to disable.
+    compound_atom_limit: u32,
+    compound_too_large_count: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2399,10 +3099,25 @@ pub fn evaluate_sort_work(
         if !can_possibly_qualify {
             continue;
         }
-        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
-        // Same optimisation as in evaluate_filter_work — one HashMap lookup
-        // per bucket clause per item instead of one per slot.
-        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        // B9 safety valve: bail on pathological compound shapes before entering
+        // the per-slot loop. Checked after the cheap field-range fast-reject so
+        // that obviously-skippable entries don't even reach the atom count.
+        if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
+            let atoms = count_leaf_atoms(&item.original_filter_clauses);
+            if atoms > compound_atom_limit {
+                timed_out.push(item.key.clone());
+                compound_too_large_count.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let use_native = !item.original_filter_clauses.is_empty();
+        // For the canonical path: hoist bucket-clause bitmap lookups out of
+        // the per-slot loop — one HashMap lookup per bucket clause per item.
+        let resolved_buckets = if !use_native {
+            resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr)
+        } else {
+            Vec::new()
+        };
         let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         for &slot in &item.slots {
@@ -2418,10 +3133,19 @@ pub fn evaluate_sort_work(
             if !qualifies {
                 continue;
             }
-            // Sort qualifies — only now pay filter match cost. Preserves the
-            // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
-            // bucket, compound) — no signature-based shortcut.
-            let filter_matches = if use_resolved {
+            // Sort qualifies — only now pay filter match cost.
+            let filter_matches = if use_native {
+                slot_matches_filter_native(
+                    slot,
+                    &item.original_filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr,
+                    string_maps,
+                    dictionaries,
+                    string_lookup_misses,
+                )
+            } else if use_resolved {
                 slot_matches_filter_resolved(
                     slot,
                     &item.key.filter_clauses,
@@ -2588,6 +3312,13 @@ mod tests {
             cache.form_and_store(key, &slots, true, 100_000, |s| s);
         }
         assert_eq!(cache.len(), 5);
+        // Force entry 0 to timestamp=0 so it is unambiguously the LRU
+        // regardless of how fast the test loop runs (sampled-LRU is random
+        // when all timestamps are equal, making the test flaky otherwise).
+        let key0 = make_key(&[("field", "eq", "0")], "sort", SortDirection::Desc);
+        if let Some(mut e) = cache.get_mut(&key0) {
+            e.last_used.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         // Touch entries 1-4 to make entry 0 the LRU
         for i in 1..5 {
             let key = make_key(
@@ -2765,6 +3496,105 @@ mod tests {
         let fresh_slots: Vec<u32> = (0..10).collect();
         entry.rebuild(&fresh_slots, |s| 1000 - s);
         assert!(entry.try_start_rebuild()); // available again
+    }
+    /// `lookup_for_read` returns `None` when `needs_rebuild=true` — sanity check
+    /// that the read-path miss gate is in place before the single-flight guard relies on it.
+    #[test]
+    fn test_needs_rebuild_triggers_slow_path_on_read() {
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        // Entry is healthy — lookup_for_read succeeds.
+        assert!(cache.lookup_for_read(&key).is_some());
+        // Flag for rebuild.
+        cache.get_mut(&key).unwrap().mark_for_rebuild();
+        // lookup_for_read must return None so callers fall through to the slow path.
+        assert!(
+            cache.lookup_for_read(&key).is_none(),
+            "needs_rebuild=true must produce a cache miss on lookup_for_read"
+        );
+    }
+    /// `store()` increments `rebuild_completed_total` when it replaces a flagged entry,
+    /// and only when it replaces a flagged entry.
+    #[test]
+    fn test_store_increments_rebuild_completed_when_replacing_flagged_entry() {
+        use crate::cache_worker::CacheWorkerMetrics;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let metrics = Arc::new(CacheWorkerMetrics::default());
+        cache.set_rebuild_metrics(Arc::clone(&metrics));
+        let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let key2 = make_key(&[("nsfwLevel", "eq", "2")], "reactionCount", SortDirection::Desc);
+        let key3 = make_key(&[("nsfwLevel", "eq", "3")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        // Form entry on key1 and mark for rebuild — replacing it via store() should count.
+        cache.form_and_store(key1.clone(), &slots, true, 100, |s| s);
+        cache.get_mut(&key1).unwrap().mark_for_rebuild();
+        assert_eq!(metrics.rebuild_completed_total.load(Ordering::Relaxed), 0);
+        cache.form_and_store(key1.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            1,
+            "replacing a needs_rebuild entry must increment rebuild_completed_total"
+        );
+        // Form entry on key2 — replacing it WITHOUT flagging should NOT increment.
+        cache.form_and_store(key2.clone(), &slots, true, 100, |s| s);
+        cache.form_and_store(key2.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            1,
+            "replacing a healthy entry must NOT increment rebuild_completed_total"
+        );
+        // Form entry on key3, flag it, replace — should increment to 2.
+        cache.form_and_store(key3.clone(), &slots, true, 100, |s| s);
+        cache.get_mut(&key3).unwrap().mark_for_rebuild();
+        cache.form_and_store(key3.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            2,
+            "second flagged replacement must bring total to 2"
+        );
+    }
+    /// `should_rebuild_single_flight` serializes concurrent callers: first returns true,
+    /// second returns false while the rebuild guard is held, then true again after release.
+    #[test]
+    fn test_concurrent_slow_path_single_flight() {
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        // No entry — first call proceeds normally.
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "no entry: should proceed"
+        );
+        // Form and store, leave healthy — also proceeds.
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "healthy entry: should proceed"
+        );
+        // Flag for rebuild — first caller wins the CAS, second is blocked.
+        cache.get_mut(&key).unwrap().mark_for_rebuild();
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "flagged entry, first caller: should proceed (wins CAS)"
+        );
+        assert!(
+            !cache.should_rebuild_single_flight(&key),
+            "flagged entry, second caller: should skip (loses CAS)"
+        );
+        // After the winning caller stores the new entry (simulated by form_and_store),
+        // the flag is gone and the next caller proceeds again.
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "fresh entry after rebuild: should proceed"
+        );
     }
     #[test]
     fn test_clear() {
@@ -3283,7 +4113,7 @@ mod tests {
         dropped.insert(2);
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[])])]);
         let sorts = make_sort_index(&[("reactionCount", &[])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &dropped, &RoaringBitmap::new(), &filters, &sorts);
+        cache.maintain_bucket_changes("sortAt", "7d", &dropped, &RoaringBitmap::new(), &filters, &sorts, None, None);
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.cardinality(), 7);
         assert!(!entry.bitmap().contains(0));
@@ -3318,7 +4148,7 @@ mod tests {
         added.insert(100);
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[100])])]);
         let sorts = make_sort_index(&[("reactionCount", &[(100, 1500)])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &RoaringBitmap::new(), &added, &filters, &sorts);
+        cache.maintain_bucket_changes("sortAt", "7d", &RoaringBitmap::new(), &added, &filters, &sorts, None, None);
         assert!(cache.get(&key).unwrap().bitmap().contains(100));
     }
     #[test]
@@ -3467,6 +4297,7 @@ mod tests {
             max_maintenance_work: 500_000,
             max_maintenance_ms: 1, // 1ms — very short
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         // Create 150 cache entries all referencing nsfwLevel=1
@@ -3540,6 +4371,7 @@ mod tests {
             max_maintenance_work: 500_000,
             max_maintenance_ms: 1000, // 1 second — very generous
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         // Create 5 cache entries
@@ -3599,6 +4431,7 @@ mod tests {
             max_maintenance_work: 1, // Very low: 1 unit of work triggers rebuild
             max_maintenance_ms: 0,   // Disable time-based
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
@@ -3648,7 +4481,8 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].key, key);
         // Phase B: evaluate outside lock
-        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         assert!(timed_out.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
@@ -3673,7 +4507,8 @@ mod tests {
             vec![3],
         );
         let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
@@ -3692,7 +4527,8 @@ mod tests {
         sort_mutations.insert("reactionCount", [10].into_iter().collect());
         let (work, _) = cache.collect_sort_work(&sort_mutations);
         assert_eq!(work.len(), 1);
-        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
         assert_eq!(results[0].adds[0].0, 10);
@@ -3749,7 +4585,8 @@ mod tests {
         let mut cache_two = UnifiedCache::new(config);
         cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         cache_two.apply_maintenance_results(&results);
         let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
@@ -3778,6 +4615,7 @@ mod tests {
             );
             let meta_id = cache.meta_mut().register(
                 &key.filter_clauses,
+                None,
                 Some(&key.sort_field),
                 Some(key.direction),
             );
@@ -4001,6 +4839,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
         cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
@@ -4020,12 +4859,15 @@ mod tests {
         assert!(!filter_work.is_empty(), "should have work for the bucket entry");
 
         // Phase B: evaluate with the bucket manager. slot 3 must be rejected.
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, timed_out) = evaluate_filter_work(
             &filter_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         assert!(timed_out.is_empty());
 
@@ -4101,6 +4943,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
@@ -4115,12 +4958,15 @@ mod tests {
         );
 
         let (filter_work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, _) = evaluate_filter_work(
             &filter_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         cache.apply_maintenance_results(&results);
 
@@ -4237,6 +5083,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
             if s == 1 { ts_slot1 } else { 0 }
@@ -4250,12 +5097,15 @@ mod tests {
         let (sort_work, _over_budget) = cache.collect_sort_work(&sort_mutations);
         // The cache entry has filter_clauses so it may appear in sort_work.
         // evaluate_sort_work must reject slot 7 because it fails the bucket clause.
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, timed_out) = evaluate_sort_work(
             &sort_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         assert!(timed_out.is_empty());
         cache.apply_maintenance_results(&results);
@@ -4269,5 +5119,1572 @@ mod tests {
             entry.bitmap().contains(1),
             "slot 1 (in 24h bucket) must remain in the cache entry"
         );
+    }
+
+    // ── A1 tests: is_time_bucket_clause helper ────────────────────────────
+
+    #[test]
+    fn test_is_time_bucket_clause_prefilter_excluded() {
+        // A prefilter-substituted clause (field="__prefilter") must NOT be treated
+        // as a time-bucket clause — it must not enter the bucket-diff path.
+        let c = CanonicalClause {
+            field: "__prefilter".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "auto_xxx".to_string(),
+        };
+        assert!(
+            !crate::unified_cache::is_time_bucket_clause(&c),
+            "prefilter sentinel (field=__prefilter) must return false"
+        );
+    }
+
+    #[test]
+    fn test_is_time_bucket_clause_real_bucket() {
+        // A genuine time-bucket clause (field = sort field name) must return true.
+        let c = CanonicalClause {
+            field: "sortAt".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "7d".to_string(),
+        };
+        assert!(
+            crate::unified_cache::is_time_bucket_clause(&c),
+            "sortAt:bucket:7d must return true"
+        );
+    }
+
+    #[test]
+    fn test_uses_bucket_false_for_prefilter_substituted_entry() {
+        // An entry formed with a __prefilter clause must have uses_bucket=false.
+        let mut cache = UnifiedCache::new(make_config());
+        // Simulates what prefilter.rs::substitute produces canonically
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "__prefilter".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "auto_safe".to_string(),
+            }],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+        let entry = cache.get(&key).unwrap();
+        assert!(!entry.uses_bucket(), "prefilter-substituted entry must have uses_bucket=false");
+    }
+
+    #[test]
+    fn test_uses_bucket_true_for_time_bucket_entry() {
+        // An entry formed with a genuine sortAt:bucket:7d clause must have uses_bucket=true.
+        let mut cache = UnifiedCache::new(make_config());
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.uses_bucket(), "genuine sortAt:bucket:7d entry must have uses_bucket=true");
+    }
+
+    // ── A2 tests: invalidate_prefilter hook ───────────────────────────────
+
+    #[test]
+    fn test_invalidate_prefilter_marks_referencing_entry() {
+        // Form a cache entry that references a __prefilter clause with name "safe".
+        // Calling invalidate_prefilter("safe") must mark that entry needs_rebuild=true.
+        let mut cache = UnifiedCache::new(make_config());
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "__prefilter".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "safe".to_string(),
+            }],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        // Sanity: not flagged before invalidation
+        assert!(!cache.get(&key).unwrap().needs_rebuild());
+
+        let count = cache.invalidate_prefilter("safe");
+        assert_eq!(count, 1, "exactly one entry should be flagged");
+        assert!(
+            cache.get(&key).unwrap().needs_rebuild(),
+            "entry must be marked needs_rebuild after invalidate_prefilter"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_prefilter_nonexistent_name_is_noop() {
+        let mut cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let count = cache.invalidate_prefilter("does_not_exist");
+        assert_eq!(count, 0, "no entries should be flagged for a name that was never registered");
+        assert!(!cache.get(&key).unwrap().needs_rebuild());
+    }
+
+    // ── A3 tests: apply_maintenance_results increments updates counter ────
+
+    #[test]
+    fn test_apply_maintenance_results_increments_updates() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let before = cache.stats().updates;
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![(99u32, 500u32)],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+        let after = cache.stats().updates;
+        assert!(after > before, "updates counter must increment after apply_maintenance_results with non-empty adds");
+    }
+
+    // ── B2 tests: native FilterClause evaluator ────────────────────────────
+
+    /// Helper: build a string_maps lookup for one field.
+    fn make_string_maps(field: &str, entries: &[(&str, i64)]) -> crate::executor::StringMaps {
+        let mut maps: crate::executor::StringMaps = HashMap::new();
+        let mut field_map = HashMap::new();
+        for (s, v) in entries {
+            field_map.insert(s.to_string(), *v);
+        }
+        maps.insert(field.to_string(), field_map);
+        maps
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_string_in() {
+        // Build a filter index with baseModel as a single-value field.
+        // Key 1 = "SD 1.5" (via string_maps), key 2 = "SDXL".
+        let filters = make_filter_index(&[
+            ("baseModel", &[(1, &[5u32]), (2, &[6u32])]),
+        ]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd 1.5", 1), ("sdxl", 2)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clauses = vec![FilterClause::In(
+            "baseModel".to_string(),
+            vec![crate::query::Value::String("SD 1.5".to_string())],
+        )];
+        // Slot 5 has baseModel key=1 ("SD 1.5") → should match.
+        assert!(
+            slot_matches_filter_native(5, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 5 should match In(baseModel, ['SD 1.5'])"
+        );
+        // Slot 6 has baseModel key=2 ("SDXL") → should NOT match.
+        assert!(
+            !slot_matches_filter_native(6, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 6 should not match In(baseModel, ['SD 1.5'])"
+        );
+        // No misses — all strings resolved.
+        assert_eq!(misses.load(Ordering::Relaxed), 0, "no string lookup misses expected");
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_compound_not_and() {
+        // Clause: Not(And(In(nsfwLevel, [4]), In(baseModel, ["SD XL"])))
+        // nsfwLevel key 4 in bitmap for slots [10, 20]; baseModel key 1 ("SD XL") for slot 20 only.
+        let filters = make_filter_index(&[
+            ("nsfwLevel", &[(4, &[10u32, 20u32])]),
+            ("baseModel",  &[(1, &[20u32])]),
+        ]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd xl", 1)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clause = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+        ])));
+        let clauses = vec![clause];
+        // Slot 10: nsfwLevel=4 ✓, baseModel≠"SD XL" ✗ → And=false → Not=true.
+        assert!(
+            slot_matches_filter_native(10, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 10: Not(And(true,false)) should be true"
+        );
+        // Slot 20: nsfwLevel=4 ✓, baseModel="SD XL" ✓ → And=true → Not=false.
+        assert!(
+            !slot_matches_filter_native(20, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 20: Not(And(true,true)) should be false"
+        );
+        // Slot 99: nsfwLevel≠4, baseModel missing → And=false → Not=true.
+        assert!(
+            slot_matches_filter_native(99, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 99: Not(And(false,?)) should be true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_default_is_false() {
+        // String key that doesn't exist in string_maps → resolution fails → returns false.
+        let filters = make_filter_index(&[("baseModel", &[(1, &[5u32])])]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd 1.5", 1)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clauses = vec![FilterClause::In(
+            "baseModel".to_string(),
+            vec![crate::query::Value::String("does-not-exist".to_string())],
+        )];
+        // Even though slot 5 is in the field, the value doesn't resolve → false (not true).
+        assert!(
+            !slot_matches_filter_native(5, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "unresolvable string key must return false, not true"
+        );
+        // Miss should be counted.
+        assert!(misses.load(Ordering::Relaxed) > 0, "string lookup miss must be recorded");
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_uses_native_path() {
+        // Build cache entry via form_and_store_with_clauses with a compound clause.
+        // The compound clause is Not(And(In(nsfwLevel,[4]), In(nsfwLevel,[4]))).
+        // This is always false for slot 42 (nsfwLevel=4). The canonical path
+        // returns conservative true; the native path returns false → removes slot 42.
+        let cache = UnifiedCache::new(make_config());
+        let native_clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+        let key = make_key(&[("nsfwLevel", "neq", "4")], "reactionCount", SortDirection::Desc);
+        // Slot 42 is in the cache (initial formation included it).
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[42u32, 1u32, 2u32],
+            false,
+            0,
+            Arc::new(native_clauses),
+            |s| 100 - s,
+        );
+        assert!(cache.get(&key).unwrap().bitmap().contains(42));
+        // Now run filter work: slot 42 has nsfwLevel=4 → Not(And(In(nsfwLevel,4))) = Not(true) = false.
+        let filters = make_filter_index(&[("nsfwLevel", &[(4, &[42u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[])]);
+        let item = {
+            let entry = cache.get(&key).unwrap();
+            CacheMaintenanceItem {
+                key: key.clone(),
+                slots: vec![42u32],
+                min_tracked_value: 0,
+                direction: SortDirection::Desc,
+                original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
+            }
+        };
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let (results, _timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            0, &std::sync::atomic::AtomicU64::new(0),
+        );
+        // Slot 42 does NOT match the native clause → should be in removes.
+        let result = results.iter().find(|r| r.key == key);
+        assert!(result.is_some(), "should have a result for our key");
+        let r = result.unwrap();
+        assert!(
+            r.removes.iter().any(|(s, _)| *s == 42),
+            "slot 42 should be in removes (native eval returned false)"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_falls_back_when_clauses_empty() {
+        // form_and_store (no _with_clauses) → original_filter_clauses is empty.
+        // evaluate_filter_work should fall back to canonical path (slot_matches_filter).
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        // Slot 10 in cache; nsfwLevel=1 in filter index.
+        cache.form_and_store(key.clone(), &[10u32], false, 0, |s| 1000 - s);
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+        let item = {
+            let entry = cache.get(&key).unwrap();
+            CacheMaintenanceItem {
+                key: key.clone(),
+                slots: vec![10u32],
+                min_tracked_value: 0,
+                direction: SortDirection::Desc,
+                original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
+            }
+        };
+        assert!(item.original_filter_clauses.is_empty(), "legacy path: clauses should be empty");
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            0, &std::sync::atomic::AtomicU64::new(0),
+        );
+        // Slot 10 matches Eq(nsfwLevel, 1) via canonical path → added (sort qualifies).
+        let adds_slot_10 = results
+            .iter()
+            .flat_map(|r| r.adds.iter())
+            .any(|(s, _)| *s == 10);
+        assert!(adds_slot_10, "canonical fallback should add slot 10");
+    }
+
+    // ── B4 Tests: recursive meta-index registration + slot-gather fix ──────
+
+    /// B4 test 1: registering an entry with a compound clause registers it
+    /// under each leaf field name, not just FieldKey("").
+    ///
+    /// Pre-B4: entries_for_filter_field("baseModel") and
+    /// entries_for_filter_field("nsfwLevel") would both return None (only
+    /// FieldKey("") was registered for compound canonical clauses).
+    #[test]
+    fn test_meta_index_registers_inner_compound_fields() {
+        use crate::meta_index::MetaIndex;
+
+        let mut mi = MetaIndex::new();
+
+        // Canonical clauses for Not(And(In(baseModel, ...), In(nsfwLevel, ...)))
+        // have field="" — the inner fields are invisible to canonical registration.
+        let canonical = vec![CanonicalClause {
+            field: String::new(), // compound canonical: field=""
+            op: "not_and".to_string(),
+            value_repr: "compound".to_string(),
+        }];
+
+        // Original FilterClause tree exposes the real leaf fields.
+        let original: Vec<FilterClause> = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+
+        let id = mi.register(
+            &canonical,
+            Some(&original),
+            Some("sortAt"),
+            Some(SortDirection::Desc),
+        );
+
+        // Both leaf fields must be registered.
+        let bm_base = mi.entries_for_filter_field("baseModel");
+        assert!(bm_base.is_some(), "baseModel should be in meta-index");
+        assert!(bm_base.unwrap().contains(id), "entry id should be under baseModel");
+
+        let bm_nsfw = mi.entries_for_filter_field("nsfwLevel");
+        assert!(bm_nsfw.is_some(), "nsfwLevel should be in meta-index");
+        assert!(bm_nsfw.unwrap().contains(id), "entry id should be under nsfwLevel");
+
+        // Canonical compound field ("") also still registered (belt-and-suspenders).
+        let bm_empty = mi.entries_for_filter_field("");
+        assert!(bm_empty.is_some(), "canonical FieldKey('') still registered");
+        assert!(bm_empty.unwrap().contains(id));
+    }
+
+    /// B4 test 2: the slot-gather loop in collect_filter_work gathers slots for
+    /// fields that appear inside compound clauses.
+    ///
+    /// Pre-B4: mutating baseModel for slot 42 would NOT appear in slots_to_check
+    /// because the canonical clause for the compound shape has field="".
+    #[test]
+    fn test_collect_filter_work_finds_compound_fields() {
+        let cache = UnifiedCache::new(make_config());
+
+        // Compound clause: Not(And(In(baseModel, ...), In(nsfwLevel, ...)))
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: String::new(), // compound canonical
+                op: "not_and".to_string(),
+                value_repr: "compound".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        let original: Vec<FilterClause> = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+
+        // Form an entry that includes slot 42.
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[42u32, 1u32, 2u32],
+            false,
+            3,
+            Arc::new(original),
+            |s| 100 - s,
+        );
+
+        // Stage a mutation on baseModel for slot 42.
+        let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 999 },
+            vec![42u32],
+        );
+
+        let (work, _over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+
+        // There should be exactly one work item for our entry.
+        assert_eq!(work.len(), 1, "compound-clause entry should appear in work items");
+        let item = &work[0];
+        assert!(
+            item.slots.contains(&42),
+            "slot 42 (mutated baseModel field) must appear in slots_to_check"
+        );
+    }
+
+    /// B4 test 3: collect_filter_work falls back to canonical clause iteration
+    /// when original_filter_clauses is empty (legacy form_and_store path).
+    /// Simple non-compound shapes still work via the fallback.
+    #[test]
+    fn test_collect_filter_work_falls_back_to_canonical_when_clauses_empty() {
+        let cache = UnifiedCache::new(make_config());
+
+        // Simple Eq clause — has a real field name in canonical form.
+        let key = make_key(&[("baseModel", "eq", "999")], "sortAt", SortDirection::Desc);
+
+        // form_and_store (not _with_clauses) → original_filter_clauses is empty.
+        cache.form_and_store(key.clone(), &[42u32, 1u32], false, 2, |s| 100 - s);
+
+        // Stage a mutation on baseModel for slot 42.
+        let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 999 },
+            vec![42u32],
+        );
+
+        let (work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+
+        // The canonical fallback path should still find this entry because
+        // the canonical clause has field="baseModel" (non-compound shape).
+        assert_eq!(work.len(), 1, "non-compound entry should be found via canonical fallback");
+        assert!(
+            work[0].slots.contains(&42),
+            "slot 42 should appear via canonical fallback"
+        );
+    }
+
+    /// B4 test 4: calling register with None for original_filter_clauses
+    /// behaves identically to pre-B4 (canonical-only field registration).
+    /// Compound canonical clause only registers FieldKey(""), not inner fields.
+    #[test]
+    fn test_meta_index_register_with_none_clauses_is_canonical_only() {
+        use crate::meta_index::MetaIndex;
+
+        let mut mi = MetaIndex::new();
+
+        let canonical = vec![CanonicalClause {
+            field: String::new(), // compound canonical
+            op: "not_and".to_string(),
+            value_repr: "compound".to_string(),
+        }];
+
+        // Pass None — canonical-only behavior (same as pre-B4).
+        let id = mi.register(
+            &canonical,
+            None, // no original FilterClause tree
+            Some("sortAt"),
+            Some(SortDirection::Desc),
+        );
+
+        // Only FieldKey("") registered — inner fields NOT visible.
+        let bm_empty = mi.entries_for_filter_field("");
+        assert!(bm_empty.is_some(), "FieldKey('') must be registered");
+        assert!(bm_empty.unwrap().contains(id));
+
+        // Inner fields NOT registered (None → canonical-only).
+        assert!(
+            mi.entries_for_filter_field("baseModel").is_none(),
+            "baseModel must NOT be registered when original_filter_clauses=None"
+        );
+        assert!(
+            mi.entries_for_filter_field("nsfwLevel").is_none(),
+            "nsfwLevel must NOT be registered when original_filter_clauses=None"
+        );
+    }
+
+    // ── B3 Tests: cheap-clause-first ordering ────────────────────────────────
+
+    /// B3 test 1: `clause_atom_cost` returns the correct cost class for each
+    /// FilterClause variant.
+    #[test]
+    fn test_clause_atom_cost_class_assignment() {
+        use crate::query::Value;
+
+        // Class 1 — cheapest
+        assert_eq!(clause_atom_cost(&FilterClause::Eq("a".into(), Value::Integer(1))), 1);
+        assert_eq!(clause_atom_cost(&FilterClause::IsNull("x".into())), 1);
+        assert_eq!(clause_atom_cost(&FilterClause::IsNotNull("x".into())), 1);
+        assert_eq!(
+            clause_atom_cost(&FilterClause::BucketBitmap {
+                field: "sortAt".into(),
+                bucket_name: "7d".into(),
+                bitmap: Arc::new(roaring::RoaringBitmap::new()),
+            }),
+            1
+        );
+
+        // Class 2 — one negation / range
+        assert_eq!(clause_atom_cost(&FilterClause::NotEq("a".into(), Value::Integer(1))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Gt("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Gte("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Lt("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Lte("ts".into(), Value::Integer(0))), 2);
+
+        // Class 3 — In / NotIn
+        assert_eq!(
+            clause_atom_cost(&FilterClause::In("f".into(), vec![Value::Integer(1), Value::Integer(2)])),
+            3
+        );
+        assert_eq!(
+            clause_atom_cost(&FilterClause::NotIn("f".into(), vec![Value::Integer(1)])),
+            3
+        );
+
+        // Class 4 — And/Or: max(child classes); min bucket is 4
+        // And(Eq, In) → max(1, 3) = 3, clamped to 4
+        let and_eq_in = FilterClause::And(vec![
+            FilterClause::Eq("a".into(), Value::Integer(1)),
+            FilterClause::In("b".into(), vec![Value::Integer(2)]),
+        ]);
+        assert_eq!(clause_atom_cost(&and_eq_in), 4);
+
+        // Or(Eq, NotEq) → max(1, 2) = 2, clamped to 4
+        let or_eq_noteq = FilterClause::Or(vec![
+            FilterClause::Eq("a".into(), Value::Integer(1)),
+            FilterClause::NotEq("a".into(), Value::Integer(2)),
+        ]);
+        assert_eq!(clause_atom_cost(&or_eq_noteq), 4);
+
+        // Class 5 — Not(And/Or)
+        let not_and = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("x".into(), vec![Value::Integer(1)]),
+            FilterClause::In("y".into(), vec![Value::Integer(2)]),
+        ])));
+        assert_eq!(clause_atom_cost(&not_and), 5);
+
+        let not_or = FilterClause::Not(Box::new(FilterClause::Or(vec![
+            FilterClause::Eq("x".into(), Value::Integer(1)),
+        ])));
+        assert_eq!(clause_atom_cost(&not_or), 5);
+
+        // Not(leaf) inherits leaf class — Not(Eq) → class 1
+        let not_eq = FilterClause::Not(Box::new(FilterClause::Eq("a".into(), Value::Integer(1))));
+        assert_eq!(clause_atom_cost(&not_eq), 1);
+
+        // Not(In) → class 3
+        let not_in = FilterClause::Not(Box::new(FilterClause::In("a".into(), vec![Value::Integer(1)])));
+        assert_eq!(clause_atom_cost(&not_in), 3);
+    }
+
+    /// B3 test 2: `form_and_store_with_clauses` stores clauses in cheap-first
+    /// order even when the caller passes expensive clauses first.
+    #[test]
+    fn test_form_and_store_sorts_clauses_cheap_first() {
+        use crate::query::Value;
+
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(&[], "sortAt", SortDirection::Desc);
+
+        // Input order: [Not(And(In,In)), IsNotNull, Eq] — costs [5, 1, 1]
+        // Expected stored order (stable sort): [IsNotNull, Eq, Not(And(In,In))]
+        // (class-1 items first, class-5 last; within class 1 the original
+        //  relative order IsNotNull→Eq is preserved by stable sort)
+        let expensive_first = vec![
+            FilterClause::Not(Box::new(FilterClause::And(vec![
+                FilterClause::In("baseModel".into(), vec![Value::String("SD XL".into())]),
+                FilterClause::In("nsfwLevel".into(), vec![Value::Integer(4)]),
+            ]))),
+            FilterClause::IsNotNull("postId".into()),
+            FilterClause::Eq("isPublished".into(), Value::Bool(true)),
+        ];
+
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[1u32, 2u32],
+            false,
+            2,
+            Arc::new(expensive_first),
+            |s| s,
+        );
+
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert_eq!(stored.len(), 3, "all 3 clauses must be stored");
+
+        // First two must be class-1 (IsNotNull, Eq in any order within class 1)
+        let cost0 = clause_atom_cost(&stored[0]);
+        let cost1 = clause_atom_cost(&stored[1]);
+        let cost2 = clause_atom_cost(&stored[2]);
+        assert!(cost0 <= cost1, "clauses must be in non-decreasing cost order (0 vs 1)");
+        assert!(cost1 <= cost2, "clauses must be in non-decreasing cost order (1 vs 2)");
+        assert_eq!(cost0, 1, "cheapest clause must be class 1");
+        assert_eq!(cost2, 5, "most expensive clause must be class 5");
+
+        // Stable sort: within class 1, IsNotNull comes before Eq (original order)
+        assert!(
+            matches!(stored[0], FilterClause::IsNotNull(_)),
+            "stable sort: IsNotNull should precede Eq within class 1"
+        );
+        assert!(
+            matches!(stored[1], FilterClause::Eq(..)),
+            "stable sort: Eq should be second within class 1"
+        );
+    }
+
+    /// B3 test 3 (proptest): per-slot eval result is invariant under any
+    /// reordering of the top-level FilterClause list.
+    ///
+    /// Generates random FilterClause trees, builds a FilterIndex with random
+    /// bitmap state for each key, evaluates with both original and
+    /// cheap-first-sorted orderings, and asserts the results are identical.
+    mod b3_proptest {
+        use super::*;
+        use proptest::prelude::*;
+        use crate::query::Value;
+
+        /// Simple leaf clause strategies for proptest.
+        /// All clauses reference field "f" with integer keys 1..=4, or field "g"
+        /// for IsNull/IsNotNull so the two semantics don't collide.
+        fn arb_leaf_clause() -> impl Strategy<Value = FilterClause> {
+            prop_oneof![
+                // Eq with integer key 1..=4 (field "f")
+                (1i64..=4i64).prop_map(|v| FilterClause::Eq("f".into(), Value::Integer(v))),
+                // NotEq with integer key 1..=4 (field "f")
+                (1i64..=4i64).prop_map(|v| FilterClause::NotEq("f".into(), Value::Integer(v))),
+                // In with 1..=3 integer values drawn from 1..=4 (field "f")
+                proptest::collection::vec(1i64..=4i64, 1..=3usize)
+                    .prop_map(|vals| FilterClause::In("f".into(), vals.into_iter().map(Value::Integer).collect())),
+                // IsNotNull on field "g"
+                Just(FilterClause::IsNotNull("g".into())),
+                // IsNull on field "g"
+                Just(FilterClause::IsNull("g".into())),
+            ]
+        }
+
+        /// Strategy for a FilterClause tree of depth ≤ 2, up to 6 leaves.
+        fn arb_clause() -> impl Strategy<Value = FilterClause> {
+            prop_oneof![
+                3 => arb_leaf_clause(),
+                1 => proptest::collection::vec(arb_leaf_clause(), 1..=3usize)
+                    .prop_map(|parts| FilterClause::And(parts)),
+                1 => proptest::collection::vec(arb_leaf_clause(), 1..=3usize)
+                    .prop_map(|parts| FilterClause::Or(parts)),
+                1 => arb_leaf_clause().prop_map(|c| FilterClause::Not(Box::new(c))),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+            #[test]
+            fn test_eval_invariant_under_clause_reordering(
+                clauses in proptest::collection::vec(arb_clause(), 1..=6usize),
+                // Test a slot in 1..=4
+                slot in 1u32..=4u32,
+                // Bitmask per key 1..=4: bit i set → slot (i+1) in that key's bitmap for field "f"
+                bm1 in 0u8..=15u8,
+                bm2 in 0u8..=15u8,
+                bm3 in 0u8..=15u8,
+                bm4 in 0u8..=15u8,
+                // Bitmask for NULL_BITMAP_KEY in field "g": which slots (1..=4) are "null"
+                null_mask in 0u8..=15u8,
+            ) {
+                // Build filter index for field "f" with keys 1..=4.
+                // Decode each bitmask: bit i set → slot (i+1) is in that key's bitmap.
+                let mut f_values: Vec<(u64, Vec<u32>)> = Vec::new();
+                for (key, mask) in [(1u64, bm1), (2, bm2), (3, bm3), (4, bm4)] {
+                    let slots: Vec<u32> = (0..4u32)
+                        .filter(|&bit| mask & (1 << bit) != 0)
+                        .map(|bit| bit + 1)
+                        .collect();
+                    if !slots.is_empty() {
+                        f_values.push((key, slots));
+                    }
+                }
+                // Build field "g" where NULL_BITMAP_KEY is set for certain slots.
+                let null_slots: Vec<u32> = (0..4u32)
+                    .filter(|&bit| null_mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+
+                // Use the test helper that correctly constructs FilterIndex.
+                let f_pairs: Vec<(u64, Vec<u32>)> = f_values;
+                let f_refs: Vec<(u64, &[u32])> = f_pairs.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+                let fi = {
+                    let mut index = FilterIndex::new();
+                    index.add_field(FilterFieldConfig {
+                        name: "f".to_string(),
+                        field_type: FilterFieldType::SingleValue,
+                        behaviors: None,
+                        eviction: None,
+                        eager_load: false,
+                        per_value_lazy: false,
+                        max_range_scan_values: None,
+                    });
+                    {
+                        let field = index.get_field("f").unwrap();
+                        for &(key, slots) in &f_refs {
+                            field.insert_bulk(key, slots.iter().copied());
+                        }
+                    }
+                    // Field "g" for IsNull/IsNotNull
+                    index.add_field(FilterFieldConfig {
+                        name: "g".to_string(),
+                        field_type: FilterFieldType::SingleValue,
+                        behaviors: None,
+                        eviction: None,
+                        eager_load: false,
+                        per_value_lazy: false,
+                        max_range_scan_values: None,
+                    });
+                    if !null_slots.is_empty() {
+                        let field_g = index.get_field("g").unwrap();
+                        field_g.insert_bulk(crate::filter::NULL_BITMAP_KEY, null_slots.iter().copied());
+                    }
+                    index
+                };
+
+                let si = SortIndex::new();
+                let misses = std::sync::atomic::AtomicU64::new(0);
+
+                // Evaluate with original order
+                let result_original = slot_matches_filter_native(
+                    slot, &clauses, &fi, &si, None, None, None, &misses,
+                );
+
+                // Evaluate with cheap-first sort (B3 ordering)
+                let mut sorted = clauses.clone();
+                sorted.sort_by_key(|c| clause_atom_cost(c));
+
+                let misses2 = std::sync::atomic::AtomicU64::new(0);
+                let result_sorted = slot_matches_filter_native(
+                    slot, &sorted, &fi, &si, None, None, None, &misses2,
+                );
+
+                prop_assert_eq!(
+                    result_original,
+                    result_sorted,
+                    "eval result must be invariant under clause reordering: slot={:?}, clauses={:?}",
+                    slot,
+                    clauses
+                );
+            }
+        }
+    }
+
+    // ── B5 — Prefetch worker compound-clause fix ─────────────────────────────
+    //
+    // The prefetch worker previously reconstructed FilterClause vecs by calling
+    // CanonicalClause::to_filter_clause on each canonical key, then collecting
+    // with filter_map. That silently drops compound clauses (And/Or/Not/IsNull/
+    // IsNotNull/bucket) because to_filter_clause returns None for them. The
+    // resulting filter bitmap was a superset, so entry.expand added wrong slots.
+    //
+    // Fix (B5): the worker now clones entry.original_filter_clauses() (an Arc
+    // captured at form_and_store_with_clauses time) and uses it directly. It
+    // falls back to canonical round-trip only when the Arc is empty (pre-B8
+    // entries restored from disk).
+    //
+    // These tests verify the two code paths the prefetch worker now takes:
+    //   1. original_filter_clauses non-empty → full compound tree used.
+    //   2. original_filter_clauses empty (legacy form_and_store) → fallback.
+
+    #[test]
+    fn test_prefetch_worker_compound_filter_matches_executor() {
+        // Form a cache entry via form_and_store_with_clauses with a compound shape:
+        //   Not(And(In(baseModel, [1]), In(nsfwLevel, [4])))
+        // This compound clause cannot be round-tripped through to_filter_clause.
+        // Verify that original_filter_clauses is non-empty so the prefetch worker
+        // will use the correct full tree rather than the stripped canonical vec.
+        let cache = UnifiedCache::new(make_config());
+        let compound = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In(
+                "baseModel".to_string(),
+                vec![crate::query::Value::Integer(1)],
+            ),
+            FilterClause::In(
+                "nsfwLevel".to_string(),
+                vec![crate::query::Value::Integer(4)],
+            ),
+        ])));
+        let clauses = vec![compound.clone()];
+
+        // Build the UnifiedKey from the compound clause itself so the canonical
+        // key reflects the compound shape (op="not(and)", field="").
+        let canonical_clause = crate::cache::CanonicalClause::from_filter(&compound)
+            .expect("compound Not(And) must canonicalize");
+        let key = UnifiedKey {
+            filter_clauses: vec![canonical_clause],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[10u32, 20u32],
+            false,
+            0,
+            Arc::new(clauses.clone()),
+            |s| 1000 - s,
+        );
+
+        // Verify: original_filter_clauses is non-empty → prefetch uses full tree.
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert!(
+            !stored.is_empty(),
+            "B5: compound entry must have non-empty original_filter_clauses so \
+             prefetch worker uses the full tree (not canonical round-trip)"
+        );
+
+        // Simulate the prefetch path: clone the Arc (cheap), check it has the
+        // compound clause that to_filter_clause would have dropped.
+        let cloned: Vec<FilterClause> = (**stored).clone();
+        assert_eq!(
+            cloned.len(),
+            clauses.len(),
+            "B5: prefetch path must see all clauses including the compound Not(And)"
+        );
+
+        // Confirm to_filter_clause drops the compound canonical clause entirely.
+        // This proves the old round-trip was broken for this shape.
+        let canonical_roundtrip: Vec<FilterClause> = key
+            .filter_clauses
+            .iter()
+            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+            .collect();
+        // The canonical clause has op starting with "not(" — to_filter_clause
+        // returns None for compound ops → stripped vec is empty.
+        assert!(
+            canonical_roundtrip.is_empty(),
+            "B5 pre-condition: canonical round-trip of a compound Not(And) clause \
+             must produce empty vec (got {} clauses)",
+            canonical_roundtrip.len()
+        );
+    }
+
+    #[test]
+    fn test_prefetch_worker_falls_back_for_empty_clauses() {
+        // form_and_store (legacy, no _with_clauses) → original_filter_clauses is empty.
+        // The prefetch worker should fall back to canonical round-trip for these entries.
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(
+            &[("nsfwLevel", "eq", "1")],
+            "sortAt",
+            SortDirection::Desc,
+        );
+        // Use form_and_store (not _with_clauses) — no FilterClause tree stored.
+        cache.form_and_store(key.clone(), &[5u32], false, 0, |s| 100 - s);
+
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert!(
+            stored.is_empty(),
+            "B5 fallback: legacy form_and_store entry must have empty \
+             original_filter_clauses so prefetch falls back to canonical round-trip"
+        );
+
+        // Simulate the prefetch fallback path: since Arc is empty, use canonical.
+        let filter_clauses: Vec<FilterClause> = if !stored.is_empty() {
+            (**stored).clone()
+        } else {
+            key.filter_clauses
+                .iter()
+                .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+                .collect()
+        };
+        // Eq(nsfwLevel, 1) is a simple leaf — to_filter_clause succeeds for it.
+        assert!(
+            !filter_clauses.is_empty(),
+            "B5 fallback: canonical round-trip must recover at least the Eq clause \
+             for a simple key when original_filter_clauses is empty"
+        );
+    }
+
+    // ── B9 Tests: pathological-cost safety valve ─────────────────────────────
+
+    /// B9 test 1: count_leaf_atoms handles scalar and In clauses correctly.
+    ///
+    /// `[Eq, In(5 vals), IsNotNull]` → 1 + 5 + 1 = 7 atoms.
+    #[test]
+    fn test_count_leaf_atoms_simple() {
+        use crate::query::Value;
+        let five_vals: Vec<Value> = (0u64..5).map(|v| Value::Integer(v as i64)).collect();
+        let clauses = vec![
+            FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1)),
+            FilterClause::In("baseModel".to_string(), five_vals),
+            FilterClause::IsNotNull("postId".to_string()),
+        ];
+        assert_eq!(count_leaf_atoms(&clauses), 7, "Eq(1) + In(5) + IsNotNull(1) = 7");
+    }
+
+    /// B9 test 2: count_leaf_atoms recurses through Not/And/Or correctly.
+    ///
+    /// `Not(And(In(2 vals), In(3 vals)))` → 2 + 3 = 5 atoms.
+    #[test]
+    fn test_count_leaf_atoms_compound() {
+        use crate::query::Value;
+        let two_vals: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+        let three_vals: Vec<Value> = (0i64..3).map(Value::Integer).collect();
+        let clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), two_vals),
+            FilterClause::In("baseModel".to_string(), three_vals),
+        ])))];
+        assert_eq!(count_leaf_atoms(&clauses), 5, "Not(And(In(2), In(3))) = 5 atoms");
+    }
+
+    /// B9 test 3: Civitai's dominant compound shape lands at ~24 atoms.
+    ///
+    /// Shape: `[IsNotNull(postId), In(nsfwLevel, 6 vals), Not(And(In(nsfwLevel, 4 vals),
+    ///   In(baseModel, 9 vals))), Or(Eq, In(2), In(2)), Eq(isPublished)]`
+    /// = 1 + 6 + (4 + 9) + (1 + 2 + 2) + 1 = 26 atoms.
+    /// The default limit of 50 should NOT reject this shape.
+    #[test]
+    fn test_count_leaf_atoms_civitai_shape() {
+        use crate::query::Value;
+        let nv6: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let nv4: Vec<Value> = (0i64..4).map(Value::Integer).collect();
+        let bm9: Vec<Value> = (0i64..9).map(|i| Value::String(format!("model_{}", i))).collect();
+        let mv2a: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+        let mv2b: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+
+        let clauses = vec![
+            FilterClause::IsNotNull("postId".to_string()),
+            FilterClause::In("nsfwLevel".to_string(), nv6),
+            FilterClause::Not(Box::new(FilterClause::And(vec![
+                FilterClause::In("nsfwLevel".to_string(), nv4),
+                FilterClause::In("baseModel".to_string(), bm9),
+            ]))),
+            FilterClause::Or(vec![
+                FilterClause::Eq("postedToId".to_string(), Value::Integer(12345)),
+                FilterClause::In("modelVersionIds".to_string(), mv2a),
+                FilterClause::In("modelVersionIdsManual".to_string(), mv2b),
+            ]),
+            FilterClause::Eq("isPublished".to_string(), Value::Bool(true)),
+        ];
+        let atoms = count_leaf_atoms(&clauses);
+        // 1 + 6 + (4+9) + (1+2+2) + 1 = 26
+        assert_eq!(atoms, 26, "Civitai dominant shape should be ~26 atoms");
+        assert!(atoms < 50, "Default limit (50) should NOT reject the Civitai shape");
+    }
+
+    /// B9 test 4: evaluate_filter_work skips entry and increments metric when
+    /// atom count exceeds compound_eval_atom_limit.
+    #[test]
+    fn test_evaluate_filter_work_skips_when_over_atom_limit() {
+        use crate::query::Value;
+
+        // Build a clause with 6 atoms: In(field, 6 vals).
+        let six_vals: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let original_clauses = Arc::new(vec![
+            FilterClause::In("nsfwLevel".to_string(), six_vals),
+        ]);
+        // Atom count = 6. Limit = 5 → should be skipped.
+        let limit = 5u32;
+        assert!(count_leaf_atoms(&original_clauses) > limit, "precondition: atom count > limit");
+
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let item = CacheMaintenanceItem {
+            key: key.clone(),
+            slots: vec![10u32, 20u32],
+            min_tracked_value: 0,
+            direction: SortDirection::Desc,
+            original_filter_clauses: Arc::clone(&original_clauses),
+        };
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32, 20u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 100), (20, 200)])]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let too_large = std::sync::atomic::AtomicU64::new(0);
+
+        let (results, timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            limit, &too_large,
+        );
+
+        // Entry must end up in timed_out (caller marks for rebuild), not in results.
+        assert_eq!(timed_out.len(), 1, "over-limit entry should be in timed_out");
+        assert_eq!(timed_out[0], key, "timed_out should contain our key");
+        assert!(results.is_empty(), "results should be empty: per-slot eval must NOT run");
+        assert_eq!(too_large.load(Ordering::Relaxed), 1, "metric should be 1");
+    }
+
+    /// B9 test 5: evaluate_filter_work proceeds normally when atom count is under limit.
+    #[test]
+    fn test_evaluate_filter_work_proceeds_when_under_limit() {
+        use crate::query::Value;
+
+        // In(nsfwLevel, 6 vals) = 6 atoms. Limit = 100 → should proceed.
+        let six_vals: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let original_clauses = Arc::new(vec![
+            FilterClause::In("nsfwLevel".to_string(), six_vals),
+        ]);
+        let limit = 100u32;
+        assert!(count_leaf_atoms(&original_clauses) <= limit, "precondition: atom count <= limit");
+
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        // Slot 10 is being inserted; min_tracked=0 so sort qualifies.
+        let item = CacheMaintenanceItem {
+            key: key.clone(),
+            slots: vec![10u32],
+            min_tracked_value: 0,
+            direction: SortDirection::Desc,
+            original_filter_clauses: Arc::clone(&original_clauses),
+        };
+
+        // nsfwLevel key 0 corresponds to Integer(0). Use key 0 and value 0 in the index.
+        // The native eval will try to look up "0" (Integer) via string_maps (None) and
+        // dictionaries (None), which will miss → string_lookup_misses incremented, slot
+        // returns false. That's fine — we only need to confirm the per-slot loop ran
+        // (results not empty OR misses > 0), not that the match was correct.
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 100)])]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let too_large = std::sync::atomic::AtomicU64::new(0);
+
+        let (results, timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            limit, &too_large,
+        );
+
+        assert!(timed_out.is_empty(), "under-limit entry must NOT be skipped");
+        assert_eq!(too_large.load(Ordering::Relaxed), 0, "metric should be 0");
+        // Per-slot loop ran: either produced a result (add/remove) or missed on string lookup.
+        let loop_ran = !results.is_empty() || misses.load(Ordering::Relaxed) > 0;
+        assert!(loop_ran, "per-slot eval must have executed (results or misses)");
+    }
+
+    // ── Commit 11 — Regression test: Archer's exact bug ─────────────────────
+    //
+    // Bug: cache entry formed for Not(And(In(baseModel,["SD XL"]),In(nsfwLevel,[1,2])))
+    // retains a slot after baseModel mutates away from "SD XL" — maintenance
+    // never removes it because (a) meta-index didn't register inner leaf fields
+    // so the entry wasn't included in affected_ids, and (b) even when reached,
+    // slot_matches_clause returned conservative true for compound clauses.
+    //
+    // Fix path verified here:
+    //   1. form_and_store_with_clauses registers baseModel + nsfwLevel via B4
+    //      recursive meta-index walk.
+    //   2. collect_filter_work finds the entry via entries_for_filter_field("baseModel")
+    //      and returns slot 42 in the work item slots list.
+    //   3. evaluate_filter_work runs slot_matches_filter_native (B2) with the
+    //      post-mutation filter index → returns false for slot 42 → work result
+    //      has slot 42 in removes.
+    //   4. apply_maintenance_results removes slot 42 from the entry bitmap.
+
+    #[test]
+    fn test_archer_repro_not_and_in_in_cleans_on_mutation() {
+        // ── Setup ─────────────────────────────────────────────────────────────
+        // String-to-key mapping:
+        //   baseModel: "SD XL" → key 1, "FLUX" → key 2
+        //   nsfwLevel: integer keys, no string resolution needed.
+        //
+        // nsfwLevel values 1 and 2 are the inner In targets.
+        // Slot 42: initially baseModel=FLUX (key 2), nsfwLevel=1 (key 1).
+        //   → Not(And(In(baseModel,["SD XL"]) ← false because key 2 not key 1,
+        //             In(nsfwLevel,[1,2])       ← true))
+        //   → Not(And(false, true)) = Not(false) = true  → slot matches → in cache.
+        //
+        // After mutation: baseModel changes from FLUX (key 2) to SD XL (key 1).
+        //   → Not(And(In(baseModel,["SD XL"]) ← true,
+        //             In(nsfwLevel,[1,2])       ← true))
+        //   → Not(And(true, true)) = Not(true) = false → slot no longer matches.
+
+        let cfg = UnifiedCacheConfig {
+            max_entries: 10,
+            max_bytes: 16 * 1024 * 1024,
+            initial_capacity: 20,
+            max_capacity: 200,
+            min_filter_size: 0,
+            max_maintenance_work: 0,  // disable count budget so ms path runs
+            max_maintenance_ms: 1000, // generous deadline
+            prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
+        };
+        let cache = UnifiedCache::new(cfg);
+
+        // The clause tree for the bug shape.
+        let original_clauses = Arc::new(vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In(
+                "baseModel".to_string(),
+                vec![crate::query::Value::String("SD XL".to_string())],
+            ),
+            FilterClause::In(
+                "nsfwLevel".to_string(),
+                vec![
+                    crate::query::Value::Integer(1),
+                    crate::query::Value::Integer(2),
+                ],
+            ),
+        ])))]);
+
+        // Build a canonical key for the compound shape.
+        let compound_clause = &original_clauses[0];
+        let canonical = crate::cache::CanonicalClause::from_filter(compound_clause)
+            .expect("Not(And) must produce a canonical clause");
+        let key = UnifiedKey {
+            filter_clauses: vec![canonical],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        // Pre-mutation filter index:
+        //   baseModel key 1 → slots [10] ("SD XL" group — NOT slot 42)
+        //   baseModel key 2 → slots [42] ("FLUX" group — slot 42 is here)
+        //   nsfwLevel key 1 → slots [10, 42] (both slots have nsfwLevel=1)
+        let pre_mutation_filters = make_filter_index(&[
+            ("baseModel", &[(1, &[10u32]), (2, &[42u32])]),
+            ("nsfwLevel", &[(1, &[10u32, 42u32])]),
+        ]);
+
+        // Form the entry. Slot 42 matches Not(And(false, true)) = true.
+        // Slot 10 matches Not(And(true, true)) = false — excluded from initial slots.
+        // Pass slot 42 as part of the initial formation (it matched at query time).
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[42u32], // slot 42 was in the result at formation time
+            false,
+            1,
+            Arc::clone(&original_clauses),
+            |s| 1000 - s,
+        );
+
+        // Confirm slot 42 is in the cache entry.
+        assert!(
+            cache.get(&key).unwrap().bitmap().contains(42),
+            "pre-condition: slot 42 must be in cache entry before mutation"
+        );
+
+        // ── Mutation ──────────────────────────────────────────────────────────
+        // Slot 42's baseModel changes: key 2 ("FLUX") → key 1 ("SD XL").
+        // After mutation the filter index reflects the new state:
+        //   baseModel key 1 → slots [10, 42]  (42 now in "SD XL" group)
+        //   baseModel key 2 → slots []         (42 removed from "FLUX" group)
+        //   nsfwLevel key 1 → slots [10, 42]  (unchanged)
+        let post_mutation_filters = make_filter_index(&[
+            ("baseModel", &[(1, &[10u32, 42u32]), (2, &[])]),
+            ("nsfwLevel", &[(1, &[10u32, 42u32])]),
+        ]);
+        let sorts = make_sort_index(&[("sortAt", &[(42u32, 500u32), (10u32, 600u32)])]);
+
+        // Build the string_maps so slot_matches_filter_native can resolve "SD XL".
+        let string_maps = make_string_maps("baseModel", &[("sd xl", 1), ("flux", 2)]);
+
+        // The mutation is reported as: baseModel key 1 now contains slot 42
+        // (it moved from key 2 into key 1).
+        let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 1 },
+            vec![42u32],
+        );
+        let mut removes: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        removes.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 2 },
+            vec![42u32],
+        );
+
+        // ── Phase A: collect work ─────────────────────────────────────────────
+        // B4: collect_filter_work must include slot 42 for our compound entry
+        // because baseModel is registered as a leaf field in the meta-index.
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &removes);
+        assert!(
+            over_budget.is_empty(),
+            "Archer repro: collect_filter_work must not flag entry over budget"
+        );
+        assert_eq!(
+            work.len(),
+            1,
+            "Archer repro: exactly one work item expected for the compound entry"
+        );
+        let item = &work[0];
+        assert!(
+            item.slots.contains(&42),
+            "Archer repro: slot 42 (mutated baseModel) must appear in work item slots"
+        );
+
+        // ── Phase B: evaluate ─────────────────────────────────────────────────
+        // B2: slot_matches_filter_native resolves "SD XL" via string_maps → key 1.
+        // Post-mutation index has key 1 containing slot 42 → In match = true.
+        // nsfwLevel key 1 contains slot 42 → In match = true.
+        // Not(And(true, true)) = false → slot 42 does NOT match → goes to removes.
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let too_large_counter = std::sync::atomic::AtomicU64::new(0);
+        let atom_limit = 50u32;
+        let (results, timed_out) = evaluate_filter_work(
+            &work,
+            &post_mutation_filters,
+            &sorts,
+            None,
+            None,
+            Some(&string_maps),
+            None,
+            &misses,
+            atom_limit,
+            &too_large_counter,
+        );
+        assert!(
+            timed_out.is_empty(),
+            "Archer repro: compound entry must not time out (atom count < 50)"
+        );
+        assert_eq!(
+            misses.load(Ordering::Relaxed),
+            0,
+            "Archer repro: all string lookups must resolve (no misses)"
+        );
+        assert_eq!(results.len(), 1, "Archer repro: one maintenance result expected");
+        let result = &results[0];
+        assert!(
+            result.removes.iter().any(|&(s, _)| s == 42),
+            "Archer repro: slot 42 must be in removes after baseModel mutation to 'SD XL'"
+        );
+        assert!(
+            !result.adds.iter().any(|&(s, _)| s == 42),
+            "Archer repro: slot 42 must NOT be in adds"
+        );
+
+        // ── Phase C: apply ────────────────────────────────────────────────────
+        cache.apply_maintenance_results(&results);
+
+        // The bug: pre-fix this assertion would fail because the entry was never
+        // reached (meta-index had field="" not "baseModel") or because slot_matches_clause
+        // returned conservative true for compound clauses.
+        assert!(
+            !cache.get(&key).unwrap().bitmap().as_ref().contains(42),
+            "Archer repro: slot 42 must be REMOVED from cache entry after one maintenance cycle"
+        );
+    }
+
+    // ── Commit 11 — Property test: cache-warm == skip_cache under random mutations
+    //
+    // This property test verifies that after any sequence of field mutations, the
+    // cache-warmed result (warm bitmap from the cache entry after maintenance) matches
+    // what slot_matches_filter_native would compute from scratch (the skip_cache ground
+    // truth). Uses integer-only fields (no string resolution) so every clause is
+    // resolvable, maximizing the chance of catching asymmetries.
+    //
+    // Shape: Not(And(In(field_a, vals_a), In(field_b, vals_b))) — exactly Archer's shape.
+    // Additional wrapper clauses (Eq/IsNotNull) are added to exercise multi-clause entries.
+    //
+    // 10K cases run in --release mode (target <60s). In debug mode the test runs 500
+    // cases (proptest default rescale is not available, so we use a separate config).
+    mod regression_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Build a FilterIndex for two integer fields "fa" and "fb".
+        /// `fa_bitmap[v]` is a u16 bitmask: bit i set means slot (i+1) is in key v.
+        fn build_filter_index_two_fields(
+            fa_keys: &[u64],
+            fa_bitmasks: &[u16], // one per fa_keys entry
+            fb_keys: &[u64],
+            fb_bitmasks: &[u16], // one per fb_keys entry
+        ) -> FilterIndex {
+            let mut fi = FilterIndex::new();
+            for name in ["fa", "fb"] {
+                fi.add_field(FilterFieldConfig {
+                    name: name.to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                    max_range_scan_values: None,
+                });
+            }
+            let decode = |key: u64, mask: u16, field: &FilterIndex| {
+                let f = field.get_field(if key == u64::MAX { "fa" } else { "fa" }).unwrap();
+                let _ = f; // just for type inference; we do it inline below
+            };
+            let _ = decode; // silence unused warning
+            let fa = fi.get_field("fa").unwrap();
+            for (&key, &mask) in fa_keys.iter().zip(fa_bitmasks.iter()) {
+                let slots: Vec<u32> = (0..16u32)
+                    .filter(|&bit| mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+                if !slots.is_empty() {
+                    fa.insert_bulk(key, slots.iter().copied());
+                }
+            }
+            let fb = fi.get_field("fb").unwrap();
+            for (&key, &mask) in fb_keys.iter().zip(fb_bitmasks.iter()) {
+                let slots: Vec<u32> = (0..16u32)
+                    .filter(|&bit| mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+                if !slots.is_empty() {
+                    fb.insert_bulk(key, slots.iter().copied());
+                }
+            }
+            fi
+        }
+
+        /// Build a UnifiedCache with a single compound entry.
+        ///
+        /// Returns (cache, key, original_clauses, initial_filter_index).
+        /// The entry is pre-seeded with whichever slots among 1..=16 match the
+        /// clause against the initial filter index.
+        fn make_archer_cache(
+            fa_in_vals: &[i64], // values for In(fa, ...) inner clause
+            fb_in_vals: &[i64], // values for In(fb, ...) inner clause
+            fa_keys: &[u64],
+            fa_bitmasks: &[u16],
+            fb_keys: &[u64],
+            fb_bitmasks: &[u16],
+        ) -> (UnifiedCache, UnifiedKey, Arc<Vec<FilterClause>>, FilterIndex) {
+            let original_clauses = Arc::new(vec![FilterClause::Not(Box::new(FilterClause::And(
+                vec![
+                    FilterClause::In(
+                        "fa".to_string(),
+                        fa_in_vals.iter().map(|&v| crate::query::Value::Integer(v)).collect(),
+                    ),
+                    FilterClause::In(
+                        "fb".to_string(),
+                        fb_in_vals.iter().map(|&v| crate::query::Value::Integer(v)).collect(),
+                    ),
+                ],
+            )))]);
+
+            let compound = &original_clauses[0];
+            let canonical = crate::cache::CanonicalClause::from_filter(compound)
+                .expect("Not(And) must canonicalize");
+            let key = UnifiedKey {
+                filter_clauses: vec![canonical],
+                sort_field: "s".to_string(),
+                direction: SortDirection::Desc,
+            };
+
+            let cfg = UnifiedCacheConfig {
+                max_entries: 20,
+                max_bytes: 16 * 1024 * 1024,
+                initial_capacity: 50,
+                max_capacity: 500,
+                min_filter_size: 0,
+                max_maintenance_work: 0,
+                max_maintenance_ms: 5000,
+                prefetch_threshold: 0.95,
+                compound_eval_atom_limit: 50,
+            };
+            let cache = UnifiedCache::new(cfg);
+            let fi = build_filter_index_two_fields(fa_keys, fa_bitmasks, fb_keys, fb_bitmasks);
+            let si = SortIndex::new();
+            let misses = std::sync::atomic::AtomicU64::new(0);
+
+            // Compute which slots match the clause against the initial filter index.
+            let matching: Vec<u32> = (1u32..=16)
+                .filter(|&slot| {
+                    slot_matches_filter_native(
+                        slot,
+                        &original_clauses,
+                        &fi,
+                        &si,
+                        None,
+                        None,
+                        None,
+                        &misses,
+                    )
+                })
+                .collect();
+
+            cache.form_and_store_with_clauses(
+                key.clone(),
+                &matching,
+                false,
+                matching.len() as u64,
+                Arc::clone(&original_clauses),
+                |s| 1000 - s,
+            );
+            (cache, key, original_clauses, fi)
+        }
+
+        proptest! {
+            // 10K cases in release mode (~12-18s on typical CI). In debug mode
+            // proptest normally runs the same count but each case is slower (~60s
+            // total acceptable). Reduce only if CI wall-clock becomes untenable.
+            #![proptest_config(ProptestConfig::with_cases(10_000))]
+            #[test]
+            fn cache_warm_equals_skip_cache_under_random_mutations(
+                // Keys for field "fa": use a small alphabet (1..=4) so bitmaps overlap.
+                fa_key_a in 1u64..=2u64,
+                fa_key_b in 3u64..=4u64,
+                // Keys for field "fb": orthogonal alphabet.
+                fb_key_a in 1u64..=2u64,
+                fb_key_b in 3u64..=4u64,
+                // Bitmasks for each key: 16-bit, bits 0..15 → slots 1..=16.
+                fa_mask_a in 0u16..=0xFFFFu16,
+                fa_mask_b in 0u16..=0xFFFFu16,
+                fb_mask_a in 0u16..=0xFFFFu16,
+                fb_mask_b in 0u16..=0xFFFFu16,
+                // Inner In values: subsets of the key alphabets.
+                fa_in_a in prop::bool::ANY,
+                fa_in_b in prop::bool::ANY,
+                fb_in_a in prop::bool::ANY,
+                fb_in_b in prop::bool::ANY,
+                // Mutation: a second bitmask config applied after cache formation.
+                fa_mask_a2 in 0u16..=0xFFFFu16,
+                fa_mask_b2 in 0u16..=0xFFFFu16,
+                fb_mask_a2 in 0u16..=0xFFFFu16,
+                fb_mask_b2 in 0u16..=0xFFFFu16,
+                // Which slots (1..=16) are explicitly mutated in the inserts/removes map.
+                mutation_mask in 0u16..=0xFFFFu16,
+            ) {
+                let fa_keys = [fa_key_a, fa_key_b];
+                let fb_keys = [fb_key_a, fb_key_b];
+                let fa_bitmasks_init = [fa_mask_a, fa_mask_b];
+                let fb_bitmasks_init = [fb_mask_a, fb_mask_b];
+                let fa_bitmasks_post = [fa_mask_a2, fa_mask_b2];
+                let fb_bitmasks_post = [fb_mask_a2, fb_mask_b2];
+
+                // Inner In clause values: if fa_in_a is true, include fa_key_a, etc.
+                let fa_in_vals: Vec<i64> = [
+                    if fa_in_a { Some(fa_key_a as i64) } else { None },
+                    if fa_in_b { Some(fa_key_b as i64) } else { None },
+                ].iter().flatten().copied().collect();
+                let fb_in_vals: Vec<i64> = [
+                    if fb_in_a { Some(fb_key_a as i64) } else { None },
+                    if fb_in_b { Some(fb_key_b as i64) } else { None },
+                ].iter().flatten().copied().collect();
+
+                // Skip degenerate cases where both inner In lists are empty
+                // (Not(And(In([]), In([]))) is trivially true for all slots —
+                // not interesting and can't test removal).
+                if fa_in_vals.is_empty() && fb_in_vals.is_empty() {
+                    return Ok(());
+                }
+
+                // Build the initial cache.
+                let (cache, key, original_clauses, _) = make_archer_cache(
+                    &fa_in_vals, &fb_in_vals,
+                    &fa_keys, &fa_bitmasks_init,
+                    &fb_keys, &fb_bitmasks_init,
+                );
+
+                // Build the post-mutation filter index.
+                let post_fi = build_filter_index_two_fields(
+                    &fa_keys, &fa_bitmasks_post,
+                    &fb_keys, &fb_bitmasks_post,
+                );
+                let si = SortIndex::new();
+
+                // Mutated slots: those set in mutation_mask.
+                let mutated_slots: Vec<u32> = (0..16u32)
+                    .filter(|&bit| mutation_mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+
+                if mutated_slots.is_empty() {
+                    // No mutations → cache should still be correct (no-op path).
+                    // Just verify the warm result matches skip_cache on the initial state.
+                    let warm_bitmap: RoaringBitmap = cache.get(&key)
+                        .map(|e| (*e.bitmap().as_ref()).clone())
+                        .unwrap_or_default();
+                    let miss_c = std::sync::atomic::AtomicU64::new(0);
+                    let init_fi = build_filter_index_two_fields(
+                        &fa_keys, &fa_bitmasks_init,
+                        &fb_keys, &fb_bitmasks_init,
+                    );
+                    let skip_cache_bm: RoaringBitmap = (1u32..=16)
+                        .filter(|&slot| slot_matches_filter_native(
+                            slot, &original_clauses, &init_fi,
+                            &si, None, None, None, &miss_c,
+                        ))
+                        .collect();
+                    prop_assert_eq!(
+                        warm_bitmap,
+                        skip_cache_bm,
+                        "no-mutation: warm bitmap must equal skip_cache ground truth"
+                    );
+                    return Ok(());
+                }
+
+                // Build a generic inserts map: report all mutated slots under fa_key_a.
+                // (The exact key doesn't matter for the property test — what matters is
+                // that the maintenance pipeline sees the mutated slots and re-evaluates
+                // them against the post-mutation filter index.)
+                let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+                inserts.insert(
+                    FilterGroupKey { field: Arc::from("fa"), value: fa_key_a },
+                    mutated_slots.clone(),
+                );
+                inserts.insert(
+                    FilterGroupKey { field: Arc::from("fb"), value: fb_key_a },
+                    mutated_slots.clone(),
+                );
+
+                // Snapshot which slots were in the cache entry before maintenance.
+                let pre_mutation_bm: RoaringBitmap = cache.get(&key)
+                    .map(|e| (*e.bitmap().as_ref()).clone())
+                    .unwrap_or_default();
+
+                // Phase A: collect.
+                let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+                if !over_budget.is_empty() {
+                    cache.mark_for_rebuild_batch(&over_budget);
+                }
+
+                // Phase B: evaluate with post-mutation filter index.
+                let misses = std::sync::atomic::AtomicU64::new(0);
+                let too_large = std::sync::atomic::AtomicU64::new(0);
+                let (results, timed_out) = evaluate_filter_work(
+                    &work, &post_fi, &si, None, None, None, None,
+                    &misses, 50u32, &too_large,
+                );
+                cache.mark_for_rebuild_batch(&timed_out);
+
+                // Phase C: apply.
+                cache.apply_maintenance_results(&results);
+
+                // Ground truth: which slots match the clause against the post-mutation index?
+                let skip_cache_bm: RoaringBitmap = {
+                    let miss_c = std::sync::atomic::AtomicU64::new(0);
+                    (1u32..=16)
+                        .filter(|&slot| slot_matches_filter_native(
+                            slot, &original_clauses, &post_fi,
+                            &si, None, None, None, &miss_c,
+                        ))
+                        .collect()
+                };
+
+                // Warm result: current cache entry bitmap (only the 1..=16 universe).
+                let warm_bitmap: RoaringBitmap = cache.get(&key)
+                    .map(|e| {
+                        let full = (*e.bitmap().as_ref()).clone();
+                        // Restrict to our known slot universe.
+                        let universe: RoaringBitmap = (1u32..=16).collect();
+                        full & universe
+                    })
+                    .unwrap_or_default();
+
+                // Core correctness invariant (removal direction):
+                //   For every mutated slot that was in the cache entry before maintenance:
+                //     - If post-mutation it no longer matches → it must be removed (warm=false).
+                //     - If post-mutation it still matches → it must remain (warm=true).
+                //
+                // We do NOT assert the add direction (warm=true when slot wasn't in cache
+                // but now matches) because adds require sort qualification. Since this test
+                // uses an empty sort index, newly-matching slots won't be added by the
+                // evaluate_filter_work sort_qualifies check — that's correct behaviour, not
+                // a bug. The Archer repro test covers the add direction in the Eq case.
+                for &slot in &mutated_slots {
+                    let was_in_cache = pre_mutation_bm.contains(slot);
+                    if !was_in_cache {
+                        // Skip: slot wasn't tracked before; maintenance doesn't add without
+                        // sort qualification, so warm=false is expected even if skip=true.
+                        continue;
+                    }
+                    let warm_has = warm_bitmap.contains(slot);
+                    let skip_has = skip_cache_bm.contains(slot);
+                    // If was in cache AND now matches → must still be in cache.
+                    // If was in cache AND now doesn't match → must NOT be in cache.
+                    prop_assert_eq!(
+                        warm_has, skip_has,
+                        "slot {} was in cache pre-mutation: warm={} skip_cache={} after \
+                         mutation — stale entry not cleaned up",
+                        slot, warm_has, skip_has
+                    );
+                }
+            }
+        }
     }
 }

@@ -439,6 +439,13 @@ pub struct CacheConfig {
     /// worker has been validated on local 107M data.
     #[serde(default)]
     pub async_maintenance: bool,
+    /// B9 safety valve: maximum total leaf-atom count across an entry's
+    /// `FilterClause` tree before live maintenance skips per-slot eval and marks
+    /// the entry for rebuild instead. Civitai's dominant shape is ~24 atoms;
+    /// the default 50 gives 2× margin. Set to 0 to disable. Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.compound_eval_atom_limit`.
+    #[serde(default = "default_compound_eval_atom_limit")]
+    pub compound_eval_atom_limit: u32,
 }
 fn default_cache_max_entries() -> usize {
     100_000
@@ -481,6 +488,9 @@ fn default_max_maintenance_ms() -> u64 {
     // async cache worker runs on its own thread so no deadline is needed.
     0
 }
+fn default_compound_eval_atom_limit() -> u32 {
+    50 // 2× Civitai's dominant compound shape (~24 atoms)
+}
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -498,6 +508,7 @@ impl Default for CacheConfig {
             max_maintenance_work: default_max_maintenance_work(),
             max_maintenance_ms: default_max_maintenance_ms(),
             async_maintenance: false,
+            compound_eval_atom_limit: default_compound_eval_atom_limit(),
         }
     }
 }

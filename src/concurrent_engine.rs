@@ -249,6 +249,14 @@ pub struct ConcurrentEngine {
     case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
     /// Per-field dictionaries for LowCardinalityString fields.
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
+    /// Shared string_maps handle for the flush thread and cache worker.
+    /// Updated by `set_string_maps` so background threads always see the latest.
+    shared_string_maps: Arc<ArcSwap<Option<StringMaps>>>,
+    /// Shared dictionaries handle for the flush thread and cache worker.
+    /// Updated by `set_dictionaries` so background threads see fresh values.
+    /// Wraps `Arc<HashMap<...>>` so the same allocation can be shared with
+    /// `self.dictionaries` without cloning the (non-Clone) `FieldDictionary` values.
+    shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>>,
     /// Unified cache: primary query result cache. Interior-mutable; callers
     /// invoke methods directly on the `Arc` (no outer `Mutex`/`RwLock`).
     unified_cache: Arc<UnifiedCache>,
@@ -632,6 +640,7 @@ impl ConcurrentEngine {
             max_maintenance_work: config.cache.max_maintenance_work,
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
+            compound_eval_atom_limit: config.cache.compound_eval_atom_limit,
         };
         // Cache-worker metrics created early so the cache can hold an Arc to
         // it for reason-attributed rebuild counters (alive_change,
@@ -653,11 +662,21 @@ impl ConcurrentEngine {
                                 meta.tombstones.len(),
                                 meta.next_entry_id
                             );
-                            // Restore meta-index registrations
+                            // Restore meta-index registrations. Pass the
+                            // persisted FilterClause tree (V2 only; V1 entries
+                            // have empty Vec which becomes None) so leaf fields
+                            // of compound shapes get registered for write-path
+                            // discovery — matches the B4 live-register behavior.
                             for entry in &meta.entries {
+                                let originals = if entry.original_filter_clauses.is_empty() {
+                                    None
+                                } else {
+                                    Some(entry.original_filter_clauses.as_slice())
+                                };
                                 uc.meta_mut().register_with_id(
                                     entry.entry_id,
                                     &entry.filter_clauses,
+                                    originals,
                                     Some(&entry.sort_field),
                                     Some(entry.direction),
                                 );
@@ -676,6 +695,13 @@ impl ConcurrentEngine {
                                 .map(|e| (e.entry_id, e.total_matched))
                                 .collect();
                             uc.set_meta_total_matched(total_matched_map);
+                            // Store original FilterClause trees (V2 only; V1 entries have Vec::new()).
+                            let original_fc_map: HashMap<crate::meta_index::CacheEntryId, Vec<crate::query::FilterClause>> = meta.entries
+                                .iter()
+                                .filter(|e| !e.original_filter_clauses.is_empty())
+                                .map(|e| (e.entry_id, e.original_filter_clauses.clone()))
+                                .collect();
+                            uc.set_meta_original_filter_clauses(original_fc_map);
                             // Record pending shards from registered entries
                             let mut shard_keys = HashSet::new();
                             for entry in &meta.entries {
@@ -717,6 +743,12 @@ impl ConcurrentEngine {
         };
         let unified_cache = Arc::new(uc);
         unified_cache.set_rebuild_metrics(Arc::clone(&cache_worker_metrics));
+        // Shared string_maps + dictionaries for native FilterClause eval (B2).
+        // Initialized empty; populated by set_string_maps / set_dictionaries.
+        let shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+        let shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> =
+            Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new())));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
@@ -1078,6 +1110,8 @@ impl ConcurrentEngine {
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
+                shared_string_maps: Arc::new(ArcSwap::from_pointee(None)),
+                shared_dictionaries: Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new()))),
                 unified_cache,
                 bound_store,
                 flush_publish_count,
@@ -1181,6 +1215,11 @@ impl ConcurrentEngine {
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
             let flush_cache_work_tx = cache_work_tx.clone();
             let flush_cache_worker_metrics = Arc::clone(&cache_worker_metrics);
+            // Shared string_maps + dictionaries for native FilterClause eval (B2).
+            // Updated by set_string_maps/set_dictionaries via ArcSwap so the flush
+            // thread always sees the latest without holding a lock.
+            let flush_shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> = Arc::clone(&shared_string_maps);
+            let flush_shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> = Arc::clone(&shared_dictionaries);
             thread::Builder::new()
                 .name("bitdex-flush".to_string())
                 .spawn(move || {
@@ -1688,16 +1727,45 @@ impl ConcurrentEngine {
                                 .as_ref()
                                 .map(|arc| arc.load_full());
                             let tb_ref = tb_guard.as_deref();
+                            // Load string_maps + dictionaries for native FilterClause eval.
+                            let sm_guard = flush_shared_string_maps.load_full();
+                            let sm_ref = (*sm_guard).as_ref();
+                            let dict_guard = flush_shared_dictionaries.load_full();
+                            let dict_inner = Arc::clone(&*dict_guard);
+                            let dict_ref: &HashMap<String, crate::dictionary::FieldDictionary> = &*dict_inner;
+                            let flush_string_misses = std::sync::atomic::AtomicU64::new(0);
+                            let flush_compound_too_large = std::sync::atomic::AtomicU64::new(0);
+                            let compound_atom_limit = flush_unified_cache.compound_eval_atom_limit();
                             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline, tb_ref)
+                                evaluate_filter_work(
+                                    &filter_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    sm_ref, Some(dict_ref), &flush_string_misses,
+                                    compound_atom_limit, &flush_compound_too_large,
+                                )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
                             let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
-                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline, tb_ref)
+                                evaluate_sort_work(
+                                    &sort_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    sm_ref, Some(dict_ref), &flush_string_misses,
+                                    compound_atom_limit, &flush_compound_too_large,
+                                )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
+                            let flush_misses = flush_string_misses.load(Ordering::Relaxed);
+                            if flush_misses > 0 {
+                                flush_cache_worker_metrics
+                                    .string_lookup_misses_total
+                                    .fetch_add(flush_misses, Ordering::Relaxed);
+                            }
+                            let flush_too_large = flush_compound_too_large.load(Ordering::Relaxed);
+                            if flush_too_large > 0 {
+                                flush_cache_worker_metrics
+                                    .marked_for_rebuild_compound_too_large_total
+                                    .fetch_add(flush_too_large, Ordering::Relaxed);
+                            }
                             let phase_b_ns = t_phase_b.elapsed().as_nanos() as u64;
                             let ct_filter_results = filter_results.len();
                             let ct_sort_results = sort_results.len();
@@ -2794,6 +2862,7 @@ impl ConcurrentEngine {
                                                 min_tracked_value: entry.min_tracked_value(),
                                                 total_matched: entry.total_matched(),
                                                 has_more: entry.has_more(),
+                                                original_filter_clauses: (**entry.original_filter_clauses()).clone(),
                                             }
                                         } else {
                                             crate::bound_store::MetaEntry {
@@ -2806,6 +2875,7 @@ impl ConcurrentEngine {
                                                 min_tracked_value: 0,
                                                 total_matched: 0,
                                                 has_more: true,
+                                                original_filter_clauses: Vec::new(),
                                             }
                                         }
                                     })
@@ -3211,7 +3281,12 @@ impl ConcurrentEngine {
                 .name("bitdex-prefetch".to_string())
                 .spawn(move || {
                     while let Ok(ukey) = prefetch_rx.recv() {
-                        // Read entry state under lock, then drop lock before doing work
+                        // Read entry state under lock, then drop lock before doing work.
+                        // Also clone the original FilterClause Arc so compound clauses
+                        // (And/Or/Not/IsNull/IsNotNull/bucket) survive the lock release —
+                        // CanonicalClause::to_filter_clause returns None for those, so a
+                        // plain filter_map would silently drop them and produce a superset
+                        // filter bitmap, causing entry.expand to add wrong slots (B5 fix).
                         let work = {
                             let uc = &pf_cache;
                             if let Some(entry) = uc.get(&ukey) {
@@ -3223,14 +3298,15 @@ impl ConcurrentEngine {
                                     let cap = entry.capacity();
                                     let max_cap = entry.max_capacity();
                                     let min_val = entry.min_tracked_value();
+                                    let original_clauses = Arc::clone(entry.original_filter_clauses());
                                     entry.set_prefetching(true);
-                                    Some((cap, max_cap, min_val))
+                                    Some((cap, max_cap, min_val, original_clauses))
                                 }
                             } else {
                                 None
                             }
                         };
-                        let Some((capacity, max_capacity, min_tracked_value)) = work else {
+                        let Some((capacity, max_capacity, min_tracked_value, original_clauses)) = work else {
                             continue;
                         };
                         tracing::debug!(
@@ -3245,10 +3321,19 @@ impl ConcurrentEngine {
                             &snap.sorts,
                             pf_config.max_page_size,
                         );
-                        // Convert canonical clauses back to FilterClauses
-                        let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
-                            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
-                            .collect();
+                        // Use the original FilterClause tree stored on the entry (B5).
+                        // This preserves compound shapes (And/Or/Not/IsNull/IsNotNull/bucket)
+                        // that CanonicalClause::to_filter_clause cannot round-trip.
+                        // Fall back to canonical round-trip only for pre-B1 entries where
+                        // original_filter_clauses is empty (e.g. entries restored from disk
+                        // before the B8 meta.bin V2 upgrade).
+                        let filter_clauses: Vec<FilterClause> = if !original_clauses.is_empty() {
+                            (*original_clauses).clone()
+                        } else {
+                            ukey.filter_clauses.iter()
+                                .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+                                .collect()
+                        };
                         // Resolve filters
                         let _now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -3396,6 +3481,8 @@ impl ConcurrentEngine {
                 },
                 Arc::clone(&cache_worker_metrics),
                 Arc::clone(&shutdown),
+                Arc::clone(&shared_string_maps),
+                Arc::clone(&shared_dictionaries),
             );
             // Attach time buckets so the async worker evaluates bucket clauses
             // correctly (bitmap.contains) rather than always returning true.
@@ -3443,6 +3530,8 @@ impl ConcurrentEngine {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
+            shared_string_maps: Arc::new(ArcSwap::from_pointee(None)),
+            shared_dictionaries: Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new()))),
             unified_cache,
             bound_store,
             flush_publish_count,
@@ -3542,6 +3631,7 @@ impl ConcurrentEngine {
     /// Set the string maps for MappedString field query resolution.
     /// Call after creating the engine with schema data that includes string_map entries.
     pub fn set_string_maps(&mut self, maps: StringMaps) {
+        self.shared_string_maps.store(Arc::new(Some(maps.clone())));
         self.string_maps = Some(Arc::new(maps));
     }
     /// Set the case-sensitive fields for string matching control.
@@ -3600,13 +3690,25 @@ impl ConcurrentEngine {
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
         &self.bitmap_memory_cache
     }
+    /// Count cache entries by clause type for scrape-time gauges (A3).
+    /// Returns (substituted_entries, compound_clause_entries).
+    pub fn unified_cache_entry_counts(&self) -> (u64, u64) {
+        self.unified_cache.count_by_clause_type()
+    }
+    /// Access the unified cache for diagnostic reads (A4).
+    pub fn unified_cache_ref(&self) -> &UnifiedCache {
+        &self.unified_cache
+    }
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
     pub fn compaction_skipped_count(&self) -> u64 {
         self.compaction_skipped.load(Ordering::Relaxed)
     }
     /// Set the per-field dictionaries for LowCardinalityString fields.
     pub fn set_dictionaries(&mut self, dicts: HashMap<String, crate::dictionary::FieldDictionary>) {
-        self.dictionaries = Arc::new(dicts);
+        let arc = Arc::new(dicts);
+        // Share the same Arc<HashMap> with background threads via ArcSwap.
+        self.shared_dictionaries.store(Arc::new(Arc::clone(&arc)));
+        self.dictionaries = arc;
     }
     /// Get a reference to the dictionaries (for loader and upsert paths).
     pub fn dictionaries(&self) -> &HashMap<String, crate::dictionary::FieldDictionary> {
@@ -4548,12 +4650,15 @@ impl ConcurrentEngine {
             let boundstore_entries_restored = Arc::clone(&self.boundstore_entries_restored);
             let boundstore_shard_loads = Arc::clone(&self.boundstore_shard_loads);
             let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
+            let time_buckets_clone = self.time_buckets.as_ref().map(Arc::clone);
+            let prefilter_registry_clone = Arc::clone(&self.prefilter_registry);
             std::thread::Builder::new()
                 .name(format!("shard-load-{}_{:?}", sort_field, direction))
                 .spawn(move || {
                     Self::load_shard_background(
                         &bs, &uc_arc, &inner, &sort_field, direction,
                         &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
+                        time_buckets_clone, prefilter_registry_clone,
                     );
                 })
                 .map_err(|e| {
@@ -4573,6 +4678,8 @@ impl ConcurrentEngine {
         boundstore_entries_restored: &Arc<AtomicU64>,
         boundstore_shard_loads: &Arc<AtomicU64>,
         boundstore_entries_skipped: &Arc<AtomicU64>,
+        time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
+        prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
     ) {
             let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
@@ -4585,8 +4692,12 @@ impl ConcurrentEngine {
                     let snap = inner.load();
                     let sf = snap.sorts.get_field(sort_field);
                     let uc = &**uc_arc;
+                    // Load TimeBucketManager snapshot once for BucketBitmap re-resolve.
+                    let tb_guard = time_buckets.as_ref().map(|tb| tb.load_full());
+                    let tb_ref: Option<&TimeBucketManager> = tb_guard.as_deref();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
+                    let mut tombstoned_unresolvable = 0usize;
                     uc.begin_restore();
                     let config = uc.config();
                     for se in shard_entries {
@@ -4608,23 +4719,85 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let entry = UnifiedEntry::from_restored(
-                            se.bitmap,
-                            se.entry_id,
-                            config.initial_capacity,
-                            config.max_capacity,
-                            direction,
-                            se.sorted_keys,
-                            &value_fn,
-                            has_more,
-                            persisted_total,
-                        );
+                        // Fetch persisted original FilterClause tree (V2 meta.bin only).
+                        let mut original_clauses = uc.get_meta_original_filter_clauses(se.entry_id);
+                        let entry = if !original_clauses.is_empty() {
+                            // Re-resolve BucketBitmap Arcs from live engine state.
+                            let all_resolved = resolve_bucket_clauses(
+                                &mut original_clauses,
+                                tb_ref,
+                                &prefilter_registry,
+                            );
+                            if !all_resolved {
+                                // Some bucket names are gone (bucket config changed, prefilter
+                                // evicted). Mark for rebuild so the next read re-forms correctly.
+                                tombstoned_unresolvable += 1;
+                                let mut entry = UnifiedEntry::from_restored(
+                                    se.bitmap,
+                                    se.entry_id,
+                                    config.initial_capacity,
+                                    config.max_capacity,
+                                    direction,
+                                    se.sorted_keys,
+                                    &value_fn,
+                                    has_more,
+                                    persisted_total,
+                                );
+                                entry.mark_for_rebuild();
+                                entry
+                            } else {
+                                UnifiedEntry::from_restored_with_clauses(
+                                    se.bitmap,
+                                    se.entry_id,
+                                    config.initial_capacity,
+                                    config.max_capacity,
+                                    direction,
+                                    se.sorted_keys,
+                                    &value_fn,
+                                    has_more,
+                                    persisted_total,
+                                    Arc::new(original_clauses),
+                                )
+                            }
+                        } else {
+                            // V1 meta.bin or entry with no persisted FC tree — legacy path.
+                            UnifiedEntry::from_restored(
+                                se.bitmap,
+                                se.entry_id,
+                                config.initial_capacity,
+                                config.max_capacity,
+                                direction,
+                                se.sorted_keys,
+                                &value_fn,
+                                has_more,
+                                persisted_total,
+                            )
+                        };
+                        // Recompute uses_bucket from the canonical key. If the
+                        // entry has a real time-bucket clause (excluding the
+                        // __prefilter sentinel), bucket maintenance must apply.
+                        let mut entry = entry;
+                        let restored_uses_bucket = key.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
+                        entry.set_uses_bucket(restored_uses_bucket);
+                        if restored_uses_bucket {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            entry.set_bucket_cutoff(now);
+                        }
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
                         boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
                     }
                     uc.finish_restore();
                     uc.mark_shard_loaded(sort_field, direction);
+                    if tombstoned_unresolvable > 0 {
+                        tracing::info!(
+                            "BoundStore: tombstoned {tombstoned_unresolvable} entries (unresolvable BucketBitmap clauses) in shard {}_{:?}",
+                            sort_field, direction,
+                        );
+                    }
                     boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
                     boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
                     let total_elapsed = t0.elapsed();
@@ -5389,13 +5562,34 @@ impl ConcurrentEngine {
         if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
             let ukey = unified_key.unwrap();
             let sort_clause = query.sort.as_ref().unwrap();
+            // Snapshot the original FilterClause tree so cache live-maintenance
+            // can natively evaluate compound predicates (B2 consumes this).
+            let original_clauses = Arc::new(snapped_filters.to_vec());
+            // Single-flight guard: when a flagged entry (needs_rebuild=true) triggered
+            // this miss, only the first concurrent caller does the seed + store. Others
+            // skip the write and serve directly from the executor to avoid stampeding
+            // compute_filters with redundant sort traversals.
+            if !self.unified_cache.should_rebuild_single_flight(&ukey) {
+                let mut result = executor.execute_from_bitmap(
+                    &filter_arc,
+                    query.sort.as_ref(),
+                    fetch_limit,
+                    query.cursor.as_ref(),
+                    use_simple_sort,
+                )?;
+                result.total_matched = full_total_matched;
+                collector.sort_us = sort_start.elapsed().as_micros() as u64;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.form_and_store(
+                self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
                     false,
                     full_total_matched,
+                    Arc::clone(&original_clauses),
                     value_fn,
                 );
                 let mut result = QueryResult {
@@ -5428,16 +5622,19 @@ impl ConcurrentEngine {
             // were the dominant remaining cache_lock_us contributor on
             // v1.0.189 (LOCK p99 ~1-2 s under load).
             let direction = ukey.direction;
-            let uses_bucket = ukey.filter_clauses.iter().any(|c| c.op == "bucket");
+            let uses_bucket = ukey.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
             // Brief lock 1: read capacity config + allocate meta_id.
+            // Use allocate_meta_id_with_clauses so compound clauses (And/Or/Not)
+            // get registered under their real leaf field names in the meta-index,
+            // not just FieldKey("") from the canonical representation (B4).
             let (initial_cap, max_cap, meta_id) = {
                 let uc = &self.unified_cache;
                 let (i, m) = uc.capacity_config();
-                let id = uc.allocate_meta_id(&ukey);
+                let id = uc.allocate_meta_id_with_clauses(&ukey, &original_clauses);
                 (i, m, id)
             };
             // Unlocked: build the entry (the expensive part).
-            let mut new_entry = UnifiedEntry::new(
+            let mut new_entry = UnifiedEntry::new_with_clauses(
                 &sorted_slots,
                 initial_cap,
                 max_cap,
@@ -5445,6 +5642,7 @@ impl ConcurrentEngine {
                 full_total_matched,
                 meta_id,
                 direction,
+                Arc::clone(&original_clauses),
                 value_fn,
             );
             new_entry.set_uses_bucket(uses_bucket);
@@ -5743,14 +5941,34 @@ impl ConcurrentEngine {
         if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
             let ukey = unified_key.unwrap();
             let sort_clause = query.sort.as_ref().unwrap();
+            // Snapshot the FilterClause tree so cache live-maintenance can
+            // natively evaluate compound predicates (B2 consumes this).
+            let original_clauses = Arc::new(snapped_filters.to_vec());
+            // Single-flight guard: when a flagged entry (needs_rebuild=true) triggered
+            // this miss, only the first concurrent caller does the seed + store. Others
+            // skip the write and serve directly from the executor to avoid stampeding
+            // compute_filters with redundant sort traversals.
+            if !self.unified_cache.should_rebuild_single_flight(&ukey) {
+                let mut result = executor.execute_from_bitmap(
+                    &filter_arc,
+                    query.sort.as_ref(),
+                    fetch_limit,
+                    query.cursor.as_ref(),
+                    use_simple_sort,
+                )?;
+                result.total_matched = full_total_matched;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.form_and_store(
+                self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
                     false,
                     full_total_matched,
+                    Arc::clone(&original_clauses),
                     value_fn,
                 );
                 let result = QueryResult {
@@ -5785,11 +6003,12 @@ impl ConcurrentEngine {
                 sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
             };
             let t0 = std::time::Instant::now();
-            self.unified_cache.form_and_store(
+            self.unified_cache.form_and_store_with_clauses(
                 ukey.clone(),
                 &sorted_slots,
                 has_more,
                 full_total_matched,
+                Arc::clone(&original_clauses),
                 value_fn,
             );
             let cache_elapsed = t0.elapsed();
@@ -6266,8 +6485,16 @@ impl ConcurrentEngine {
     }
 
     /// Remove a prefilter by name. Returns true if it existed.
+    ///
+    /// After removal, any cache entry whose filter included this prefilter
+    /// holds a dangling bitmap reference. Mark those entries for rebuild so
+    /// the slow path regenerates them on the next read.
     pub fn remove_prefilter(&self, name: &str) -> bool {
-        self.prefilter_registry.remove(name)
+        let removed = self.prefilter_registry.remove(name);
+        if removed {
+            self.unified_cache.invalidate_prefilter(name);
+        }
+        removed
     }
 
     /// Number of filter + sort fields still pending lazy load.
@@ -6717,6 +6944,11 @@ impl ConcurrentEngine {
     /// Update the max_maintenance_work budget on the live unified cache.
     pub fn set_max_maintenance_work(&self, v: usize) {
         self.unified_cache.with_config_mut(|c| c.max_maintenance_work = v);
+    }
+    /// Update the B9 compound-eval atom limit on the live unified cache.
+    /// Set to 0 to disable the guard. Takes effect on the next maintenance cycle.
+    pub fn set_compound_eval_atom_limit(&self, v: u32) {
+        self.unified_cache.with_config_mut(|c| c.compound_eval_atom_limit = v);
     }
     /// Update the max_maintenance_ms time budget on the live unified cache and
     /// the async cache worker (if running). Takes effect on the worker's next
@@ -8695,6 +8927,91 @@ impl Drop for ConcurrentEngine {
         self.shutdown();
     }
 }
+
+// ── BucketBitmap restore helpers ─────────────────────────────────────────────
+//
+// These free functions are `pub(crate)` so `#[cfg(test)]` modules can test them
+// directly without spawning a full ConcurrentEngine.
+
+/// Re-resolve `BucketBitmap` clauses from live engine state after deserialization.
+///
+/// `BucketBitmap::bitmap` is skipped on msgpack serialize (the Arc can't cross restarts).
+/// On deserialize it defaults to an empty Arc. This helper fills it from the engine's
+/// `TimeBucketManager` or `PrefilterRegistry` by matching `bucket_name`.
+///
+/// Returns `true` if every `BucketBitmap` clause in the tree was resolved successfully.
+/// Returns `false` if any clause could not be resolved (unknown bucket name) — caller
+/// should tombstone the entry so it rebuilds on next access.
+///
+/// Non-`BucketBitmap` clauses pass through untouched. `Not`/`And`/`Or` are walked
+/// recursively. An empty `clauses` slice always returns `true` (nothing to resolve).
+pub(crate) fn resolve_bucket_clauses(
+    clauses: &mut Vec<crate::query::FilterClause>,
+    time_buckets: Option<&TimeBucketManager>,
+    prefilter_registry: &crate::prefilter::PrefilterRegistry,
+) -> bool {
+    let mut all_ok = true;
+    for c in clauses.iter_mut() {
+        resolve_bucket_clause_one(c, time_buckets, prefilter_registry, &mut all_ok);
+    }
+    all_ok
+}
+
+fn resolve_bucket_clause_one(
+    c: &mut crate::query::FilterClause,
+    time_buckets: Option<&TimeBucketManager>,
+    prefilter_registry: &crate::prefilter::PrefilterRegistry,
+    all_ok: &mut bool,
+) {
+    use crate::query::FilterClause;
+    match c {
+        FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+            if field == "__prefilter" {
+                // Prefilter-substituted BucketBitmap — resolve via registry
+                if let Some(entry) = prefilter_registry.get(bucket_name) {
+                    *bitmap = entry.bitmap.load_full();
+                } else {
+                    tracing::debug!(
+                        "resolve_bucket_clauses: prefilter '{}' not in registry — tombstoning entry",
+                        bucket_name
+                    );
+                    *all_ok = false;
+                }
+            } else {
+                // Time-bucket BucketBitmap — resolve via TimeBucketManager
+                if let Some(tb) = time_buckets {
+                    if let Some(bucket) = tb.get_bucket(bucket_name) {
+                        *bitmap = Arc::clone(bucket.bitmap());
+                    } else {
+                        tracing::debug!(
+                            "resolve_bucket_clauses: time bucket '{}' not in manager — tombstoning entry",
+                            bucket_name
+                        );
+                        *all_ok = false;
+                    }
+                } else {
+                    // No TimeBucketManager configured — can't resolve time-bucket clause
+                    tracing::debug!(
+                        "resolve_bucket_clauses: time bucket '{}' present but no TimeBucketManager — tombstoning entry",
+                        bucket_name
+                    );
+                    *all_ok = false;
+                }
+            }
+        }
+        FilterClause::Not(inner) => {
+            resolve_bucket_clause_one(inner, time_buckets, prefilter_registry, all_ok);
+        }
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            for p in parts.iter_mut() {
+                resolve_bucket_clause_one(p, time_buckets, prefilter_registry, all_ok);
+            }
+        }
+        // All leaf clauses without a bitmap Arc pass through.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12275,5 +12592,159 @@ mod tests {
         }
 
         engine.shutdown();
+    }
+
+    // ── B8: resolve_bucket_clauses tests ────────────────────────────────
+
+    fn make_time_bucket_manager_with(bucket_name: &str, slots: &[u32]) -> TimeBucketManager {
+        use crate::config::BucketConfig;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tb = TimeBucketManager::new(
+            "sortAt".to_string(),
+            vec![BucketConfig {
+                name: bucket_name.to_string(),
+                duration_secs: 7 * 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        let mut bm = RoaringBitmap::new();
+        for &s in slots {
+            bm.insert(s);
+        }
+        tb.rebuild_bucket_from_bitmap(bucket_name, bm, now);
+        tb
+    }
+
+    fn make_prefilter_registry_with(name: &str, slots: &[u32]) -> crate::prefilter::PrefilterRegistry {
+        let reg = crate::prefilter::PrefilterRegistry::new();
+        let mut bm = RoaringBitmap::new();
+        for &s in slots {
+            bm.insert(s);
+        }
+        // insert() requires at least one clause — use a minimal placeholder
+        let dummy_clause = vec![FilterClause::IsNotNull("__placeholder".to_string())];
+        let _ = reg.insert(name.to_string(), dummy_clause, bm, 300, 0);
+        reg
+    }
+
+    /// A BucketBitmap referencing a known time bucket is resolved to a non-empty Arc.
+    #[test]
+    fn test_resolve_bucket_clauses_re_resolves_time_bucket() {
+        let tb = make_time_bucket_manager_with("7d", &[10, 20, 30]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "7d".to_string(),
+            bitmap: Arc::new(RoaringBitmap::new()), // empty — simulates post-deserialize state
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok, "resolve should succeed when bucket exists");
+
+        match &clauses[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                assert!(!bitmap.is_empty(), "bitmap should be non-empty after resolve");
+                assert!(bitmap.contains(10));
+                assert!(bitmap.contains(20));
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+    }
+
+    /// A BucketBitmap with field="__prefilter" is resolved via PrefilterRegistry.
+    #[test]
+    fn test_resolve_bucket_clauses_re_resolves_prefilter() {
+        let tb = make_time_bucket_manager_with("7d", &[]);
+        let pf = make_prefilter_registry_with("safe", &[100, 200, 300]);
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "__prefilter".to_string(),
+            bucket_name: "safe".to_string(),
+            bitmap: Arc::new(RoaringBitmap::new()), // empty
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok, "resolve should succeed when prefilter exists");
+
+        match &clauses[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                assert!(!bitmap.is_empty(), "bitmap should be non-empty after resolve");
+                assert!(bitmap.contains(100));
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+    }
+
+    /// A BucketBitmap referencing an unknown bucket name returns false — caller tombstones.
+    #[test]
+    fn test_resolve_bucket_clauses_unresolved_returns_false() {
+        let tb = make_time_bucket_manager_with("7d", &[10]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "unknown_bucket".to_string(), // does not exist in manager
+            bitmap: Arc::new(RoaringBitmap::new()),
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(!ok, "resolve should fail when bucket name is unknown");
+    }
+
+    /// Leaf clauses (Eq, In, IsNotNull) pass through untouched — all_ok stays true.
+    #[test]
+    fn test_resolve_bucket_clauses_leaf_clauses_pass_through() {
+        let pf = crate::prefilter::PrefilterRegistry::new();
+        let mut clauses = vec![
+            FilterClause::Eq("nsfwLevel".to_string(), crate::query::Value::Integer(1)),
+            FilterClause::In(
+                "baseModel".to_string(),
+                vec![crate::query::Value::Integer(42)],
+            ),
+            FilterClause::IsNotNull("postId".to_string()),
+        ];
+        let original = clauses.clone();
+
+        let ok = resolve_bucket_clauses(&mut clauses, None, &pf);
+        assert!(ok, "leaf-only clauses should always resolve successfully");
+        assert_eq!(clauses, original, "leaf clauses must not be modified");
+    }
+
+    /// resolve_bucket_clauses recurses into Not(And(...)) and resolves inner BucketBitmaps.
+    #[test]
+    fn test_resolve_bucket_clauses_recurses_into_compound() {
+        let tb = make_time_bucket_manager_with("7d", &[5, 10, 15]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::BucketBitmap {
+                field: "sortAt".to_string(),
+                bucket_name: "7d".to_string(),
+                bitmap: Arc::new(RoaringBitmap::new()),
+            },
+            FilterClause::Eq("nsfwLevel".to_string(), crate::query::Value::Integer(1)),
+        ])))];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok);
+
+        // Verify the inner BucketBitmap was resolved
+        match &clauses[0] {
+            FilterClause::Not(inner) => match inner.as_ref() {
+                FilterClause::And(parts) => match &parts[0] {
+                    FilterClause::BucketBitmap { bitmap, .. } => {
+                        assert!(!bitmap.is_empty(), "inner BucketBitmap should be resolved");
+                        assert!(bitmap.contains(5));
+                    }
+                    other => panic!("expected BucketBitmap, got {other:?}"),
+                },
+                other => panic!("expected And, got {other:?}"),
+            },
+            other => panic!("expected Not, got {other:?}"),
+        }
     }
 }

@@ -68,6 +68,7 @@ fn generate_meta_entries(n: usize) -> Vec<MetaEntry> {
             min_tracked_value: 500,
             total_matched: 10000,
             has_more: true,
+            original_filter_clauses: Vec::new(),
         });
     }
     entries
