@@ -1249,7 +1249,13 @@ impl UnifiedCache {
         for tick in 0..target_evict {
             let mut h = hb.build_hasher();
             h.write_u64(self.evictions.load(Ordering::Relaxed).wrapping_add(tick as u64));
-            let skip = (h.finish() as usize) % self.entries.len().max(1);
+            // For small caches, skipping past the front would leave entries
+            // unsampled (DashMap iter doesn't cycle), so always start at 0.
+            let skip = if self.entries.len() <= SAMPLE_SIZE {
+                0
+            } else {
+                (h.finish() as usize) % self.entries.len()
+            };
             let mut best: Option<(u64, UnifiedKey)> = None;
             let mut all_dirty_seen = true;
             // Take a fresh sample — DashMap iter order is shard-order, randomize via skip.
@@ -3653,6 +3659,11 @@ mod tests {
         let meta_id_1 = cache.form_and_store(key1.clone(), &slots, true, 100_000, |s| s);
         let key2 = make_key(&[("field", "eq", "2")], "sort", SortDirection::Desc);
         cache.form_and_store(key2.clone(), &slots, true, 100_000, |s| s);
+        // Force key1 to ts=0 so it is unambiguously the LRU regardless of
+        // millisecond-resolution clock collisions in form_and_store/lookup.
+        if let Some(e) = cache.get_mut(&key1) {
+            e.last_used.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         // Touch key2 to make key1 the LRU
         cache.lookup(&key2);
         // Add third — evicts key1
