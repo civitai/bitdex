@@ -339,7 +339,11 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
         }
         JsonValue::Bool(b) => Some(PackedValue::B(*b)),
         JsonValue::String(s) => Some(PackedValue::S(s.clone())),
-        JsonValue::Null => None,
+        // Explicit null clears the field. DocOp::Set apply removes the field
+        // from the doc snapshot when the value is Null. Without this, scalar
+        // nullable transitions (e.g. blockedFor "X"→null) leave the prior tuple
+        // as the LIFO winner and reads return the stale value.
+        JsonValue::Null => Some(PackedValue::Null),
         JsonValue::Array(arr) => {
             let ints: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
             if ints.len() == arr.len() {
@@ -2705,7 +2709,7 @@ mod tests {
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
         assert_eq!(json_to_packed(&json!(true)), Some(PackedValue::B(true)));
         assert_eq!(json_to_packed(&json!("hello")), Some(PackedValue::S("hello".into())));
-        assert_eq!(json_to_packed(&json!(null)), None);
+        assert_eq!(json_to_packed(&json!(null)), Some(PackedValue::Null));
         assert_eq!(json_to_packed(&json!([1, 2, 3])), Some(PackedValue::Mi(vec![1, 2, 3])));
     }
     // -----------------------------------------------------------------------
