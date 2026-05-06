@@ -3788,8 +3788,10 @@ mod tests {
         // Values: slot 0 -> 1000, slot 1 -> 999, ..., slot 4 -> 996
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get(&key).unwrap();
-        assert_eq!(entry.min_tracked_value(), 996); // 1000 - 4
+        {
+            let entry = cache.get(&key).unwrap();
+            assert_eq!(entry.min_tracked_value(), 996); // 1000 - 4
+        }
         // Expand with slots 5-9, values 995-991
         let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..10).collect();
@@ -3807,8 +3809,10 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get(&key).unwrap();
-        assert!(entry.radix().is_none(), "no radix at initial capacity");
+        {
+            let entry = cache.get(&key).unwrap();
+            assert!(entry.radix().is_none(), "no radix at initial capacity");
+        }
         // Expand
         let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..100).collect();
