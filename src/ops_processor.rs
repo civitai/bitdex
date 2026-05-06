@@ -339,7 +339,11 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
         }
         JsonValue::Bool(b) => Some(PackedValue::B(*b)),
         JsonValue::String(s) => Some(PackedValue::S(s.clone())),
-        JsonValue::Null => None,
+        // Explicit null clears the field. DocOp::Set apply removes the field
+        // from the doc snapshot when the value is Null. Without this, scalar
+        // nullable transitions (e.g. blockedFor "X"→null) leave the prior tuple
+        // as the LIFO winner and reads return the stale value.
+        JsonValue::Null => Some(PackedValue::Null),
         JsonValue::Array(arr) => {
             let ints: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
             if ints.len() == arr.len() {
@@ -729,23 +733,31 @@ fn accum_set_sort(
 }
 /// Check if an entity's ops contain a deferred alive condition (future publishedAt).
 fn check_deferred_alive(meta: &FieldMeta, ops: &[Op]) -> bool {
-    if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
-        for op in ops {
-            if let Op::Set { field, value } = op {
-                if field == da_field {
-                    if let Some(ts) = value.as_i64() {
-                        let secs = if ms_to_secs { ts / 1000 } else { ts };
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                        return secs > now;
+    check_deferred_alive_secs(meta, ops).is_some()
+}
+
+/// Same as `check_deferred_alive` but returns the activation timestamp (seconds
+/// since epoch) when deferral applies. Used by `apply_query_op_set` to register
+/// deferred fan-out slots without a second scan of the ops.
+fn check_deferred_alive_secs(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
+    let (ref da_field, ms_to_secs) = meta.deferred_alive_field.as_ref()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    for op in ops {
+        if let Op::Set { field, value } = op {
+            if field == da_field.as_str() {
+                if let Some(ts) = value.as_i64() {
+                    let secs = if *ms_to_secs { ts / 1000 } else { ts };
+                    if secs > now {
+                        return Some(secs as u64);
                     }
                 }
             }
         }
     }
-    false
+    None
 }
 /// Extract the deferred alive timestamp (seconds since epoch) from ops.
 fn get_deferred_timestamp(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
@@ -1371,6 +1383,19 @@ fn apply_query_op_set<S: BitmapSink>(
         return Ok(0);
     }
     let dictionaries = Some(engine.dictionaries());
+    // Per-slot deferred-alive gate for fan-out (e.g. Post→Image scheduled posts).
+    // The top-level apply_ops_batch deferred check fires on creates_slot for the
+    // entity_id, which for a fan-out is the source row (Post.id), not the matched
+    // image slot. Without this check, fan-out from a future-scheduled Post
+    // immediately writes publishedAt sort layers and flips the isPublished
+    // shadow on already-alive image slots, leaking scheduled posts into queries.
+    //
+    // Detection mirrors check_deferred_alive: if any nested Set targets the
+    // configured deferred_alive source field with a value > now, route every
+    // matched slot through the deferred path (write doc, skip bitmap, schedule
+    // activation). activate_due replays from the docstore at activation time —
+    // the doc already carries the future field values from the writes below.
+    let deferred_at = check_deferred_alive_secs(meta, ops);
     // Apply nested ops to each matching slot
     let mut applied = 0;
     for &slot_id in slot_ids {
@@ -1378,6 +1403,35 @@ fn apply_query_op_set<S: BitmapSink>(
             continue;
         }
         let slot = slot_id as u32;
+        if let Some(activate_at) = deferred_at {
+            // Deferred fan-out: persist field values to the docstore so the
+            // activation replay reconstructs the correct bitmap state, but
+            // skip every bitmap mutation for this slot. The slot stays at its
+            // prior bitmap state (typically isPublished=false / publishedAt=0
+            // for a brand-new Post hitting an existing Image) until the flush
+            // thread's activate_due() drains it from the deferred map.
+            if let Some(ref mut dw) = doc_writer {
+                for op in ops {
+                    match op {
+                        Op::Set { field, value } => {
+                            dw.write_set(slot, field, value);
+                            write_shadow_target_docs(dw, meta, slot, field, value.is_null());
+                        }
+                        Op::Remove { field, value } => {
+                            dw.write_remove(slot, field, value);
+                            write_shadow_target_docs(dw, meta, slot, field, true);
+                        }
+                        Op::Add { field, value } => {
+                            dw.write_add(slot, field, value);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            sink.deferred_alive(slot, activate_at);
+            applied += 1;
+            continue;
+        }
         for op in ops {
             match op {
                 Op::Set { field, value } => {
@@ -2705,7 +2759,7 @@ mod tests {
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
         assert_eq!(json_to_packed(&json!(true)), Some(PackedValue::B(true)));
         assert_eq!(json_to_packed(&json!("hello")), Some(PackedValue::S("hello".into())));
-        assert_eq!(json_to_packed(&json!(null)), None);
+        assert_eq!(json_to_packed(&json!(null)), Some(PackedValue::Null));
         assert_eq!(json_to_packed(&json!([1, 2, 3])), Some(PackedValue::Mi(vec![1, 2, 3])));
     }
     // -----------------------------------------------------------------------

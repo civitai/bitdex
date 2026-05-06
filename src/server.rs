@@ -5086,51 +5086,180 @@ async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoRespo
     }))
 }
 
-/// Read RSS from /proc/self/status (Linux). Returns bytes, or 0 on non-Linux.
-fn read_rss_bytes() -> i64 {
+/// Aggregate RSS readings parsed in a single pass over /proc/self/status.
+/// Bytes; zeros on non-Linux or when a key is absent.
+#[derive(Default, Clone, Copy)]
+struct RssReading {
+    rss: i64,
+    anon: i64,
+    file: i64,
+    shmem: i64,
+}
+
+/// Single-syscall, single-pass read of all four RSS-related keys.
+fn read_rss_all() -> RssReading {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if line.starts_with("VmRSS:") {
-                    // Format: "VmRSS:    12345 kB"
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(kb) = parts[1].parse::<i64>() {
-                            return kb * 1024; // kB → bytes
-                        }
+        let mut r = RssReading::default();
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return r;
+        };
+        for line in status.lines() {
+            // Lines: "<Key>:\t  12345 kB". Match prefix, parse 2nd token.
+            let slot = if line.starts_with("VmRSS:") { Some(&mut r.rss) }
+                else if line.starts_with("RssAnon:") { Some(&mut r.anon) }
+                else if line.starts_with("RssFile:") { Some(&mut r.file) }
+                else if line.starts_with("RssShmem:") { Some(&mut r.shmem) }
+                else { None };
+            if let Some(s) = slot {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<i64>() {
+                        *s = kb * 1024;
                     }
                 }
             }
         }
-        0
+        r
     }
     #[cfg(not(target_os = "linux"))]
-    { 0 }
+    { RssReading::default() }
 }
+
+
+/// Cached mmap inventory; refreshed at most once per
+/// MMAP_INVENTORY_REFRESH_SECS to bound `/proc/self/maps` walk cost.
+/// The walk holds the kernel's `mmap_lock` for read across all VMAs
+/// (~500-2000 at our thread count); throttling avoids contention with
+/// concurrent mmap/munmap on the hot path.
+static MMAP_INVENTORY_LAST_REFRESH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MMAP_INVENTORY_CACHE: parking_lot::Mutex<Vec<(&'static str, u64)>> =
+    parking_lot::Mutex::new(Vec::new());
+const MMAP_INVENTORY_REFRESH_SECS: u64 = 150;
+
+/// Mmap inventory by kind. Sums file-backed VMA lengths bucketed by path
+/// prefix (tuple/shard/wal/data_other), plus anonymous and other regions.
+/// Throttled — served from cache between refreshes.
+fn read_mmap_inventory() -> Vec<(&'static str, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = MMAP_INVENTORY_LAST_REFRESH.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < MMAP_INVENTORY_REFRESH_SECS && last != 0 {
+            return MMAP_INVENTORY_CACHE.lock().clone();
+        }
+        // Single-flight: claim the slot before doing the walk.
+        MMAP_INVENTORY_LAST_REFRESH.store(now, std::sync::atomic::Ordering::Relaxed);
+        let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+            return MMAP_INVENTORY_CACHE.lock().clone();
+        };
+        let mut tuple = 0u64;
+        let mut shard = 0u64;
+        let mut wal = 0u64;
+        let mut data_other = 0u64;
+        let mut anon = 0u64;
+        let mut other = 0u64;
+        for line in maps.lines() {
+            // Format: "<start>-<end> <perms> <offset> <dev> <inode> <path?>"
+            // Inode-to-path gap is variable whitespace, so use split_whitespace
+            // and take fields 0..5 by token, then reconstruct the path tail.
+            let mut iter = line.split_whitespace();
+            let Some(range) = iter.next() else { continue };
+            // Skip perms, offset, dev, inode.
+            for _ in 0..4 {
+                if iter.next().is_none() { break; }
+            }
+            let path = iter.next().unwrap_or("");
+            let (start, end) = match range.split_once('-') {
+                Some((a, b)) => (a, b),
+                None => continue,
+            };
+            let Ok(s) = u64::from_str_radix(start, 16) else { continue };
+            let Ok(e) = u64::from_str_radix(end, 16) else { continue };
+            let len = e.saturating_sub(s);
+            if len == 0 { continue; }
+            if path.is_empty() || path.starts_with('[') {
+                anon += len;
+                continue;
+            }
+            if path.contains("/wal/") || path.ends_with(".wal") {
+                wal += len;
+            } else if path.contains("/docs/") || path.contains("/tuples/") {
+                tuple += len;
+            } else if path.contains("/bitmaps/") || path.contains("/shardstore/") || path.contains("/shards/") {
+                shard += len;
+            } else if path.starts_with("/data/") {
+                data_other += len;
+            } else {
+                other += len;
+            }
+        }
+        let result = vec![
+            ("tuple", tuple),
+            ("shard", shard),
+            ("wal", wal),
+            ("data_other", data_other),
+            ("anon", anon),
+            ("other", other),
+        ];
+        *MMAP_INVENTORY_CACHE.lock() = result.clone();
+        result
+    }
+    #[cfg(not(target_os = "linux"))]
+    { Vec::new() }
+}
+
 
 async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let metrics_start = std::time::Instant::now();
     let m = &state.metrics;
 
-    // Process memory (collect-on-scrape, no index needed)
-    let rss = read_rss_bytes();
+    // Process memory (collect-on-scrape, no index needed). One read of
+    // /proc/self/status produces VmRSS + the three split values.
+    let rss_reading = read_rss_all();
+    let rss = rss_reading.rss;
     m.process_rss_bytes.set(rss);
+    m.process_rss_anon_bytes.set(rss_reading.anon);
+    m.process_rss_file_bytes.set(rss_reading.file);
+    m.process_rss_shmem_bytes.set(rss_reading.shmem);
+    for (kind, bytes) in read_mmap_inventory() {
+        m.mmap_bytes.with_label_values(&[kind]).set(bytes as i64);
+    }
     if rss > m.process_rss_peak_bytes.get() {
         m.process_rss_peak_bytes.set(rss);
     }
 
-    // Jemalloc memory stats (only available when heap-prof feature is active)
+    // Jemalloc memory stats (only available when heap-prof feature is active).
+    // active   — bytes in active pages (allocated + small dirty)
+    // resident — physical pages held (active + retained dirty)
+    // mapped   — total mapped bytes (resident + decay-pending)
+    // retained — virtual address space mapped but not committed
+    // metadata — arena/extent/slab bookkeeping
     #[cfg(feature = "heap-prof")]
     {
         // With the `stats` feature enabled, epoch::advance() returns
         // Result<u64, _> (the previous epoch value) instead of Result<(), _>.
         if tikv_jemalloc_ctl::epoch::advance().is_ok() {
-            if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
-                m.jemalloc_allocated_bytes.set(allocated as i64);
+            if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
+                m.jemalloc_allocated_bytes.set(v as i64);
             }
-            if let Ok(resident) = tikv_jemalloc_ctl::stats::resident::read() {
-                m.jemalloc_resident_bytes.set(resident as i64);
+            if let Ok(v) = tikv_jemalloc_ctl::stats::active::read() {
+                m.jemalloc_active_bytes.set(v as i64);
+            }
+            if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
+                m.jemalloc_resident_bytes.set(v as i64);
+            }
+            if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
+                m.jemalloc_mapped_bytes.set(v as i64);
+            }
+            if let Ok(v) = tikv_jemalloc_ctl::stats::retained::read() {
+                m.jemalloc_retained_bytes.set(v as i64);
+            }
+            if let Ok(v) = tikv_jemalloc_ctl::stats::metadata::read() {
+                m.jemalloc_metadata_bytes.set(v as i64);
             }
         }
     }

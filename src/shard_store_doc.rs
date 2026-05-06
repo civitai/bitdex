@@ -42,6 +42,12 @@ pub struct StoredDoc {
 }
 
 /// Compact value encoding for document fields.
+///
+/// `Null` represents an explicit field clear. When emitted via `DocOp::Set`, the
+/// apply path removes the field from the composed doc — required so scalar
+/// nullable transitions (string→null on `low_cardinality_string` fields like
+/// `blockedFor`) actually clear the docstore. Without this variant the prior
+/// non-null tuple wins on LIFO read.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum PackedValue {
     I(i64),
@@ -50,6 +56,7 @@ pub enum PackedValue {
     S(String),
     Mi(Vec<i64>),
     Mm(Vec<PackedValue>),
+    Null,
 }
 
 /// Convert a raw JSON value to PackedValue, with optional dictionary for LowCardinalityString.
@@ -185,6 +192,7 @@ const PV_TAG_B: u8 = 0x03;
 const PV_TAG_S: u8 = 0x04;
 const PV_TAG_MI: u8 = 0x05;
 const PV_TAG_MM: u8 = 0x06;
+const PV_TAG_NULL: u8 = 0x07;
 
 // ---------------------------------------------------------------------------
 // Zero-copy wire format helpers — write Merge ops directly from borrowed data.
@@ -266,6 +274,9 @@ fn encode_packed_value(pv: &PackedValue, buf: &mut Vec<u8>) {
                 encode_packed_value(val, buf);
             }
         }
+        PackedValue::Null => {
+            buf.push(PV_TAG_NULL);
+        }
     }
 }
 
@@ -331,6 +342,7 @@ fn decode_packed_value(data: &[u8], pos: &mut usize) -> io::Result<PackedValue> 
             }
             Ok(PackedValue::Mm(vals))
         }
+        PV_TAG_NULL => Ok(PackedValue::Null),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown packed value tag: 0x{:02x}", other),
@@ -529,8 +541,12 @@ impl OpCodec for DocOpCodec {
         match op {
             DocOp::Set { slot, field, value } => {
                 let fields = snapshot.docs.entry(*slot).or_default();
-                // Replace existing field or append
-                if let Some(entry) = fields.iter_mut().find(|(f, _)| *f == *field) {
+                if matches!(value, PackedValue::Null) {
+                    // Explicit null clears the field. Drop the entry entirely so
+                    // downstream conversions (StoredDoc, JSON) see field absence,
+                    // matching the bitmap NULL_BITMAP_KEY semantics.
+                    fields.retain(|(f, _)| *f != *field);
+                } else if let Some(entry) = fields.iter_mut().find(|(f, _)| *f == *field) {
                     entry.1 = value.clone();
                 } else {
                     fields.push((*field, value.clone()));
@@ -597,6 +613,10 @@ impl OpCodec for DocOpCodec {
             DocOp::Merge { slot, fields } => {
                 let doc = snapshot.docs.entry(*slot).or_default();
                 for (field_idx, value) in fields {
+                    if matches!(value, PackedValue::Null) {
+                        doc.retain(|(f, _)| *f != *field_idx);
+                        continue;
+                    }
                     if let Some(entry) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
                         // Multi-value union semantics: when both old and new are
                         // multi-int (Mi), union the value lists with dedup. This
@@ -636,6 +656,7 @@ fn packed_value_eq(a: &PackedValue, b: &PackedValue) -> bool {
         (PackedValue::Mm(x), PackedValue::Mm(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| packed_value_eq(a, b))
         }
+        (PackedValue::Null, PackedValue::Null) => true,
         _ => false,
     }
 }
@@ -1541,6 +1562,10 @@ fn packed_to_field_value(pv: &PackedValue) -> FieldValue {
                 None
             }
         }).collect()),
+        // DocOp::Set { value: Null } removes the field from the snapshot before
+        // composition, so Null should never reach this conversion. Map to an
+        // empty-multi as a defensive fallback rather than panic.
+        PackedValue::Null => FieldValue::Multi(Vec::new()),
     }
 }
 
@@ -1854,6 +1879,7 @@ fn packed_value_to_json(pv: &PackedValue) -> serde_json::Value {
         PackedValue::Mm(arr) => {
             serde_json::Value::Array(arr.iter().map(packed_value_to_json).collect())
         }
+        PackedValue::Null => serde_json::Value::Null,
     }
 }
 
@@ -2683,6 +2709,51 @@ mod tests {
             }
             _ => panic!("expected Set"),
         }
+    }
+
+    #[test]
+    fn test_packed_value_null_roundtrip() {
+        let pv = PackedValue::Null;
+        let mut buf = Vec::new();
+        encode_packed_value(&pv, &mut buf);
+        let mut pos = 0;
+        let decoded = decode_packed_value(&buf, &mut pos).unwrap();
+        assert_eq!(decoded, PackedValue::Null);
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn test_doc_op_set_null_clears_field() {
+        // Bug repro: scalar nullable transition (e.g. blockedFor "X" → null) must
+        // remove the field from the composed doc, not leave the prior tuple as
+        // the LIFO winner.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+        let blocked_idx = ds.ensure_field_index("blockedFor").unwrap();
+        let nsfw_idx = ds.ensure_field_index("nsfwLevel").unwrap();
+
+        let initial = rmp_serde::to_vec(&PackedValue::S("CSAM".into())).unwrap();
+        ds.append_tuple(42, blocked_idx, &initial).unwrap();
+        let nsfw_bytes = rmp_serde::to_vec(&PackedValue::I(8)).unwrap();
+        ds.append_tuple(42, nsfw_idx, &nsfw_bytes).unwrap();
+
+        let doc_before = ds.get(42).unwrap().expect("doc must exist");
+        assert!(doc_before.fields.contains_key("blockedFor"));
+
+        let null_bytes = rmp_serde::to_vec(&PackedValue::Null).unwrap();
+        ds.append_tuple(42, blocked_idx, &null_bytes).unwrap();
+
+        let doc_after = ds.get(42).unwrap().expect("doc must still exist");
+        assert!(
+            !doc_after.fields.contains_key("blockedFor"),
+            "blockedFor must be cleared after Set::Null, found {:?}",
+            doc_after.fields.get("blockedFor"),
+        );
+        assert!(
+            doc_after.fields.contains_key("nsfwLevel"),
+            "unrelated fields must survive",
+        );
     }
 
     #[test]

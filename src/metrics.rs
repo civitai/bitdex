@@ -51,10 +51,20 @@ pub struct Metrics {
     // -- Process memory --
     pub process_rss_bytes: IntGauge,
     pub process_rss_peak_bytes: IntGauge,
+    pub process_rss_anon_bytes: IntGauge,
+    pub process_rss_file_bytes: IntGauge,
+    pub process_rss_shmem_bytes: IntGauge,
 
     // -- Jemalloc memory (populated when heap-prof feature is active) --
     pub jemalloc_allocated_bytes: IntGauge,
+    pub jemalloc_active_bytes: IntGauge,
     pub jemalloc_resident_bytes: IntGauge,
+    pub jemalloc_mapped_bytes: IntGauge,
+    pub jemalloc_retained_bytes: IntGauge,
+    pub jemalloc_metadata_bytes: IntGauge,
+
+    // -- Mmap inventory (sum of file-backed mapped regions by kind) --
+    pub mmap_bytes: IntGaugeVec,
 
     // -- Startup --
     pub startup_duration_seconds: IntGauge,
@@ -479,18 +489,45 @@ impl Metrics {
 
         // Process memory
         let process_rss_bytes = IntGauge::new(
-            "bitdex_process_rss_bytes", "Process resident set size in bytes",
+            "bitdex_process_rss_bytes", "Process resident set size in bytes (VmRSS)",
         ).unwrap();
         let process_rss_peak_bytes = IntGauge::new(
             "bitdex_process_rss_peak_bytes", "Peak process RSS in bytes since startup",
         ).unwrap();
+        let process_rss_anon_bytes = IntGauge::new(
+            "bitdex_process_rss_anon_bytes", "Anonymous (heap/stack) RSS in bytes (RssAnon)",
+        ).unwrap();
+        let process_rss_file_bytes = IntGauge::new(
+            "bitdex_process_rss_file_bytes", "File-backed RSS in bytes (RssFile) — mmap of shard/tuple/WAL files paged in",
+        ).unwrap();
+        let process_rss_shmem_bytes = IntGauge::new(
+            "bitdex_process_rss_shmem_bytes", "Shared memory RSS in bytes (RssShmem)",
+        ).unwrap();
 
         // Jemalloc memory (refreshed on scrape when heap-prof feature is active)
         let jemalloc_allocated_bytes = IntGauge::new(
-            "bitdex_jemalloc_allocated_bytes", "Jemalloc stats.allocated — total bytes allocated by the application",
+            "bitdex_jemalloc_allocated_bytes", "Jemalloc stats.allocated — bytes in active allocations",
+        ).unwrap();
+        let jemalloc_active_bytes = IntGauge::new(
+            "bitdex_jemalloc_active_bytes", "Jemalloc stats.active — bytes in active pages (allocated + small dirty)",
         ).unwrap();
         let jemalloc_resident_bytes = IntGauge::new(
-            "bitdex_jemalloc_resident_bytes", "Jemalloc stats.resident — RSS bytes accounted for by jemalloc",
+            "bitdex_jemalloc_resident_bytes", "Jemalloc stats.resident — physical pages (allocated + dirty + retained)",
+        ).unwrap();
+        let jemalloc_mapped_bytes = IntGauge::new(
+            "bitdex_jemalloc_mapped_bytes", "Jemalloc stats.mapped — total mapped bytes (resident + decay-pending)",
+        ).unwrap();
+        let jemalloc_retained_bytes = IntGauge::new(
+            "bitdex_jemalloc_retained_bytes", "Jemalloc stats.retained — virtual memory mapped but not committed (madvise/decay state)",
+        ).unwrap();
+        let jemalloc_metadata_bytes = IntGauge::new(
+            "bitdex_jemalloc_metadata_bytes", "Jemalloc stats.metadata — bookkeeping memory (arenas, extents, slabs)",
+        ).unwrap();
+
+        // Mmap inventory: file-backed regions registered by kind (shard/tuple/wal)
+        let mmap_bytes = IntGaugeVec::new(
+            prometheus::Opts::new("bitdex_mmap_bytes", "File-backed mmap region size (mapped length sum)").namespace(""),
+            &["kind"],
         ).unwrap();
 
         // Startup duration (set once after index restore completes)
@@ -1155,8 +1192,16 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(process_rss_bytes.clone())).unwrap();
         registry.register(Box::new(process_rss_peak_bytes.clone())).unwrap();
+        registry.register(Box::new(process_rss_anon_bytes.clone())).unwrap();
+        registry.register(Box::new(process_rss_file_bytes.clone())).unwrap();
+        registry.register(Box::new(process_rss_shmem_bytes.clone())).unwrap();
         registry.register(Box::new(jemalloc_allocated_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_active_bytes.clone())).unwrap();
         registry.register(Box::new(jemalloc_resident_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_mapped_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_retained_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_metadata_bytes.clone())).unwrap();
+        registry.register(Box::new(mmap_bytes.clone())).unwrap();
         registry.register(Box::new(startup_duration_seconds.clone())).unwrap();
         registry.register(Box::new(flush_apply_nanos.clone())).unwrap();
         registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
@@ -1295,8 +1340,16 @@ impl Metrics {
             snapshot_publish_total,
             process_rss_bytes,
             process_rss_peak_bytes,
+            process_rss_anon_bytes,
+            process_rss_file_bytes,
+            process_rss_shmem_bytes,
             jemalloc_allocated_bytes,
+            jemalloc_active_bytes,
             jemalloc_resident_bytes,
+            jemalloc_mapped_bytes,
+            jemalloc_retained_bytes,
+            jemalloc_metadata_bytes,
+            mmap_bytes,
             startup_duration_seconds,
             flush_apply_nanos,
             flush_cache_nanos,

@@ -258,7 +258,7 @@ mod tests {
                     field_type: FilterFieldType::MultiValue,
                     behaviors: None,
                     eviction: None,
-                    eager_load: false,
+                    eager_load: true,
                     per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
