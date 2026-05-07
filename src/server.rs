@@ -1821,6 +1821,18 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
             bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
             query_total: state.metrics.query_total.clone(),
+            timebucket_dropped_no_sort_field_total: state
+                .metrics
+                .timebucket_dropped_no_sort_field_total
+                .clone(),
+            timebucket_dropped_capacity_exceeded_total: state
+                .metrics
+                .timebucket_dropped_capacity_exceeded_total
+                .clone(),
+            timebucket_anomalous_ts_total: state
+                .metrics
+                .timebucket_anomalous_ts_total
+                .clone(),
             index_name: def.name.clone(),
         });
         // Install the cache-worker cycle-time histogram so the worker can
@@ -2154,6 +2166,15 @@ async fn handle_create_index(
         wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
         bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
         query_total: state.metrics.query_total.clone(),
+        timebucket_dropped_no_sort_field_total: state
+            .metrics
+            .timebucket_dropped_no_sort_field_total
+            .clone(),
+        timebucket_dropped_capacity_exceeded_total: state
+            .metrics
+            .timebucket_dropped_capacity_exceeded_total
+            .clone(),
+        timebucket_anomalous_ts_total: state.metrics.timebucket_anomalous_ts_total.clone(),
         index_name: definition.name.clone(),
     });
 

@@ -211,6 +211,7 @@ fn config_nullable_post_id() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
@@ -219,6 +220,7 @@ fn config_nullable_post_id() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -348,6 +350,7 @@ fn test_dump_nullable_csv_values() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "blockedFor".to_string(),
@@ -356,6 +359,7 @@ fn test_dump_nullable_csv_values() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![],
@@ -480,6 +484,7 @@ fn test_range_scans_exclude_nulls() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {
@@ -561,6 +566,7 @@ fn test_not_eq_excludes_nulls() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {
@@ -724,6 +730,7 @@ fn test_null_bitmaps_survive_restart() {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    max_range_scan_values: None,
                 });
                 fi
             },
@@ -779,6 +786,7 @@ fn test_dictionary_field_null_bypass() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {
@@ -960,6 +968,7 @@ fn test_multiple_nullable_fields_no_contamination() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "blockedFor".to_string(),
@@ -968,6 +977,7 @@ fn test_multiple_nullable_fields_no_contamination() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![],
@@ -1087,6 +1097,7 @@ fn test_dump_then_restart_preserves_nulls() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {
@@ -1228,6 +1239,7 @@ fn test_nullable_value_to_value_transition() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {
@@ -1345,6 +1357,7 @@ fn test_not_eq_on_nullable_field_via_ops() {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            max_range_scan_values: None,
         }],
         sort_fields: vec![],
         data_schema: DataSchema {

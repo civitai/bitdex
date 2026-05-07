@@ -56,6 +56,17 @@ pub struct MetricsBridge {
     /// Existing query counter; bridged so apply_query_op_set can bump it on the
     /// QueryOpSet path (mission #77).
     pub query_total: prometheus::IntCounterVec,
+    /// Time-bucket flush dropped slot insertion because sort field unavailable
+    /// (lazy-load race). Labels: index, field.
+    pub timebucket_dropped_no_sort_field_total: prometheus::IntCounterVec,
+    /// Time-bucket flush observed an anomalous reconstructed timestamp. Labels:
+    /// index, field, kind in {zero, future, wrapped}.
+    pub timebucket_anomalous_ts_total: prometheus::IntCounterVec,
+    /// Slots permanently lost because the deferred-retry queue hit its cap
+    /// while the sort field was unloaded. Distinct from
+    /// `timebucket_dropped_no_sort_field_total` which counts slots that were
+    /// successfully deferred and will replay later. Labels: index, field.
+    pub timebucket_dropped_capacity_exceeded_total: prometheus::IntCounterVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -1174,6 +1185,9 @@ impl ConcurrentEngine {
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
+            #[cfg(feature = "server")]
+            let flush_metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> =
+                Arc::clone(&metrics_bridge);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
             let flush_diff_log_path = config.storage.bitmap_path.as_ref()
                 .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
@@ -1246,6 +1260,13 @@ impl ConcurrentEngine {
                 // ~10000% it was when we did it every cycle.
                 let mut last_sort_promote = std::time::Instant::now();
                 let sort_promote_interval = Duration::from_secs(5);
+                // Slots whose time-bucket insertion was deferred because the
+                // bucket sort field was not fully loaded at flush time.
+                // Drained on the first flush cycle that observes the sort
+                // field fully loaded. Capped to bound memory under prolonged
+                // unload windows.
+                let mut pending_bucket_retries: HashSet<u32> = HashSet::new();
+                const PENDING_BUCKET_RETRY_CAP: usize = 1_000_000;
                 let mut heartbeat_counter: u64 = 0;
                 let mut max_bitmap_count_seen: usize = 0;
                 let mut nonzero_iters: u64 = 0;
@@ -1475,6 +1496,7 @@ impl ConcurrentEngine {
                                 if !alive_inserts.is_empty()
                                     || !alive_removes.is_empty()
                                     || !sort_value_changed.is_empty()
+                                    || !pending_bucket_retries.is_empty()
                                 {
                                     let now_secs = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -1482,29 +1504,159 @@ impl ConcurrentEngine {
                                         .as_secs();
                                     let mut tb = (*tb_arc.load_full()).clone();
                                     let sort_field = staging.sorts.get_field(&sort_field_name);
-                                    if !alive_inserts.is_empty() {
-                                        if let Some(sort_field) = sort_field {
-                                            for &slot in alive_inserts {
-                                                let ts = sort_field.reconstruct_value(slot) as u64;
-                                                tb.insert_slot(slot, ts, now_secs);
-                                            }
-                                        }
-                                    }
+                                    let sort_field_loaded = sort_field
+                                        .map(|sf| sf.is_fully_loaded())
+                                        .unwrap_or(false);
+                                    #[cfg(feature = "server")]
+                                    let bridge_guard = flush_metrics_bridge.load();
+                                    #[cfg(feature = "server")]
+                                    let bridge_opt = (**bridge_guard).as_ref();
+                                    // Removes always work — they don't need the sort field — so
+                                    // process them unconditionally. A remove also cancels any
+                                    // pending insert for the same slot from a prior cycle.
                                     for &slot in alive_removes {
                                         tb.remove_slot(slot);
+                                        pending_bucket_retries.remove(&slot);
                                     }
-                                    if !sort_value_changed.is_empty() {
-                                        if let Some(sort_field) = sort_field {
-                                            for slot in sort_value_changed {
-                                                // Drop prior membership (whatever bucket it was
-                                                // in for the old value) and re-evaluate against
-                                                // the new value's bucket eligibility. insert_slot
-                                                // is a no-op for buckets where the new ts is out
-                                                // of window, so this also handles aging-out.
-                                                let ts = sort_field.reconstruct_value(slot) as u64;
-                                                tb.remove_slot(slot);
-                                                tb.insert_slot(slot, ts, now_secs);
+                                    // Anomaly classification helper. Closures don't need to
+                                    // borrow bridge_opt because each call site reads it.
+                                    let classify_anomaly = |ts: u64| -> Option<&'static str> {
+                                        if ts == 0 {
+                                            Some("zero")
+                                        } else if ts > now_secs.saturating_add(60) {
+                                            if ts > 4_000_000_000 {
+                                                Some("wrapped")
+                                            } else {
+                                                Some("future")
                                             }
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    if sort_field_loaded {
+                                        let sort_field = sort_field.expect("loaded implies Some");
+                                        // Drain deferred slots from prior cycles first. These
+                                        // can be either deferred alive_inserts (no prior bucket
+                                        // membership) OR deferred sort_value_changed (old bucket
+                                        // membership was already cleared at defer time, so a
+                                        // plain insert is sufficient on replay).
+                                        for slot in pending_bucket_retries.drain() {
+                                            let ts = sort_field.reconstruct_value(slot) as u64;
+                                            #[cfg(feature = "server")]
+                                            if let Some(bridge) = bridge_opt {
+                                                if let Some(k) = classify_anomaly(ts) {
+                                                    bridge
+                                                        .timebucket_anomalous_ts_total
+                                                        .with_label_values(&[
+                                                            &bridge.index_name,
+                                                            &sort_field_name,
+                                                            k,
+                                                        ])
+                                                        .inc();
+                                                }
+                                            }
+                                            tb.insert_slot(slot, ts, now_secs);
+                                        }
+                                        for &slot in alive_inserts {
+                                            let ts = sort_field.reconstruct_value(slot) as u64;
+                                            #[cfg(feature = "server")]
+                                            if let Some(bridge) = bridge_opt {
+                                                if let Some(k) = classify_anomaly(ts) {
+                                                    bridge
+                                                        .timebucket_anomalous_ts_total
+                                                        .with_label_values(&[
+                                                            &bridge.index_name,
+                                                            &sort_field_name,
+                                                            k,
+                                                        ])
+                                                        .inc();
+                                                }
+                                            }
+                                            tb.insert_slot(slot, ts, now_secs);
+                                        }
+                                        for slot in &sort_value_changed {
+                                            // Re-evaluate bucket membership against the new
+                                            // value. insert_slot is a no-op for buckets where
+                                            // the new ts is out of window, so this also handles
+                                            // aging-out.
+                                            let ts = sort_field.reconstruct_value(*slot) as u64;
+                                            #[cfg(feature = "server")]
+                                            if let Some(bridge) = bridge_opt {
+                                                if let Some(k) = classify_anomaly(ts) {
+                                                    bridge
+                                                        .timebucket_anomalous_ts_total
+                                                        .with_label_values(&[
+                                                            &bridge.index_name,
+                                                            &sort_field_name,
+                                                            k,
+                                                        ])
+                                                        .inc();
+                                                }
+                                            }
+                                            tb.remove_slot(*slot);
+                                            tb.insert_slot(*slot, ts, now_secs);
+                                        }
+                                    } else {
+                                        // Sort field is partially loaded (some bit layers in the
+                                        // unloaded placeholder state). reconstruct_value would
+                                        // return zeroed/garbage timestamps for slots whose bits
+                                        // live only in the unloaded base, so silently dropping
+                                        // them from buckets is the live-update path's main
+                                        // staleness source. Defer them, replay once loaded.
+                                        //
+                                        // For sort_value_changed slots specifically: we MUST
+                                        // clear any existing bucket membership at defer time,
+                                        // not at replay time. Otherwise the slot lingers in its
+                                        // old bucket until reload — exactly the staleness this
+                                        // fix is meant to prevent. The old ts is unknown without
+                                        // the sort field so we remove from every bucket; the
+                                        // replay path will re-insert with the correct new ts.
+                                        for slot in &sort_value_changed {
+                                            tb.remove_slot(*slot);
+                                        }
+                                        let total_pending =
+                                            alive_inserts.len() + sort_value_changed.len();
+                                        let space_left = PENDING_BUCKET_RETRY_CAP
+                                            .saturating_sub(pending_bucket_retries.len());
+                                        let mut deferred = 0usize;
+                                        for &slot in alive_inserts.iter().take(space_left) {
+                                            pending_bucket_retries.insert(slot);
+                                            deferred += 1;
+                                        }
+                                        let space_left = PENDING_BUCKET_RETRY_CAP
+                                            .saturating_sub(pending_bucket_retries.len());
+                                        for slot in sort_value_changed.iter().take(space_left) {
+                                            pending_bucket_retries.insert(*slot);
+                                            deferred += 1;
+                                        }
+                                        let dropped = total_pending.saturating_sub(deferred);
+                                        if dropped > 0 {
+                                            tracing::error!(
+                                                "[time-bucket] pending retry queue at cap ({}); permanently dropped {} slots while sort field '{}' is unloaded — bucket bitmap data loss",
+                                                PENDING_BUCKET_RETRY_CAP,
+                                                dropped,
+                                                sort_field_name,
+                                            );
+                                            #[cfg(feature = "server")]
+                                            if let Some(bridge) = bridge_opt {
+                                                bridge
+                                                    .timebucket_dropped_capacity_exceeded_total
+                                                    .with_label_values(&[
+                                                        &bridge.index_name,
+                                                        &sort_field_name,
+                                                    ])
+                                                    .inc_by(dropped as u64);
+                                            }
+                                        }
+                                        #[cfg(feature = "server")]
+                                        if let Some(bridge) = bridge_opt {
+                                            bridge
+                                                .timebucket_dropped_no_sort_field_total
+                                                .with_label_values(&[
+                                                    &bridge.index_name,
+                                                    &sort_field_name,
+                                                ])
+                                                .inc_by(deferred as u64);
                                         }
                                     }
                                     tb_arc.store(Arc::new(tb));

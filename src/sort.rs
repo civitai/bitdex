@@ -524,6 +524,14 @@ impl SortField {
         }
     }
 
+    /// Returns true when every bit layer is loaded (base in memory). False if
+    /// any layer is in the unloaded placeholder state — in which case
+    /// `reconstruct_value` may return partially-zeroed garbage for slots whose
+    /// bits live only in the unloaded base.
+    pub fn is_fully_loaded(&self) -> bool {
+        self.bit_layers.iter().all(|vb| vb.is_loaded())
+    }
+
     /// Load persisted base bitmaps into the sort layers, replacing existing bases.
     /// Each layer becomes a clean VersionedBitmap (no diff).
     pub fn load_layers(&mut self, layers: Vec<RoaringBitmap>) {
