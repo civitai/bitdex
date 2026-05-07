@@ -1404,22 +1404,22 @@ fn apply_query_op_set<S: BitmapSink>(
         }
         let slot = slot_id as u32;
         if let Some(activate_at) = deferred_at {
-            // Deferred fan-out: persist field values to the docstore so the
-            // activation replay reconstructs the correct bitmap state, but
-            // skip every bitmap mutation for this slot. The slot stays at its
-            // prior bitmap state (typically isPublished=false / publishedAt=0
-            // for a brand-new Post hitting an existing Image) until the flush
-            // thread's activate_due() drains it from the deferred map.
+            // Deferred fan-out: persist source field values to the docstore so
+            // activate_due's diff_document replay reconstructs the correct
+            // bitmap state, but skip every bitmap mutation AND skip the shadow
+            // doc writes. write_shadow_target_docs would prematurely flip
+            // shadow targets like isPublished=true in the doc — making
+            // GET /documents/{slot} disagree with the deferred bitmap state
+            // until activation. The shadow gets derived correctly from the
+            // source field at activation time via diff_document.
             if let Some(ref mut dw) = doc_writer {
                 for op in ops {
                     match op {
                         Op::Set { field, value } => {
                             dw.write_set(slot, field, value);
-                            write_shadow_target_docs(dw, meta, slot, field, value.is_null());
                         }
                         Op::Remove { field, value } => {
                             dw.write_remove(slot, field, value);
-                            write_shadow_target_docs(dw, meta, slot, field, true);
                         }
                         Op::Add { field, value } => {
                             dw.write_add(slot, field, value);
