@@ -90,10 +90,12 @@ pub struct CacheWorkerMetrics {
     pub backpressure_invalidations_total: AtomicU64,
     pub cycles_total: AtomicU64,
     /// Cache entries marked for rebuild because the time deadline was hit
-    /// (`max_maintenance_ms` exceeded mid-cycle).
+    /// (`max_maintenance_ms` exceeded mid-cycle). `max_maintenance_ms` is now
+    /// deprecated (no-op); this counter is retained for metric continuity.
     pub marked_for_rebuild_deadline_total: AtomicU64,
-    /// Cache entries marked for rebuild because the count budget was hit
-    /// (`max_maintenance_work` exceeded before evaluation started).
+    /// Cache entries evicted (not merely marked for rebuild) because the count
+    /// budget was hit (`max_maintenance_work` exceeded before evaluation started).
+    /// `max_maintenance_work` defaults to 0 (disabled) in new configs.
     pub marked_for_rebuild_count_budget_total: AtomicU64,
     /// Cache entries marked for rebuild because the worker backlog overflowed
     /// `backlog_drop_limit` and we fell back to coarse invalidation.

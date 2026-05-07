@@ -1043,14 +1043,19 @@ impl UnifiedCache {
                     m.rebuild_completed_total.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            self.total_bytes
-                .fetch_sub(old.memory_bytes().min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+            let old_bytes = old.memory_bytes();
+            let _ = self.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| Some(curr.saturating_sub(old_bytes)));
             self.meta_id_to_key.remove(&old.meta_id);
             self.meta.write().deregister(old.meta_id);
             // Remove from shard→keys index
             let old_sk = ShardKey::new(key.sort_field.clone(), key.direction);
             if let Some(mut set) = self.shard_to_keys.get_mut(&old_sk) {
                 set.value_mut().remove(&key);
+                let now_empty = set.value().is_empty();
+                drop(set);
+                if now_empty {
+                    self.shard_to_keys.remove(&old_sk);
+                }
             }
         }
         // Batch eviction: when over budget, evict ~10% of entries at once.
@@ -1222,12 +1227,16 @@ impl UnifiedCache {
                 evicted.cardinality(), evicted.memory_bytes()
             );
             let bytes = evicted.memory_bytes();
-            self.total_bytes
-                .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+            let _ = self.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| Some(curr.saturating_sub(bytes)));
             self.meta_id_to_key.remove(&evicted.meta_id);
             let sk = ShardKey::new(lru_key.sort_field.clone(), lru_key.direction);
             if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
                 set.value_mut().remove(&lru_key);
+                let now_empty = set.value().is_empty();
+                drop(set);
+                if now_empty {
+                    self.shard_to_keys.remove(&sk);
+                }
             }
             self.evictions.fetch_add(1, Ordering::Relaxed);
             if !persistence {
@@ -1286,12 +1295,16 @@ impl UnifiedCache {
             let Some((_, key)) = best else { break };
             if let Some((_, entry)) = self.entries.remove(&key) {
                 let bytes = entry.memory_bytes();
-                self.total_bytes
-                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                let _ = self.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| Some(curr.saturating_sub(bytes)));
                 self.meta_id_to_key.remove(&entry.meta_id);
                 let sk = ShardKey::new(key.sort_field.clone(), key.direction);
                 if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
                     set.value_mut().remove(&key);
+                    let now_empty = set.value().is_empty();
+                    drop(set);
+                    if now_empty {
+                        self.shard_to_keys.remove(&sk);
+                    }
                 }
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 if !prefer_non_dirty {
@@ -1582,12 +1595,16 @@ impl UnifiedCache {
             }
             if let Some((_, entry)) = self.entries.remove(key) {
                 let bytes = entry.memory_bytes();
-                self.total_bytes
-                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                let _ = self.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| Some(curr.saturating_sub(bytes)));
                 self.meta_id_to_key.remove(&entry.meta_id);
                 let sk = ShardKey::new(key.sort_field.clone(), key.direction);
                 if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
                     set.value_mut().remove(key);
+                    let now_empty = set.value().is_empty();
+                    drop(set);
+                    if now_empty {
+                        self.shard_to_keys.remove(&sk);
+                    }
                 }
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 if !persistence {
@@ -1905,6 +1922,10 @@ impl UnifiedCache {
         // every subsequent query to re-run the full filter+sort on a cold miss, while an
         // evicted entry simply re-populates on the next `store()`. Net cost is the same
         // cold miss either way, but without the persistent `needs_rebuild` state.
+        //
+        // NOTE: `max_maintenance_ms` is deprecated (no-op); the `== 0` guard is kept for
+        // YAML-compat with old configs that set both fields. The effective condition is
+        // `max_maintenance_work > 0 && estimated_work > max_maintenance_work`.
         if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
@@ -1992,6 +2013,8 @@ impl UnifiedCache {
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
         // Same overrun fallback as `collect_filter_work`: evict rather than mark-for-rebuild.
+        // NOTE: `max_maintenance_ms` is deprecated (no-op); the `== 0` guard is kept for
+        // YAML-compat with old configs that set both fields.
         if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
@@ -2073,12 +2096,16 @@ impl UnifiedCache {
         for key in keys {
             if let Some((_, evicted)) = self.entries.remove(key) {
                 let bytes = evicted.memory_bytes();
-                self.total_bytes
-                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                let _ = self.total_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |curr| Some(curr.saturating_sub(bytes)));
                 self.meta_id_to_key.remove(&evicted.meta_id);
                 let sk = ShardKey::new(key.sort_field.clone(), key.direction);
                 if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
                     set.value_mut().remove(key);
+                    let now_empty = set.value().is_empty();
+                    drop(set);
+                    if now_empty {
+                        self.shard_to_keys.remove(&sk);
+                    }
                 }
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 if !persistence {
