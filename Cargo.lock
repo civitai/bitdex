@@ -219,7 +219,7 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitdex-v2"
-version = "1.1.3"
+version = "1.1.5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2202,7 +2202,6 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "roaring",
- "serde_json",
  "tempfile",
 ]
 
