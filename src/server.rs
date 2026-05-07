@@ -1073,6 +1073,11 @@ struct ConfigPatch {
     /// faster ops-replay on read at cost of more rewrite I/O.
     #[serde(default)]
     bitmap_compact_threshold: Option<u32>,
+    /// Max prefilter registry size. 0 disables prefilters entirely — existing
+    /// entries are evicted within one merge cycle and all registration paths
+    /// (manual POST and auto-promotion) are gated. Range: 0-32.
+    #[serde(default)]
+    max_registered_prefilters: Option<usize>,
 }
 
 /// Patchable fields for a filter field.
@@ -2499,6 +2504,22 @@ async fn handle_patch_config(
                 if let Some(v) = patch.bitmap_compact_threshold {
                     idx.engine.set_bitmap_compact_threshold(v);
                     eprintln!("Config patch: bitmap_compact_threshold set to {v}");
+                }
+                if let Some(v) = patch.max_registered_prefilters {
+                    if v > crate::prefilter::MAX_REGISTERED_PREFILTERS {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": format!(
+                                    "max_registered_prefilters must be 0-{} (got {v})",
+                                    crate::prefilter::MAX_REGISTERED_PREFILTERS
+                                )
+                            })),
+                        ).into_response();
+                    }
+                    idx.definition.config.max_registered_prefilters = v;
+                    idx.engine.set_max_registered_prefilters(v);
+                    eprintln!("Config patch: max_registered_prefilters set to {v}");
                 }
 
                 // Toggle trace collection (server-wide, not persisted with index config)

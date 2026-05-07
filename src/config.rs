@@ -107,6 +107,13 @@ pub struct Config {
     /// Defaults to 0, which means use rayon's default (usually num_cpus).
     #[serde(default)]
     pub rayon_threads: usize,
+    /// Max prefilter registry size. 0 disables prefilters entirely — existing
+    /// entries are evicted on the next maintenance cycle and all registration
+    /// paths (manual POST and auto-promotion) are gated.
+    /// Default: 32 (matches prior hardcoded behavior). Range: 0-32.
+    /// Runtime-patchable via PATCH /api/indexes/{name}/config.
+    #[serde(default = "default_max_registered_prefilters")]
+    pub max_registered_prefilters: usize,
 }
 fn default_max_page_size() -> usize {
     100
@@ -140,6 +147,9 @@ fn default_channel_capacity() -> usize {
 }
 fn default_schema_version() -> u8 {
     1
+}
+fn default_max_registered_prefilters() -> usize {
+    crate::prefilter::MAX_REGISTERED_PREFILTERS
 }
 /// Deferred alive configuration: defer a document's alive bit until a future timestamp.
 ///
@@ -181,6 +191,7 @@ impl Default for Config {
             headless: false,
             data_schema: DataSchema::default(),
             rayon_threads: 0,
+            max_registered_prefilters: default_max_registered_prefilters(),
         }
     }
 }

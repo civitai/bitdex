@@ -1076,6 +1076,8 @@ impl ConcurrentEngine {
         } else {
             (None, None)
         };
+        // Read config values needed below (after potential config Arc move).
+        let initial_prefilter_cap = config.max_registered_prefilters;
         // Headless mode: skip all background threads.
         // The engine provides config, bitmap store, and docstore access but
         // no flush/merge/eviction threads run.
@@ -1157,7 +1159,9 @@ impl ConcurrentEngine {
                 cache_worker_handle: None,
                 cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
                 cache_worker_ms: None,
-                prefilter_registry: Arc::new(crate::prefilter::PrefilterRegistry::new()),
+                prefilter_registry: Arc::new(
+                    crate::prefilter::PrefilterRegistry::new_with_cap(initial_prefilter_cap)
+                ),
                 warm_registry: Arc::new(crate::warm_registry::WarmRegistry::new(None)),
             });
         }
@@ -2692,7 +2696,9 @@ impl ConcurrentEngine {
             })
             .expect("failed to spawn bitdex-flush thread")
         };
-        let prefilter_registry = Arc::new(crate::prefilter::PrefilterRegistry::new());
+        let prefilter_registry = Arc::new(
+            crate::prefilter::PrefilterRegistry::new_with_cap(config.max_registered_prefilters)
+        );
         let warm_persist_path = config.storage.bitmap_path.as_ref()
             .map(|p| p.join("warm.json"));
         let warm_registry = Arc::new(crate::warm_registry::WarmRegistry::new(warm_persist_path));
@@ -3097,6 +3103,30 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+                    // ── Prefilter evict-to-fit ────────────────────────────────
+                    // When max_entries has been lowered at runtime, shed entries
+                    // until len <= cap. Picks the least-substituted entry each
+                    // pass (lowest work saved → safest to drop).
+                    {
+                        let target = merge_prefilter_registry.max_entries();
+                        while merge_prefilter_registry.len() > target {
+                            let victim_name = merge_prefilter_registry
+                                .entries()
+                                .into_iter()
+                                .min_by_key(|e| e.substitutions())
+                                .map(|e| e.name.clone());
+                            match victim_name {
+                                Some(name) => {
+                                    merge_prefilter_registry.remove(&name);
+                                    merge_unified_cache.invalidate_prefilter(&name);
+                                    tracing::info!(
+                                        "prefilter evicted to fit max_entries={target}: '{name}'"
+                                    );
+                                }
+                                None => break,
+                            }
+                        }
+                    }
                     // ── Prefilter refresh ──────────────────────────────────────
                     // Refresh any stale prefilters against the current snapshot.
                     // This runs every merge cycle (~60s default), so prefilter
@@ -3139,7 +3169,10 @@ impl ConcurrentEngine {
                     // When a filter clause set reaches a frequency threshold,
                     // auto-register it as a prefilter. The warm registry tracks
                     // shapes by frequency; here we promote hot filter sets.
-                    if merge_warm_registry.total_recorded() >= 50 {
+                    // Skip entirely when the registry is at or above its cap
+                    // (max_entries == 0 disables promotion entirely).
+                    if merge_prefilter_registry.len() < merge_prefilter_registry.max_entries()
+                        && merge_warm_registry.total_recorded() >= 50 {
                         let hot = merge_warm_registry.hot_filter_sets(10);
                         for hfs in &hot {
                             // Skip if already covered by an existing prefilter
@@ -3691,6 +3724,13 @@ impl ConcurrentEngine {
         if let Some(ref s) = self.sort_store { return s.compact_threshold(); }
         crate::shard_store::DEFAULT_COMPACT_THRESHOLD
     }
+    /// Set the prefilter registry cap at runtime. Takes effect immediately for
+    /// the insert guard; the merge thread's evict-to-fit pass enforces it within
+    /// one merge cycle. Called by PATCH /config handler.
+    pub fn set_max_registered_prefilters(&self, n: usize) {
+        self.prefilter_registry.set_max_entries(n);
+    }
+
     /// Get a reference to the bitmap memory cache (for metrics scraping).
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
         &self.bitmap_memory_cache
