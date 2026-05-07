@@ -384,12 +384,50 @@ function configPatch(jsonStr) {
   if (!jsonStr) { json({ error: 'Usage: config-patch \'{"key": "value"}\'' }); process.exit(1); }
   if (!ADMIN_TOKEN) { json({ error: 'BITDEX_ADMIN_TOKEN not set' }); process.exit(1); }
   try { JSON.parse(jsonStr); } catch { json({ error: 'Invalid JSON', input: jsonStr }); process.exit(1); }
-  const localPort = 3098;
-  portForward({ target: 'pod/bitdex-0', localPort, remotePort: 3000 });
-  run('sleep 2', { throws: false });
-  const result = run(`curl -sf -X PATCH -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_TOKEN}" -d '${jsonStr}' http://localhost:${localPort}/api/indexes/civitai/config`, { throws: false });
-  killPortForward(localPort, 3000);
-  try { json(JSON.parse(result)); } catch { json({ raw: result }); }
+
+  // Fan out to every running bitdex pod so HA replicas don't drift on
+  // hot patches. Patch is in-memory only (the engine never persists it),
+  // so this loop is the only thing that keeps replicas in sync. For
+  // permanent settings, edit the ConfigMap in talos-infra and let Flux
+  // reconcile — that's the canonical path.
+  const podsRaw = run(
+    `kubectl -n ${NS} get pods -l app.kubernetes.io/name=bitdex -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}'`,
+    { throws: false },
+  );
+  let pods = (podsRaw || '').trim().split(/\s+/).filter(Boolean);
+  if (pods.length === 0) {
+    // Fallback: enumerate StatefulSet ordinals if the label selector misses.
+    const ssRaw = run(
+      `kubectl -n ${NS} get pods -l statefulset.kubernetes.io/pod-name -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\\n"}{end}'`,
+      { throws: false },
+    );
+    pods = (ssRaw || '').trim().split(/\n/).filter(p => p.startsWith('bitdex-'));
+  }
+  if (pods.length === 0) pods = ['bitdex-0']; // last-resort default
+
+  const results = [];
+  let basePort = 3098;
+  for (const pod of pods) {
+    const localPort = basePort++;
+    portForward({ target: `pod/${pod}`, localPort, remotePort: 3000 });
+    run('sleep 2', { throws: false });
+    const result = run(
+      `curl -sf -X PATCH -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_TOKEN}" -d '${jsonStr}' http://localhost:${localPort}/api/indexes/civitai/config`,
+      { throws: false },
+    );
+    killPortForward(localPort, 3000);
+    let parsed;
+    try { parsed = JSON.parse(result); } catch { parsed = { raw: result }; }
+    results.push({ pod, response: parsed, ok: !!parsed?.config });
+  }
+
+  const allOk = results.every(r => r.ok);
+  json({
+    pods_patched: results.length,
+    all_ok: allOk,
+    results,
+    warning: 'in-memory only — these patches do NOT survive pod restart and do NOT propagate beyond this fan-out. For a permanent change, edit bitdex-index-config in talos-infra and let Flux reconcile.',
+  });
 }
 
 function memory() {

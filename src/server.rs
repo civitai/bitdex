@@ -2624,10 +2624,16 @@ async fn handle_patch_config(
         }
     };
 
-    // Return the full updated config
+    // Return the full updated config plus an explicit ephemeral warning. The
+    // patch lives only in this pod's memory — it does NOT persist across pod
+    // restarts and does NOT propagate to other replicas in an HA setup. To
+    // make a setting permanent, edit `bitdex-index-config` ConfigMap in the
+    // talos-infra repo and let Flux roll it out. Hot patch is for
+    // experimentation only.
     let _ = engine; // engine kept in scope for spawned task
     Json(serde_json::json!({
         "config": updated_config,
+        "warning": "in-memory only — does not persist across pod restart and applies only to this replica. For permanent changes, edit the ConfigMap in talos-infra and let Flux reconcile.",
     })).into_response()
 }
 
