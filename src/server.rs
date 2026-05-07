@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path as AxumPath, Query as AxumQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, patch, post, put, delete};
@@ -1019,7 +1019,7 @@ struct RemoveFieldsRequest {
 // ---------------------------------------------------------------------------
 
 /// Partial config update — only fields present are changed.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ConfigPatch {
     #[serde(default)]
     filter_fields: Option<HashMap<String, FilterFieldPatch>>,
@@ -1081,32 +1081,32 @@ struct ConfigPatch {
 }
 
 /// Patchable fields for a filter field.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct FilterFieldPatch {
     eager_load: Option<bool>,
 }
 
 /// Patchable fields for a sort field.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SortFieldPatch {
     eager_load: Option<bool>,
 }
 
 /// Patchable fields for time bucket config.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TimeBucketPatch {
     range_buckets: Option<Vec<TimeBucketRangePatch>>,
 }
 
 /// Patchable fields for a single time bucket.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TimeBucketRangePatch {
     name: String,
     refresh_interval_secs: Option<u64>,
 }
 
 /// Patchable fields for cache config.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CachePatch {
     max_entries: Option<usize>,
     max_bytes: Option<usize>,
@@ -2302,11 +2302,47 @@ async fn handle_ui_config(
 // Handlers: Config Patch
 // ---------------------------------------------------------------------------
 
+/// Parse the ordinal suffix from a StatefulSet pod name of the form `<prefix>-<N>`.
+/// Returns `Some(N)` if the trailing component is a non-negative integer, `None` otherwise.
+///
+/// Examples:
+///   "bitdex-0"  → Some(0)
+///   "bitdex-1"  → Some(1)
+///   "bitdex-12" → Some(12)
+///   "bitdex"    → None
+///   ""          → None
+fn parse_pod_ordinal(pod_name: &str) -> Option<usize> {
+    pod_name.rsplit('-').next().and_then(|s| s.parse().ok())
+}
+
 async fn handle_patch_config(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
     Json(patch): Json<ConfigPatch>,
 ) -> impl IntoResponse {
+    // ---------------------------------------------------------------------------
+    // HA fan-out: forward this patch to peer pods if this is a user-facing call.
+    //
+    // Header `X-BitDex-Patch-Origin`:
+    //   absent        → user-facing: apply locally, then fan out to peers
+    //   own pod name  → misrouted self-patch: apply locally only
+    //   peer pod name → peer-driven patch: apply locally only (no cascading)
+    // ---------------------------------------------------------------------------
+    let pod_name = std::env::var("POD_NAME").ok();
+    let replica_count: Option<usize> = std::env::var("BITDEX_REPLICA_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let patch_origin = headers
+        .get("x-bitdex-patch-origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    // Determine whether to fan out: only when this is a user-facing request
+    // (no origin header), we know our own pod name, and there are 2+ replicas.
+    let should_fanout = patch_origin.is_none()
+        && pod_name.is_some()
+        && replica_count.map(|n| n > 1).unwrap_or(false);
     let (engine, updated_config) = {
         let mut guard = state.index.lock();
         match guard.as_mut() {
@@ -2626,15 +2662,141 @@ async fn handle_patch_config(
 
     // Return the full updated config plus an explicit ephemeral warning. The
     // patch lives only in this pod's memory — it does NOT persist across pod
-    // restarts and does NOT propagate to other replicas in an HA setup. To
-    // make a setting permanent, edit `bitdex-index-config` ConfigMap in the
-    // talos-infra repo and let Flux roll it out. Hot patch is for
-    // experimentation only.
+    // restarts. For permanent settings, edit the ConfigMap in talos-infra and
+    // let Flux reconcile.
     let _ = engine; // engine kept in scope for spawned task
-    Json(serde_json::json!({
+
+    let self_pod = pod_name.as_deref().unwrap_or("unknown");
+    let applied_to = vec![self_pod.to_owned()];
+
+    // Fan-out to peer pods if this is a user-facing patch.
+    let peer_results = if should_fanout {
+        let self_name = pod_name.as_deref().unwrap_or("");
+        let n = replica_count.unwrap_or(1);
+
+        // Parse self ordinal from POD_NAME (e.g. "bitdex-0" → 0). Reuse the
+        // prefix from POD_NAME rather than hardcoding "bitdex-" so a renamed
+        // StatefulSet or sidecar test harness still synthesizes correct peer
+        // names.
+        let self_ordinal: Option<usize> = parse_pod_ordinal(self_name);
+        let pod_prefix: &str = self_name
+            .rsplit_once('-')
+            .map(|(p, _)| p)
+            .unwrap_or("bitdex");
+
+        // Build peer URL list (exclude self).
+        let mut peer_urls: Vec<(String, String)> = Vec::new();
+        if let Some(self_ord) = self_ordinal {
+            for i in 0..n {
+                if i == self_ord {
+                    continue;
+                }
+                let pod = format!("{}-{}", pod_prefix, i);
+                let url = format!(
+                    "http://{}.bitdex-headless.bitdex.svc.cluster.local:3000/api/indexes/{}/config",
+                    pod, name
+                );
+                peer_urls.push((pod, url));
+            }
+        }
+
+        // Forward Authorization header if present.
+        let auth_header = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+
+        // Serialize the patch body once. ConfigPatch is structurally always
+        // serializable, but if encoding ever fails we want a hard error
+        // rather than a silent empty-body fan-out that every peer rejects.
+        let body_bytes = match serde_json::to_vec(&patch) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Config patch fan-out: failed to serialize ConfigPatch: {e}");
+                Vec::new()
+            }
+        };
+        if body_bytes.is_empty() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal: failed to serialize ConfigPatch for fan-out",
+                })),
+            ).into_response();
+        }
+
+        // Fan-out concurrently with a 5s timeout per peer.
+        let mut tasks = Vec::new();
+        for (pod, url) in peer_urls {
+            let body = body_bytes.clone();
+            let auth = auth_header.clone();
+            let self_pod_name = self_name.to_owned();
+            tasks.push(tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build();
+                let client = match client {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Config fan-out: failed to build reqwest client for {pod}: {e}");
+                        return (pod, false, format!("client build error: {e}"));
+                    }
+                };
+                let mut req = client
+                    .patch(&url)
+                    .header("content-type", "application/json")
+                    .header("x-bitdex-patch-origin", &self_pod_name)
+                    .body(body);
+                if let Some(ref auth_val) = auth {
+                    req = req.header("authorization", auth_val);
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        eprintln!("Config fan-out: {pod} ok ({})", resp.status());
+                        (pod, true, String::new())
+                    }
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        eprintln!("Config fan-out: {pod} non-2xx ({status})");
+                        (pod, false, format!("http {status}"))
+                    }
+                    Err(e) => {
+                        eprintln!("Config fan-out: {pod} error: {e}");
+                        (pod, false, format!("{e}"))
+                    }
+                }
+            }));
+        }
+
+        let mut results = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok((pod, ok, err)) => {
+                    let mut entry = serde_json::json!({"pod": pod, "ok": ok});
+                    if !ok && !err.is_empty() {
+                        entry["error"] = serde_json::Value::String(err);
+                    }
+                    results.push(entry);
+                }
+                Err(e) => {
+                    eprintln!("Config fan-out: join error: {e}");
+                }
+            }
+        }
+        results
+    } else {
+        Vec::new()
+    };
+
+    let mut resp = serde_json::json!({
         "config": updated_config,
-        "warning": "in-memory only — does not persist across pod restart and applies only to this replica. For permanent changes, edit the ConfigMap in talos-infra and let Flux reconcile.",
-    })).into_response()
+        "applied_to": applied_to,
+        "warning": "in-memory only — does not persist across pod restart. For permanent settings, edit ConfigMap in talos-infra and let Flux reconcile.",
+    });
+    if !peer_results.is_empty() {
+        resp["peer_results"] = serde_json::Value::Array(peer_results);
+    }
+    Json(resp).into_response()
 }
 
 async fn handle_delete_index(
@@ -6133,6 +6295,21 @@ async fn handle_query_stream(
 mod tests {
     use super::*;
     use crate::config::{FieldMapping, FieldValueType, DataSchema};
+
+    #[test]
+    fn patch_config_fanout_ordinal_parser() {
+        assert_eq!(parse_pod_ordinal("bitdex-0"), Some(0));
+        assert_eq!(parse_pod_ordinal("bitdex-1"), Some(1));
+        assert_eq!(parse_pod_ordinal("bitdex-12"), Some(12));
+        // No trailing ordinal
+        assert_eq!(parse_pod_ordinal("bitdex"), None);
+        // Non-numeric suffix
+        assert_eq!(parse_pod_ordinal("bitdex-abc"), None);
+        // Empty string
+        assert_eq!(parse_pod_ordinal(""), None);
+        // Different StatefulSet prefix
+        assert_eq!(parse_pod_ordinal("my-service-3"), Some(3));
+    }
 
     #[test]
     fn inflight_guard_decrements_on_drop() {
