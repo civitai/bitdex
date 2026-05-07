@@ -2674,8 +2674,15 @@ async fn handle_patch_config(
         let self_name = pod_name.as_deref().unwrap_or("");
         let n = replica_count.unwrap_or(1);
 
-        // Parse self ordinal from "bitdex-{i}".
+        // Parse self ordinal from POD_NAME (e.g. "bitdex-0" → 0). Reuse the
+        // prefix from POD_NAME rather than hardcoding "bitdex-" so a renamed
+        // StatefulSet or sidecar test harness still synthesizes correct peer
+        // names.
         let self_ordinal: Option<usize> = parse_pod_ordinal(self_name);
+        let pod_prefix: &str = self_name
+            .rsplit_once('-')
+            .map(|(p, _)| p)
+            .unwrap_or("bitdex");
 
         // Build peer URL list (exclude self).
         let mut peer_urls: Vec<(String, String)> = Vec::new();
@@ -2684,7 +2691,7 @@ async fn handle_patch_config(
                 if i == self_ord {
                     continue;
                 }
-                let pod = format!("bitdex-{}", i);
+                let pod = format!("{}-{}", pod_prefix, i);
                 let url = format!(
                     "http://{}.bitdex-headless.bitdex.svc.cluster.local:3000/api/indexes/{}/config",
                     pod, name
@@ -2699,8 +2706,24 @@ async fn handle_patch_config(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
 
-        // Serialize the patch body once.
-        let body_bytes = serde_json::to_vec(&patch).unwrap_or_default();
+        // Serialize the patch body once. ConfigPatch is structurally always
+        // serializable, but if encoding ever fails we want a hard error
+        // rather than a silent empty-body fan-out that every peer rejects.
+        let body_bytes = match serde_json::to_vec(&patch) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Config patch fan-out: failed to serialize ConfigPatch: {e}");
+                Vec::new()
+            }
+        };
+        if body_bytes.is_empty() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal: failed to serialize ConfigPatch for fan-out",
+                })),
+            ).into_response();
+        }
 
         // Fan-out concurrently with a 5s timeout per peer.
         let mut tasks = Vec::new();
