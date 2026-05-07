@@ -1778,282 +1778,11 @@ impl UnifiedCache {
         count
     }
     // ── Live Maintenance (Phase 3) ──────────────────────────────────────────
-    /// Maintain cache entries when filter fields change.
-    ///
-    /// For each entry that references a changed field, evaluates each changed slot
-    /// against the full filter predicate using contains() checks. Slots that now match
-    /// AND have qualifying sort values are added. Slots that no longer match are removed.
-    ///
-    /// Called by the flush thread after applying mutations to staging.
-    pub fn maintain_filter_changes(
-        &self,
-        filter_inserts: &HashMap<FilterGroupKey, Vec<u32>>,
-        filter_removes: &HashMap<FilterGroupKey, Vec<u32>>,
-        filters: &FilterIndex,
-        sorts: &SortIndex,
-    ) {
-        let mut changed_slots_per_field: HashMap<&str, HashSet<u32>> = HashMap::new();
-        for (key, slots) in filter_inserts {
-            changed_slots_per_field
-                .entry(&key.field)
-                .or_default()
-                .extend(slots.iter().copied());
-        }
-        for (key, slots) in filter_removes {
-            changed_slots_per_field
-                .entry(&key.field)
-                .or_default()
-                .extend(slots.iter().copied());
-        }
-        if changed_slots_per_field.is_empty() {
-            return;
-        }
-        // Clause-level narrowing via meta-index (read lock for the lookup pass).
-        let affected_ids: RoaringBitmap = {
-            let meta = self.meta.read();
-            let mut ids = RoaringBitmap::new();
-            for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
-                let value_repr = key.value.to_string();
-                if let Some(bm) = meta.entries_for_clause(&key.field, "eq", &value_repr) {
-                    ids |= bm;
-                }
-            }
-            for field in changed_slots_per_field.keys() {
-                if let Some(field_bm) = meta.entries_for_filter_field(field) {
-                    let new_entries = field_bm - &ids;
-                    if !new_entries.is_empty() {
-                        for meta_id in new_entries.iter() {
-                            if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
-                                let has_non_eq = key_ref.value().filter_clauses.iter().any(|c| {
-                                    c.field == *field && c.op != "eq"
-                                });
-                                if has_non_eq {
-                                    ids.insert(meta_id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            ids
-        };
-        if affected_ids.is_empty() {
-            return;
-        }
-        let cfg = self.config.load();
-        let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
-        let affected_count = affected_ids.len() as usize;
-        let estimated_work = affected_count * total_changed_slots;
-        let deadline = if cfg.max_maintenance_ms > 0 {
-            Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
-        } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
-            let mut marked = 0u64;
-            for meta_id in affected_ids.iter() {
-                if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
-                    let key = key_ref.value().clone();
-                    drop(key_ref);
-                    if let Some(r) = self.entries.get(&key) {
-                        r.value().mark_for_rebuild();
-                        marked += 1;
-                    }
-                }
-            }
-            if marked > 0 {
-                if let Some(m) = self.rmetrics() {
-                    m.marked_for_rebuild_count_budget_total
-                        .fetch_add(marked, Ordering::Relaxed);
-                }
-            }
-            return;
-        } else {
-            None
-        };
-        let affected_keys: Vec<UnifiedKey> = affected_ids
-            .iter()
-            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
-            .collect();
-        for (i, key) in affected_keys.iter().enumerate() {
-            if let Some(deadline) = deadline {
-                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                    let mut marked = 0u64;
-                    for remaining_key in &affected_keys[i..] {
-                        if let Some(r) = self.entries.get(remaining_key) {
-                            r.value().mark_for_rebuild();
-                            marked += 1;
-                        }
-                    }
-                    if marked > 0 {
-                        if let Some(m) = self.rmetrics() {
-                            m.marked_for_rebuild_deadline_total
-                                .fetch_add(marked, Ordering::Relaxed);
-                        }
-                    }
-                    break;
-                }
-            }
-            let Some(mut entry_ref) = self.entries.get_mut(key) else {
-                continue;
-            };
-            let entry = entry_ref.value_mut();
-            if entry.needs_rebuild() {
-                continue;
-            }
-            // Clone the native FilterClause tree (cheap Arc clone) before the
-            // per-slot loop. Non-empty → use slot_matches_filter_native (B2 path).
-            // Empty (legacy entries without original_filter_clauses) → fall back to
-            // the canonical slot_matches_filter. Test fixtures typically don't call
-            // form_and_store_with_clauses so they hit the fallback — that's fine.
-            let native_clauses = Arc::clone(entry.original_filter_clauses());
-            let use_native = !native_clauses.is_empty();
-            // Local miss counter for the test path; no string_maps/dictionaries are
-            // threaded here so string-typed In clauses will miss and return false —
-            // which is the correct conservative behaviour in the absence of
-            // resolution context. The counter is read-only (tests don't assert on it).
-            let _local_miss_counter = std::sync::atomic::AtomicU64::new(0);
-            let mut slots_to_check = HashSet::new();
-            for clause in &key.filter_clauses {
-                if let Some(slots) = changed_slots_per_field.get(clause.field.as_str()) {
-                    slots_to_check.extend(slots);
-                }
-            }
-            if slots_to_check.is_empty() {
-                continue;
-            }
-            for &slot in &slots_to_check {
-                let sort_value = sorts
-                    .get_field(&key.sort_field)
-                    .map(|f| f.reconstruct_value(slot))
-                    .unwrap_or(0);
-                let matches = if use_native {
-                    // B7: single source of truth — same native evaluator as B2.
-                    // No string_maps/dictionaries in the test path; string-typed In
-                    // clauses conservatively return false, which is safe.
-                    slot_matches_filter_native(
-                        slot,
-                        &native_clauses,
-                        filters,
-                        sorts,
-                        None,
-                        None,
-                        None,
-                        &_local_miss_counter,
-                    )
-                } else {
-                    // Fallback: canonical eval for entries without original clauses.
-                    slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None)
-                };
-                if matches {
-                    if entry.sort_qualifies(sort_value, key.direction) {
-                        entry.add_slot(slot, sort_value);
-                    }
-                } else {
-                    entry.remove_slot(slot, sort_value);
-                }
-            }
-        }
-    }
-    /// Maintain cache entries when sort fields change.
-    ///
-    /// For each entry that sorts by a changed field, checks if changed slots have
-    /// qualifying sort values. Only adds slots (never removes on sort change — bloat
-    /// control handles cleanup).
-    pub fn maintain_sort_changes(
-        &self,
-        sort_mutations: &HashMap<&str, HashSet<u32>>,
-        filters: &FilterIndex,
-        sorts: &SortIndex,
-    ) {
-        if sort_mutations.is_empty() {
-            return;
-        }
-        let affected_ids: RoaringBitmap = {
-            let meta = self.meta.read();
-            let mut ids = RoaringBitmap::new();
-            for field in sort_mutations.keys() {
-                ids |= meta.entries_for_sort_field(field);
-            }
-            ids
-        };
-        if affected_ids.is_empty() {
-            return;
-        }
-        let cfg = self.config.load();
-        let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
-        let affected_count = affected_ids.len() as usize;
-        let estimated_work = affected_count * total_sort_slots;
-        let deadline = if cfg.max_maintenance_ms > 0 {
-            Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
-        } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
-            let mut marked = 0u64;
-            for meta_id in affected_ids.iter() {
-                if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
-                    let key = key_ref.value().clone();
-                    drop(key_ref);
-                    if let Some(r) = self.entries.get(&key) {
-                        r.value().mark_for_rebuild();
-                        marked += 1;
-                    }
-                }
-            }
-            if marked > 0 {
-                if let Some(m) = self.rmetrics() {
-                    m.marked_for_rebuild_count_budget_total
-                        .fetch_add(marked, Ordering::Relaxed);
-                }
-            }
-            return;
-        } else {
-            None
-        };
-        let affected_keys: Vec<UnifiedKey> = affected_ids
-            .iter()
-            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
-            .collect();
-        for (i, key) in affected_keys.iter().enumerate() {
-            if let Some(deadline) = deadline {
-                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                    let mut marked = 0u64;
-                    for remaining_key in &affected_keys[i..] {
-                        if let Some(r) = self.entries.get(remaining_key) {
-                            r.value().mark_for_rebuild();
-                            marked += 1;
-                        }
-                    }
-                    if marked > 0 {
-                        if let Some(m) = self.rmetrics() {
-                            m.marked_for_rebuild_deadline_total
-                                .fetch_add(marked, Ordering::Relaxed);
-                        }
-                    }
-                    break;
-                }
-            }
-            let Some(mut entry_ref) = self.entries.get_mut(key) else {
-                continue;
-            };
-            let entry = entry_ref.value_mut();
-            if entry.needs_rebuild() {
-                continue;
-            }
-            let sort_slots = match sort_mutations.get(key.sort_field.as_str()) {
-                Some(slots) => slots,
-                None => continue,
-            };
-            for &slot in sort_slots {
-                let sort_value = sorts
-                    .get_field(&key.sort_field)
-                    .map(|f| f.reconstruct_value(slot))
-                    .unwrap_or(0);
-                if !entry.sort_qualifies(sort_value, key.direction) {
-                    continue;
-                }
-                // Sort qualifies — check filter match
-                if slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None) {
-                    entry.add_slot(slot, sort_value);
-                }
-            }
-        }
-    }
+    // maintain_filter_changes and maintain_sort_changes have been removed.
+    // Use collect_filter_work / evaluate_filter_work / apply_maintenance_results
+    // and collect_sort_work / evaluate_sort_work / apply_maintenance_results
+    // (the par_iter two-phase path) instead.
+
     /// Remove a deleted slot from all cache entries.
     ///
     /// Called by the flush thread when a document is deleted. Targeted removal
@@ -4010,7 +3739,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(entry.bitmap().contains(10));
         assert_eq!(entry.cardinality(), 6);
@@ -4029,7 +3762,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![2],
         );
-        cache.maintain_filter_changes(&HashMap::new(), &removes, &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&HashMap::new(), &removes);
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(2));
         assert_eq!(entry.cardinality(), 4);
@@ -4050,7 +3787,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![100],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         // Slot 100 should NOT have been added (sort value doesn't qualify)
         assert!(!cache.get(&key).unwrap().bitmap().contains(100));
     }
@@ -4076,7 +3817,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         // Slot 10 should NOT be added (fails type=2 check)
         assert!(!cache.get(&key).unwrap().bitmap().contains(10));
     }
@@ -4095,7 +3840,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 5 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         // Slot 10 should NOT be added (excluded by NotEq)
         assert!(!cache.get(&key).unwrap().bitmap().contains(10));
     }
@@ -4111,7 +3860,10 @@ mod tests {
         let sorts = make_sort_index(&[("reactionCount", &[(100, 1500)])]);
         let mut sort_mutations: HashMap<&str, HashSet<u32>> = HashMap::new();
         sort_mutations.insert("reactionCount", [100].into());
-        cache.maintain_sort_changes(&sort_mutations, &filters, &sorts);
+        let (work, _) = cache.collect_sort_work(&sort_mutations);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         assert!(cache.get(&key).unwrap().bitmap().contains(100));
     }
     #[test]
@@ -4125,7 +3877,10 @@ mod tests {
         let sorts = make_sort_index(&[("reactionCount", &[(100, 1500)])]);
         let mut sort_mutations: HashMap<&str, HashSet<u32>> = HashMap::new();
         sort_mutations.insert("reactionCount", [100].into());
-        cache.maintain_sort_changes(&sort_mutations, &filters, &sorts);
+        let (work, _) = cache.collect_sort_work(&sort_mutations);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         assert!(!cache.get(&key).unwrap().bitmap().contains(100));
     }
     #[test]
@@ -4158,7 +3913,13 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        // collect_filter_work skips entries with needs_rebuild() set, so work is empty.
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(work.is_empty(), "needs_rebuild entries should be skipped in collect phase");
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         // Slot 10 NOT added because entry needs rebuild
         assert!(!cache.get(&key).unwrap().bitmap().contains(10));
     }
@@ -4246,7 +4007,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         assert_eq!(cache.get(&key).unwrap().cardinality(), orig_cardinality);
     }
     // --- Compound clause live maintenance tests ---
@@ -4355,7 +4120,11 @@ mod tests {
             FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
             vec![10],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
+        cache.apply_maintenance_results(&results);
         // Slot 10 should be added — the Not(And(...)) clause should not reject it
         let entry = cache.get(&key).unwrap();
         assert!(
@@ -4364,143 +4133,9 @@ mod tests {
         );
     }
     #[test]
-    fn test_time_based_maintenance_short_deadline_marks_rebuild() {
-        // With a very short deadline (1ms) and many entries, some should be
-        // marked for rebuild because the deadline is exceeded mid-loop.
-        let config = UnifiedCacheConfig {
-            max_entries: 200,
-            max_bytes: 64 * 1024 * 1024,
-            initial_capacity: 100,
-            max_capacity: 1600,
-            min_filter_size: 0,
-            max_maintenance_work: 500_000,
-            max_maintenance_ms: 1, // 1ms — very short
-            prefetch_threshold: 0.95,
-            compound_eval_atom_limit: 50,
-        };
-        let mut cache = UnifiedCache::new(config);
-        // Create 150 cache entries all referencing nsfwLevel=1
-        let mut all_slots: Vec<u32> = (0..50).collect();
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &all_slots)])]);
-        let sorts = make_sort_index(&[("reactionCount", &[(100, 5000)])]);
-        for i in 0..150 {
-            let sort_field = format!("sort_{}", i);
-            let key = make_key(
-                &[("nsfwLevel", "eq", "1")],
-                &sort_field,
-                SortDirection::Desc,
-            );
-            cache.form_and_store(key, &all_slots, true, 100_000, |s| 1000 - s);
-        }
-        // Now insert 200 changed slots to create lots of work
-        let mut inserts = HashMap::new();
-        let changed_slots: Vec<u32> = (50..250).collect();
-        inserts.insert(
-            FilterGroupKey {
-                field: Arc::from("nsfwLevel"),
-                value: 1,
-            },
-            changed_slots,
-        );
-        // Extend filter to include new slots
-        let mut extended_slots: Vec<u32> = (0..250).collect();
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &extended_slots)])]);
-        let sorts = make_sort_index(&[("reactionCount", &{
-            let mut sv: Vec<(u32, u32)> = Vec::new();
-            for s in 0..250 {
-                sv.push((s, 5000 - s));
-            }
-            sv
-        })]);
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
-        // With a 1ms deadline and 150 entries × 200 slots of work,
-        // at least some entries should have been marked for rebuild.
-        // (We can't guarantee exactly how many due to timing, but with
-        // this much work at least some should be marked.)
-        let mut rebuild_count = 0;
-        for i in 0..150 {
-            let sort_field = format!("sort_{}", i);
-            let key = make_key(
-                &[("nsfwLevel", "eq", "1")],
-                &sort_field,
-                SortDirection::Desc,
-            );
-            if let Some(entry) = cache.get(&key) {
-                if entry.needs_rebuild() {
-                    rebuild_count += 1;
-                }
-            }
-        }
-        // Note: This test is timing-dependent. On very fast hardware,
-        // all work might complete within 1ms. We assert at least that
-        // the code doesn't panic and the cache is still valid.
-        // On most hardware, some entries will be marked for rebuild.
-        eprintln!("time_based_maintenance: {rebuild_count}/150 entries marked for rebuild with 1ms deadline");
-    }
-    #[test]
-    fn test_time_based_maintenance_long_deadline_completes_all() {
-        // With a long deadline (1000ms) and little work, all entries
-        // should be maintained (none marked for rebuild).
-        let config = UnifiedCacheConfig {
-            max_entries: 200,
-            max_bytes: 64 * 1024 * 1024,
-            initial_capacity: 100,
-            max_capacity: 1600,
-            min_filter_size: 0,
-            max_maintenance_work: 500_000,
-            max_maintenance_ms: 1000, // 1 second — very generous
-            prefetch_threshold: 0.95,
-            compound_eval_atom_limit: 50,
-        };
-        let mut cache = UnifiedCache::new(config);
-        // Create 5 cache entries
-        let slots: Vec<u32> = (0..10).collect();
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &slots)])]);
-        let sorts = make_sort_index(&[("reactionCount", &[
-            (0, 1000), (1, 999), (2, 998), (3, 997), (4, 996),
-            (5, 995), (6, 994), (7, 993), (8, 992), (9, 991), (20, 1500),
-        ])]);
-        for i in 0..5 {
-            let sort_field = format!("sort_{}", i);
-            let key = make_key(
-                &[("nsfwLevel", "eq", "1")],
-                &sort_field,
-                SortDirection::Desc,
-            );
-            cache.form_and_store(key, &slots, true, 100_000, |s| 1000 - s);
-        }
-        // Insert 1 changed slot — minimal work
-        let mut inserts = HashMap::new();
-        inserts.insert(
-            FilterGroupKey {
-                field: Arc::from("nsfwLevel"),
-                value: 1,
-            },
-            vec![20],
-        );
-        let extended_slots: Vec<u32> = (0..21).collect();
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &extended_slots)])]);
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
-        // With 1000ms deadline and only 5 entries × 1 slot, nothing should be
-        // marked for rebuild.
-        for i in 0..5 {
-            let sort_field = format!("sort_{}", i);
-            let key = make_key(
-                &[("nsfwLevel", "eq", "1")],
-                &sort_field,
-                SortDirection::Desc,
-            );
-            if let Some(entry) = cache.get(&key) {
-                assert!(
-                    !entry.needs_rebuild(),
-                    "Entry sort_{i} should NOT be marked for rebuild with 1000ms deadline and minimal work"
-                );
-            }
-        }
-    }
-    #[test]
     fn test_count_based_fallback_when_ms_is_zero() {
-        // With max_maintenance_ms=0, the count-based fallback should kick in.
+        // With max_maintenance_ms=0 and a low budget, the two-phase path returns
+        // over_budget keys; mark_for_rebuild_batch flags them for rebuild.
         let config = UnifiedCacheConfig {
             max_entries: 200,
             max_bytes: 64 * 1024 * 1024,
@@ -4520,10 +4155,7 @@ mod tests {
             SortDirection::Desc,
         );
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20])])]);
-        let sorts = make_sort_index(&[("reactionCount", &[(20, 1500)])]);
-        // 1 affected entry × 1 changed slot = 1 work, but budget is 1
-        // so estimated_work (1) > max_maintenance_work (1) is false... set work=2
+        // 1 affected entry × 2 changed slots = 2 > max_maintenance_work(1) → over budget
         let mut inserts = HashMap::new();
         inserts.insert(
             FilterGroupKey {
@@ -4532,8 +4164,10 @@ mod tests {
             },
             vec![20, 21],
         );
-        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
-        // 1 entry × 2 slots = 2 > max_maintenance_work(1), should mark for rebuild
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(work.is_empty(), "No work items expected when over budget");
+        assert_eq!(over_budget.len(), 1, "1 entry should be returned as over-budget");
+        cache.mark_for_rebuild_batch(&over_budget);
         let entry = cache.get(&key).unwrap();
         assert!(
             entry.needs_rebuild(),
@@ -4637,39 +4271,6 @@ mod tests {
         cache.mark_for_rebuild_batch(&over_budget);
         let entry = cache.get(&key).unwrap();
         assert!(entry.needs_rebuild(), "Entry should be marked for rebuild");
-    }
-    #[test]
-    fn test_two_phase_equivalence_with_single_phase() {
-        // Verify two-phase produces the same result as the original single-phase maintain_filter_changes.
-        let config = UnifiedCacheConfig {
-            max_maintenance_ms: 0, // disable time-based to ensure deterministic
-            ..make_config()
-        };
-        let slots: Vec<u32> = (0..5).collect();
-        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
-        // Setup: slot 10 matches filter, sort value 1500 > min_tracked(996) → should add
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 10])])]);
-        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
-        let mut inserts = HashMap::new();
-        inserts.insert(
-            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
-            vec![10],
-        );
-        // Single-phase (original)
-        let mut cache_single = UnifiedCache::new(config.clone());
-        cache_single.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        cache_single.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
-        let single_has_10 = cache_single.get(&key).unwrap().bitmap().contains(10);
-        // Two-phase (new)
-        let mut cache_two = UnifiedCache::new(config);
-        cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
-        let _m = std::sync::atomic::AtomicU64::new(0);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
-        cache_two.apply_maintenance_results(&results);
-        let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
-        assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
-        assert!(two_has_10, "Both should have slot 10");
     }
     #[test]
     fn test_finish_restore_batch_eviction() {
