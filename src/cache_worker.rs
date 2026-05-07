@@ -115,6 +115,11 @@ pub struct CacheWorkerMetrics {
     /// Cache entries skipped and marked for rebuild because their compound
     /// FilterClause tree exceeded `compound_eval_atom_limit` (B9 safety valve).
     pub marked_for_rebuild_compound_too_large_total: AtomicU64,
+    /// Cache entries evicted (removed entirely) because estimated maintenance work
+    /// exceeded `max_maintenance_work`. Eviction is preferred over mark-for-rebuild:
+    /// an evicted entry re-populates on the next `store()`, while a rebuild-flagged
+    /// entry causes every query to pay a cold-miss re-derive until it's rebuilt.
+    pub evicted_on_overrun_total: AtomicU64,
     /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
     /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
     /// Optional — the worker no-ops when unset.
@@ -385,12 +390,11 @@ impl CacheWorker {
             // evaluate without it, then reapply. Unlike the flush-thread
             // inline path, this entire sequence runs off the flush cycle so
             // writers are unblocked regardless of how long we take.
-            let ms = self.config.max_maintenance_ms.load(Ordering::Relaxed);
-            let deadline = if ms > 0 {
-                Some(Instant::now() + Duration::from_millis(ms))
-            } else {
-                None
-            };
+            //
+            // `max_maintenance_ms` is deprecated (no-op). The deadline existed to
+            // protect the flush thread from stalling; the worker has its own thread
+            // so no per-cycle deadline is needed. Work runs to completion in parallel
+            // via rayon, then results are applied under a brief per-shard lock.
 
             // No outer lock — UnifiedCache is interior-mutable. Each method
             // call acquires the per-shard / per-field locks it needs and
@@ -460,9 +464,10 @@ impl CacheWorker {
             let string_misses = std::sync::atomic::AtomicU64::new(0);
             let compound_too_large = std::sync::atomic::AtomicU64::new(0);
             let compound_atom_limit = uc.compound_eval_atom_limit();
-            let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
+            // `None` deadline: no per-cycle time limit (see comment above).
+            let (filter_results, filter_compound_too_large) = if !filter_work.is_empty() {
                 evaluate_filter_work(
-                    &filter_work, &snap.filters, &snap.sorts, deadline, tb_ref,
+                    &filter_work, &snap.filters, &snap.sorts, None, tb_ref,
                     sm_ref, Some(dict_ref), &string_misses,
                     compound_atom_limit, &compound_too_large,
                 )
@@ -470,12 +475,12 @@ impl CacheWorker {
                 (Vec::new(), Vec::new())
             };
 
-            let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
+            let (sort_results, sort_compound_too_large) = if !sort_work.is_empty() {
                 evaluate_sort_work(
                     &sort_work,
                     &snap.filters,
                     &snap.sorts,
-                    deadline,
+                    None,
                     tb_ref,
                     sm_ref,
                     Some(dict_ref),
@@ -500,31 +505,39 @@ impl CacheWorker {
                 || !sort_results.is_empty()
                 || !filter_over_budget.is_empty()
                 || !sort_over_budget.is_empty()
-                || !filter_timed_out.is_empty()
-                || !sort_timed_out.is_empty()
+                || !filter_compound_too_large.is_empty()
+                || !sort_compound_too_large.is_empty()
             {
                 uc.apply_maintenance_results(&filter_results);
                 uc.apply_maintenance_results(&sort_results);
-                // Attribute the batch-mark calls by reason. `over_budget` keys
-                // come from `collect_*_work` (count-budget bail before eval);
-                // `timed_out` keys come from `evaluate_*_work` hitting the time
-                // deadline.
+                // `over_budget` keys: estimated work (entries × slots) exceeded
+                // `max_maintenance_work` — evict them so the next query re-populates
+                // cleanly rather than paying a per-query rebuild cost indefinitely.
                 let cb = (filter_over_budget.len() + sort_over_budget.len()) as u64;
-                let dl = (filter_timed_out.len() + sort_timed_out.len()) as u64;
                 if cb > 0 {
-                    self.metrics
-                        .marked_for_rebuild_count_budget_total
-                        .fetch_add(cb, Ordering::Relaxed);
+                    let evicted = uc.evict_keys_on_overrun(&filter_over_budget)
+                        + uc.evict_keys_on_overrun(&sort_over_budget);
+                    if evicted > 0 {
+                        self.metrics
+                            .evicted_on_overrun_total
+                            .fetch_add(evicted, Ordering::Relaxed);
+                    }
                 }
-                if dl > 0 {
-                    self.metrics
-                        .marked_for_rebuild_deadline_total
-                        .fetch_add(dl, Ordering::Relaxed);
+                // `compound_too_large` keys: B9 safety valve — pathological compound
+                // clause trees that exceed `compound_eval_atom_limit`. Evict so queries
+                // can still populate a fresh entry; mark-for-rebuild would cause every
+                // query to hit the rebuild path forever. The B9 atom-count check will
+                // skip them again on the next maintenance cycle.
+                let ctl = (filter_compound_too_large.len() + sort_compound_too_large.len()) as u64;
+                if ctl > 0 {
+                    let evicted = uc.evict_keys_on_overrun(&filter_compound_too_large)
+                        + uc.evict_keys_on_overrun(&sort_compound_too_large);
+                    if evicted > 0 {
+                        self.metrics
+                            .evicted_on_overrun_total
+                            .fetch_add(evicted, Ordering::Relaxed);
+                    }
                 }
-                uc.mark_for_rebuild_batch(&filter_over_budget);
-                uc.mark_for_rebuild_batch(&sort_over_budget);
-                uc.mark_for_rebuild_batch(&filter_timed_out);
-                uc.mark_for_rebuild_batch(&sort_timed_out);
                 // Reconcile total_bytes every 30th cycle. The store/evict
                 // paths track total_bytes incrementally; only bulk ops drift
                 // it, so periodic reconcile is enough to keep eviction-budget
@@ -538,8 +551,8 @@ impl CacheWorker {
 
             let over_budget = (filter_over_budget.len()
                 + sort_over_budget.len()
-                + filter_timed_out.len()
-                + sort_timed_out.len()) as u64;
+                + filter_compound_too_large.len()
+                + sort_compound_too_large.len()) as u64;
             if over_budget > 0 {
                 self.metrics
                     .over_budget_total

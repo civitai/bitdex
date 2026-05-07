@@ -419,14 +419,20 @@ pub struct CacheConfig {
     #[serde(default = "default_preload_bounds")]
     pub preload_bounds: bool,
     /// Maximum maintenance work per flush (affected_entries x changed_slots).
-    /// When exceeded, affected entries are marked for rebuild instead of
-    /// per-slot evaluation. Default 500_000.
-    /// Used as fallback when `max_maintenance_ms` is 0.
+    /// When exceeded and non-zero, the async cache worker **evicts** affected
+    /// entries instead of marking for rebuild. Default 0 (unlimited — eviction
+    /// never triggered). Field kept for YAML compatibility; the async worker's
+    /// own-thread design means 0 is correct for production.
+    /// DEPRECATED: prefer leaving at 0. See: perf/cache-maint-pariter.
     #[serde(default = "default_max_maintenance_work")]
     pub max_maintenance_work: usize,
     /// Time budget for cache maintenance per flush cycle in milliseconds.
-    /// When > 0, replaces the count-based `max_maintenance_work` budget.
-    /// 0 = use count-based `max_maintenance_work` instead. Default: 10ms.
+    /// DEPRECATED: this field is a no-op. The deadline existed to protect the
+    /// flush thread; the async cache worker has its own thread and processes
+    /// all work to completion via rayon par_iter. Set to 0 in new configs.
+    /// Existing configmaps with `max_maintenance_ms: 10000` are safe but
+    /// the value has no effect. Field kept for YAML compatibility.
+    /// See: perf/cache-maint-pariter.
     #[serde(default = "default_max_maintenance_ms")]
     pub max_maintenance_ms: u64,
     /// When true, unified-cache live maintenance runs on a dedicated
@@ -481,11 +487,18 @@ fn default_preload_bounds() -> bool {
     true
 }
 fn default_max_maintenance_work() -> usize {
-    0 // 0 = unlimited; the async cache worker has no flush-thread stall risk
+    // DEPRECATED: set to 0 (unlimited). When non-zero, the async cache worker
+    // evicts affected entries instead of marking for rebuild — but 0 is correct
+    // because the worker runs on its own thread and has no flush-thread stall risk.
+    // Field kept for YAML compatibility. See: perf/cache-maint-pariter.
+    0
 }
 fn default_max_maintenance_ms() -> u64 {
-    // 0 = unlimited. The deadline existed to protect the flush thread; the
-    // async cache worker runs on its own thread so no deadline is needed.
+    // DEPRECATED: set to 0 (no-op). The deadline existed to protect the flush
+    // thread from stalling; the async cache worker has its own thread and
+    // processes all work to completion in parallel via rayon. Any prod configmap
+    // that still sets `max_maintenance_ms: 10000` is safe but has no effect.
+    // Field kept for YAML compatibility. See: perf/cache-maint-pariter.
     0
 }
 fn default_compound_eval_atom_limit() -> u32 {

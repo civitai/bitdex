@@ -1713,11 +1713,9 @@ impl ConcurrentEngine {
                             // This is the expensive part (slot_matches_filter, reconstruct_value)
                             // that previously held the Mutex for ~469ms.
                             let t_phase_b = Instant::now();
-                            let deadline = if flush_config.cache.max_maintenance_ms > 0 {
-                                Some(Instant::now() + Duration::from_millis(flush_config.cache.max_maintenance_ms))
-                            } else {
-                                None
-                            };
+                            // `max_maintenance_ms` deadline is deprecated (no-op) — pass None.
+                            // The inline path still parallelises via rayon par_iter inside
+                            // evaluate_filter_work / evaluate_sort_work.
                             // Load the time bucket manager snapshot once for this
                             // phase-B cycle. The flush thread already called
                             // insert_slot/remove_slot on every mutated slot before
@@ -1736,18 +1734,18 @@ impl ConcurrentEngine {
                             let flush_string_misses = std::sync::atomic::AtomicU64::new(0);
                             let flush_compound_too_large = std::sync::atomic::AtomicU64::new(0);
                             let compound_atom_limit = flush_unified_cache.compound_eval_atom_limit();
-                            let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
+                            let (filter_results, filter_compound_too_large) = if !filter_work.is_empty() {
                                 evaluate_filter_work(
-                                    &filter_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    &filter_work, &staging.filters, &staging.sorts, None, tb_ref,
                                     sm_ref, Some(dict_ref), &flush_string_misses,
                                     compound_atom_limit, &flush_compound_too_large,
                                 )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
-                            let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
+                            let (sort_results, sort_compound_too_large) = if !sort_work.is_empty() {
                                 evaluate_sort_work(
-                                    &sort_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    &sort_work, &staging.filters, &staging.sorts, None, tb_ref,
                                     sm_ref, Some(dict_ref), &flush_string_misses,
                                     compound_atom_limit, &flush_compound_too_large,
                                 )
@@ -1769,21 +1767,28 @@ impl ConcurrentEngine {
                             let phase_b_ns = t_phase_b.elapsed().as_nanos() as u64;
                             let ct_filter_results = filter_results.len();
                             let ct_sort_results = sort_results.len();
-                            let ct_filter_timed_out = filter_timed_out.len();
-                            let ct_sort_timed_out = sort_timed_out.len();
+                            let ct_filter_compound_too_large = filter_compound_too_large.len();
+                            let ct_sort_compound_too_large = sort_compound_too_large.len();
                             // Phase C: Brief lock — apply results
                             let t_phase_c = Instant::now();
                             if !filter_results.is_empty() || !sort_results.is_empty()
                                 || !filter_over_budget.is_empty() || !sort_over_budget.is_empty()
-                                || !filter_timed_out.is_empty() || !sort_timed_out.is_empty()
+                                || !filter_compound_too_large.is_empty() || !sort_compound_too_large.is_empty()
                             {
                                 let uc = &flush_unified_cache;
                                 uc.apply_maintenance_results(&filter_results);
                                 uc.apply_maintenance_results(&sort_results);
-                                uc.mark_for_rebuild_batch(&filter_over_budget);
-                                uc.mark_for_rebuild_batch(&sort_over_budget);
-                                uc.mark_for_rebuild_batch(&filter_timed_out);
-                                uc.mark_for_rebuild_batch(&sort_timed_out);
+                                // Evict on overrun rather than mark-for-rebuild: lets the next
+                                // query re-populate a clean entry instead of paying per-query cost.
+                                let evicted = uc.evict_keys_on_overrun(&filter_over_budget)
+                                    + uc.evict_keys_on_overrun(&sort_over_budget)
+                                    + uc.evict_keys_on_overrun(&filter_compound_too_large)
+                                    + uc.evict_keys_on_overrun(&sort_compound_too_large);
+                                if evicted > 0 {
+                                    flush_cache_worker_metrics
+                                        .evicted_on_overrun_total
+                                        .fetch_add(evicted, Ordering::Relaxed);
+                                }
                                 uc.reconcile_bytes();
                             }
                             let phase_c_ns = t_phase_c.elapsed().as_nanos() as u64;
@@ -1798,15 +1803,15 @@ impl ConcurrentEngine {
                                     target: "cache-trace",
                                     "cache maintenance slow: phase_a={:.2}ms phase_b={:.2}ms phase_c={:.2}ms  \
                                      uc_entries={} alive_removes={} \
-                                     filter[work={} over_budget={} results={} timed_out={}] \
-                                     sort[work={} over_budget={} results={} timed_out={}]",
+                                     filter[work={} over_budget={} results={} compound_too_large={}] \
+                                     sort[work={} over_budget={} results={} compound_too_large={}]",
                                     phase_a_ns as f64 / 1_000_000.0,
                                     phase_b_ns as f64 / 1_000_000.0,
                                     phase_c_ns as f64 / 1_000_000.0,
                                     ct_uc_entries,
                                     ct_alive_removes,
-                                    ct_filter_work_items, ct_filter_over_budget, ct_filter_results, ct_filter_timed_out,
-                                    ct_sort_work_items, ct_sort_over_budget, ct_sort_results, ct_sort_timed_out,
+                                    ct_filter_work_items, ct_filter_over_budget, ct_filter_results, ct_filter_compound_too_large,
+                                    ct_sort_work_items, ct_sort_over_budget, ct_sort_results, ct_sort_compound_too_large,
                                 );
                             }
                             } // end else (inline cache maintenance path)

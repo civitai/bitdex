@@ -12,6 +12,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2169,6 +2170,12 @@ impl UnifiedCache {
         let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_changed_slots;
+        // When `max_maintenance_work` is set and the estimated work (affected_entries ×
+        // changed_slots) exceeds it, evict the affected entries outright instead of marking
+        // them for rebuild. Eviction is strictly better: a rebuild-flagged entry causes
+        // every subsequent query to re-run the full filter+sort on a cold miss, while an
+        // evicted entry simply re-populates on the next `store()`. Net cost is the same
+        // cold miss either way, but without the persistent `needs_rebuild` state.
         if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
@@ -2255,6 +2262,7 @@ impl UnifiedCache {
         let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
+        // Same overrun fallback as `collect_filter_work`: evict rather than mark-for-rebuild.
         if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
@@ -2320,6 +2328,37 @@ impl UnifiedCache {
                 r.value().mark_for_rebuild();
             }
         }
+    }
+    /// Evict a batch of keys from the cache entirely (overrun fallback).
+    ///
+    /// Called when `collect_filter_work` / `collect_sort_work` estimates that the
+    /// work for a set of entries exceeds `max_maintenance_work`. Instead of marking
+    /// them for rebuild (which leaves stale entries that every query must re-derive),
+    /// we remove them outright so the next `store()` will populate a fresh entry.
+    /// This is cheaper end-to-end: no per-query rebuild cost, just one cold miss.
+    ///
+    /// Returns the number of entries actually removed.
+    pub fn evict_keys_on_overrun(&self, keys: &[UnifiedKey]) -> u64 {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut count = 0u64;
+        for key in keys {
+            if let Some((_, evicted)) = self.entries.remove(key) {
+                let bytes = evicted.memory_bytes();
+                self.total_bytes
+                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                self.meta_id_to_key.remove(&evicted.meta_id);
+                let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+                if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
+                    set.value_mut().remove(key);
+                }
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                if !persistence {
+                    self.meta.write().deregister(evicted.meta_id);
+                }
+                count += 1;
+            }
+        }
+        count
     }
     /// Mark all entries for rebuild when alive bitmap changes. Returns the
     /// number of entries flagged so the caller can attribute the reason.
@@ -2928,13 +2967,17 @@ pub fn evaluate_filter_work(
     work: &[CacheMaintenanceItem],
     filters: &FilterIndex,
     sorts: &SortIndex,
-    deadline: Option<Instant>,
+    // `deadline` is a deprecated no-op parameter kept for call-site compatibility.
+    // The async cache worker runs on its own thread; per-cycle time-bounding
+    // converts maintenance backpressure into per-query rebuild cost (net loss).
+    // Pass `None`. Removal tracked in: perf/cache-maint-pariter.
+    _deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
     string_maps: Option<&crate::executor::StringMaps>,
     dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     string_lookup_misses: &std::sync::atomic::AtomicU64,
     // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
-    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // threshold are skipped and pushed to `compound_too_large` (caller evicts).
     // Pass `0` to disable.
     compound_atom_limit: u32,
     compound_too_large_count: &std::sync::atomic::AtomicU64,
@@ -2946,27 +2989,24 @@ pub fn evaluate_filter_work(
     // ~3 seconds of redundant CPU per flush cycle.
     let reconstructed = precompute_sort_values(work, sorts);
     let bucket_mgr_present = bucket_mgr.is_some();
-    let mut results = Vec::with_capacity(work.len());
-    let mut timed_out = Vec::new();
-    for (i, item) in work.iter().enumerate() {
-        // Check deadline every 64 items
-        if let Some(deadline) = deadline {
-            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                for remaining in &work[i..] {
-                    timed_out.push(remaining.key.clone());
-                }
-                break;
-            }
-        }
+
+    // Each work item is independent — evaluate them in parallel across rayon's
+    // thread pool. Each item produces either a result, a compound-too-large key,
+    // or nothing. Collect into a Vec of tagged outputs then split.
+    enum ItemOutcome {
+        Result(CacheMaintenanceResult),
+        CompoundTooLarge(UnifiedKey),
+    }
+
+    let outcomes: Vec<Option<ItemOutcome>> = work.par_iter().map(|item| {
         // B9 safety valve: bail on pathological compound shapes before entering
         // the per-slot loop. Only active when `original_filter_clauses` is
         // populated (native eval path) and the limit is non-zero.
         if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
             let atoms = count_leaf_atoms(&item.original_filter_clauses);
             if atoms > compound_atom_limit {
-                timed_out.push(item.key.clone());
                 compound_too_large_count.fetch_add(1, Ordering::Relaxed);
-                continue;
+                return Some(ItemOutcome::CompoundTooLarge(item.key.clone()));
             }
         }
         let use_native = !item.original_filter_clauses.is_empty();
@@ -3022,14 +3062,26 @@ pub fn evaluate_filter_work(
             }
         }
         if !adds.is_empty() || !removes.is_empty() {
-            results.push(CacheMaintenanceResult {
+            Some(ItemOutcome::Result(CacheMaintenanceResult {
                 key: item.key.clone(),
                 adds,
                 removes,
-            });
+            }))
+        } else {
+            None
+        }
+    }).collect();
+
+    let mut results = Vec::with_capacity(work.len());
+    let mut compound_too_large = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Some(ItemOutcome::Result(r)) => results.push(r),
+            Some(ItemOutcome::CompoundTooLarge(k)) => compound_too_large.push(k),
+            None => {}
         }
     }
-    (results, timed_out)
+    (results, compound_too_large)
 }
 /// Phase B: Evaluate sort maintenance work items outside the cache lock.
 ///
@@ -3052,13 +3104,15 @@ pub fn evaluate_sort_work(
     work: &[CacheMaintenanceItem],
     filters: &FilterIndex,
     sorts: &SortIndex,
-    deadline: Option<Instant>,
+    // `deadline` is a deprecated no-op parameter kept for call-site compatibility.
+    // See `evaluate_filter_work` for rationale.
+    _deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
     string_maps: Option<&crate::executor::StringMaps>,
     dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     string_lookup_misses: &std::sync::atomic::AtomicU64,
     // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
-    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // threshold are skipped and pushed to `compound_too_large` (caller evicts).
     // Pass `0` to disable.
     compound_atom_limit: u32,
     compound_too_large_count: &std::sync::atomic::AtomicU64,
@@ -3071,17 +3125,16 @@ pub fn evaluate_sort_work(
     let max_per_field = compute_max_per_field(&reconstructed);
     let min_per_field = compute_min_per_field(&reconstructed);
     let bucket_mgr_present = bucket_mgr.is_some();
-    let mut results = Vec::with_capacity(work.len());
-    let mut timed_out = Vec::new();
-    for (i, item) in work.iter().enumerate() {
-        if let Some(deadline) = deadline {
-            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                for remaining in &work[i..] {
-                    timed_out.push(remaining.key.clone());
-                }
-                break;
-            }
-        }
+
+    // Each work item is independent — evaluate them in parallel across rayon's
+    // thread pool. Each item produces either a result, a compound-too-large key,
+    // or nothing.
+    enum ItemOutcome {
+        Result(CacheMaintenanceResult),
+        CompoundTooLarge(UnifiedKey),
+    }
+
+    let outcomes: Vec<Option<ItemOutcome>> = work.par_iter().map(|item| {
         // Fast reject: if no mutated value can possibly cross the bound in
         // the entry's direction, skip the entry entirely. This is the main
         // structural win: O(entries) integer compares instead of
@@ -3103,7 +3156,7 @@ pub fn evaluate_sort_work(
             }
         };
         if !can_possibly_qualify {
-            continue;
+            return None;
         }
         // B9 safety valve: bail on pathological compound shapes before entering
         // the per-slot loop. Checked after the cheap field-range fast-reject so
@@ -3111,9 +3164,8 @@ pub fn evaluate_sort_work(
         if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
             let atoms = count_leaf_atoms(&item.original_filter_clauses);
             if atoms > compound_atom_limit {
-                timed_out.push(item.key.clone());
                 compound_too_large_count.fetch_add(1, Ordering::Relaxed);
-                continue;
+                return Some(ItemOutcome::CompoundTooLarge(item.key.clone()));
             }
         }
         let use_native = !item.original_filter_clauses.is_empty();
@@ -3168,14 +3220,26 @@ pub fn evaluate_sort_work(
             }
         }
         if !adds.is_empty() {
-            results.push(CacheMaintenanceResult {
+            Some(ItemOutcome::Result(CacheMaintenanceResult {
                 key: item.key.clone(),
                 adds,
                 removes: Vec::new(), // Sort maintenance never removes
-            });
+            }))
+        } else {
+            None
+        }
+    }).collect();
+
+    let mut results = Vec::with_capacity(work.len());
+    let mut compound_too_large = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Some(ItemOutcome::Result(r)) => results.push(r),
+            Some(ItemOutcome::CompoundTooLarge(k)) => compound_too_large.push(k),
+            None => {}
         }
     }
-    (results, timed_out)
+    (results, compound_too_large)
 }
 /// Precompute `reconstruct_value` for every unique `(sort_field, slot)` pair
 /// referenced by the work items. Shared by `evaluate_filter_work` and
