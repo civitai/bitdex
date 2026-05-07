@@ -77,6 +77,9 @@ pub struct Metrics {
     pub flush_cache_nanos: IntGaugeVec,
     pub flush_publish_nanos: IntGaugeVec,
     pub flush_timebucket_nanos: IntGaugeVec,
+    pub timebucket_dropped_no_sort_field_total: IntCounterVec,
+    pub timebucket_dropped_capacity_exceeded_total: IntCounterVec,
+    pub timebucket_anomalous_ts_total: IntCounterVec,
     pub flush_compact_nanos: IntGaugeVec,
     pub flush_opslog_nanos: IntGaugeVec,
     pub flush_sort_promote_nanos: IntGaugeVec,
@@ -558,6 +561,30 @@ impl Metrics {
         let flush_timebucket_nanos = IntGaugeVec::new(
             Opts::new("bitdex_flush_timebucket_nanos", "Last flush time bucket maintenance duration in nanoseconds"),
             &["index"],
+        )
+        .unwrap();
+        let timebucket_dropped_no_sort_field_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_timebucket_dropped_no_sort_field_total",
+                "Slot insertions skipped during time-bucket flush maintenance because the sort field was not loaded (lazy-load race). High values indicate cross-pod bucket drift risk.",
+            ),
+            &["index", "field"],
+        )
+        .unwrap();
+        let timebucket_dropped_capacity_exceeded_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_timebucket_dropped_capacity_exceeded_total",
+                "Slots permanently lost from time-bucket maintenance because the deferred-retry queue hit its cap during a prolonged sort-field unload window. Non-zero values indicate bucket bitmap data loss; investigate the unload duration and consider raising the cap or forcing eager load.",
+            ),
+            &["index", "field"],
+        )
+        .unwrap();
+        let timebucket_anomalous_ts_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_timebucket_anomalous_ts_total",
+                "Slot timestamps reconstructed during time-bucket flush that look anomalous. kind=zero (uninitialized), future (clock skew), wrapped (u32 ms-as-secs wraparound suspected).",
+            ),
+            &["index", "field", "kind"],
         )
         .unwrap();
         let flush_compact_nanos = IntGaugeVec::new(
@@ -1220,6 +1247,9 @@ impl Metrics {
         registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
         registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
+        registry.register(Box::new(timebucket_dropped_no_sort_field_total.clone())).unwrap();
+        registry.register(Box::new(timebucket_dropped_capacity_exceeded_total.clone())).unwrap();
+        registry.register(Box::new(timebucket_anomalous_ts_total.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
         registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
         registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
@@ -1369,6 +1399,9 @@ impl Metrics {
             flush_cache_nanos,
             flush_publish_nanos,
             flush_timebucket_nanos,
+            timebucket_dropped_no_sort_field_total,
+            timebucket_dropped_capacity_exceeded_total,
+            timebucket_anomalous_ts_total,
             flush_compact_nanos,
             flush_opslog_nanos,
             flush_sort_promote_nanos,

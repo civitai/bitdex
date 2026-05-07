@@ -20,6 +20,7 @@ fn test_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
@@ -28,6 +29,7 @@ fn test_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
@@ -36,6 +38,7 @@ fn test_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

@@ -30,6 +30,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
@@ -38,6 +39,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "userId".to_string(),
@@ -46,6 +48,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "modelVersionIds".to_string(),
@@ -54,6 +57,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
@@ -62,6 +66,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "hasMeta".to_string(),
@@ -70,6 +75,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "type".to_string(),
@@ -78,6 +84,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![
@@ -137,6 +144,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
@@ -145,6 +153,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
@@ -153,6 +162,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                max_range_scan_values: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {
