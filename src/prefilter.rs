@@ -18,7 +18,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,15 +76,33 @@ impl PrefilterEntry {
 
 pub struct PrefilterRegistry {
     entries: DashMap<String, Arc<PrefilterEntry>>,
-    max_entries: usize,
+    max_entries: AtomicUsize,
 }
 
 impl PrefilterRegistry {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
-            max_entries: MAX_REGISTERED_PREFILTERS,
+            max_entries: AtomicUsize::new(MAX_REGISTERED_PREFILTERS),
         }
+    }
+
+    pub fn new_with_cap(cap: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            max_entries: AtomicUsize::new(cap),
+        }
+    }
+
+    /// Return the current max-entries cap.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries.load(Ordering::Relaxed)
+    }
+
+    /// Update the max-entries cap at runtime. Takes effect on the next
+    /// insert attempt and the next merge-thread eviction pass.
+    pub fn set_max_entries(&self, n: usize) {
+        self.max_entries.store(n, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> usize { self.entries.len() }
@@ -120,8 +138,9 @@ impl PrefilterRegistry {
             return Err(RegistryError::InvalidClauses("clauses reduced to empty after canonicalization".into()));
         }
 
-        if !self.entries.contains_key(&name) && self.entries.len() >= self.max_entries {
-            return Err(RegistryError::RegistryFull(self.max_entries));
+        let cap = self.max_entries();
+        if !self.entries.contains_key(&name) && self.entries.len() >= cap {
+            return Err(RegistryError::RegistryFull(cap));
         }
 
         let card = bitmap.len();
@@ -461,12 +480,49 @@ mod tests {
 
     #[test]
     fn registry_enforces_max() {
-        let mut reg = PrefilterRegistry::new();
-        reg.max_entries = 2;
+        let reg = PrefilterRegistry::new_with_cap(2);
         reg.insert("a".into(), vec![eq("x", 1)], RoaringBitmap::new(), 300, 0).unwrap();
         reg.insert("b".into(), vec![eq("x", 2)], RoaringBitmap::new(), 300, 0).unwrap();
         let err = reg.insert("c".into(), vec![eq("x", 3)], RoaringBitmap::new(), 300, 0);
         assert!(matches!(err, Err(RegistryError::RegistryFull(_))));
+    }
+
+    #[test]
+    fn set_max_entries_lowers_cap_and_blocks_insert() {
+        let reg = PrefilterRegistry::new();
+        reg.insert("a".into(), vec![eq("x", 1)], RoaringBitmap::new(), 300, 0).unwrap();
+        reg.insert("b".into(), vec![eq("x", 2)], RoaringBitmap::new(), 300, 0).unwrap();
+        // Lower cap to current fill level — new names rejected, existing names can still be replaced.
+        reg.set_max_entries(2);
+        assert_eq!(reg.max_entries(), 2);
+        let err = reg.insert("c".into(), vec![eq("x", 3)], RoaringBitmap::new(), 300, 0);
+        assert!(matches!(err, Err(RegistryError::RegistryFull(2))));
+        // Replacing an existing name must still work.
+        reg.insert("a".into(), vec![eq("x", 99)], RoaringBitmap::new(), 300, 0).unwrap();
+    }
+
+    #[test]
+    fn max_entries_zero_rejects_all_inserts() {
+        let reg = PrefilterRegistry::new_with_cap(0);
+        let err = reg.insert("x".into(), vec![eq("a", 1)], RoaringBitmap::new(), 300, 0);
+        assert!(matches!(err, Err(RegistryError::RegistryFull(0))));
+        // Confirm via set_max_entries path too.
+        let reg2 = PrefilterRegistry::new();
+        reg2.set_max_entries(0);
+        let err2 = reg2.insert("y".into(), vec![eq("b", 1)], RoaringBitmap::new(), 300, 0);
+        assert!(matches!(err2, Err(RegistryError::RegistryFull(0))));
+    }
+
+    #[test]
+    fn len_gt_max_entries_is_eviction_signal() {
+        // Verify the invariant the merge thread uses: if we sneak entries in
+        // (e.g. cap was higher at insert time) and then lower the cap, len > max_entries.
+        let reg = PrefilterRegistry::new_with_cap(4);
+        reg.insert("a".into(), vec![eq("x", 1)], RoaringBitmap::new(), 300, 0).unwrap();
+        reg.insert("b".into(), vec![eq("x", 2)], RoaringBitmap::new(), 300, 0).unwrap();
+        reg.insert("c".into(), vec![eq("x", 3)], RoaringBitmap::new(), 300, 0).unwrap();
+        reg.set_max_entries(1);
+        assert!(reg.len() > reg.max_entries());
     }
 
     #[test]
