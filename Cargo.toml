@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "bitdex-v2"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 license = "MIT"
 description = "Purpose-built in-memory bitmap index engine"
@@ -12,10 +12,14 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream", "dep:flate2", "dep:reqwest"]
+# `server` only needs reqwest for plain-HTTP fan-out to peer pods over the
+# bitdex-headless service (no TLS). Activating reqwest's `rustls-tls` here
+# would link `ring`, whose CPU intrinsics SIGILL'd v1.1.6 on talos-48r-b3a.
+# `pg-sync` separately keeps rustls-tls — it talks to upstream HTTPS.
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream", "dep:flate2", "dep:reqwest", "reqwest/json"]
 loadtest = ["ureq"]
 replay = ["ureq"]
-pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
+pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "reqwest/json", "reqwest/rustls-tls", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
 simd = ["roaring/simd"]
 dump-timing = []
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
@@ -80,7 +84,7 @@ ureq = { version = "2", optional = true }
 # PG sync dependencies (optional — only needed for pg-sync binary)
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "chrono"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+reqwest = { version = "0.12", default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
 futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
