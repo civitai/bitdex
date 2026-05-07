@@ -364,8 +364,8 @@ async fn run_boot_sequence(
         bulk_loader::clear_done_markers(stage_dir);
     }
 
-    if let Some(config) = full_sync_config {
-        run_streaming_pipeline(pool, sync_config, bitdex_client, config, stage_dir).await;
+    let dump_pipeline_complete = if let Some(config) = full_sync_config {
+        run_streaming_pipeline(pool, sync_config, bitdex_client, config, stage_dir).await
     } else {
         // V1 fallback: download all then process manually
         bulk_loader::download_all_tables(pool, stage_dir)
@@ -376,7 +376,10 @@ async fn run_boot_sequence(
             });
         eprintln!("No sync config YAML — skipping dump pipeline.");
         eprintln!("CSVs staged at: {}. Use /dumps endpoint manually.", stage_dir.display());
-    }
+        // V1 path doesn't actually run the dumps end-to-end here, so we
+        // can't claim readiness — leave the marker un-written.
+        false
+    };
 
     // Step 10: Seed cursor at pre_dump_cursor
     queries::upsert_cursor(pool, &cursor_name, pre_dump_cursor)
@@ -386,6 +389,27 @@ async fn run_boot_sequence(
             std::process::exit(1);
         });
     eprintln!("Seeded cursor '{cursor_name}' at {pre_dump_cursor}");
+
+    // Write the readiness marker so the bitdex server's /api/ready endpoint
+    // starts returning 200 and the K8s Service begins routing traffic. Done
+    // last in the boot sequence so a partial pipeline (e.g. a transient
+    // get_dumps failure that skips a phase) never trips readiness early.
+    // The marker is durable across bitdex container restarts on the shared
+    // PVC mount.
+    if dump_pipeline_complete {
+        let ready_marker = sync_config.data_dir.join(".ready");
+        if let Err(e) = std::fs::write(&ready_marker, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+            eprintln!("WARNING: Failed to write readiness marker {}: {e}", ready_marker.display());
+        } else {
+            eprintln!("Wrote readiness marker: {}", ready_marker.display());
+        }
+    } else {
+        eprintln!(
+            "WARNING: Dump pipeline did not finish all phases — NOT writing readiness marker. \
+             K8s Service will keep this replica out of rotation. Pod restart will retry the \
+             pipeline."
+        );
+    }
 
     eprintln!("=== Boot sequence complete — transitioning to steady-state ===");
 }
@@ -497,13 +521,18 @@ async fn run_dump_pipeline(
 
 /// Streaming pipeline: download + process each phase immediately.
 /// Prefetches the next phase's CSVs while the current dump is processing.
+/// Returns `true` only when every dump phase reached the Complete status.
+/// A `false` return MUST gate the readiness marker write — see
+/// `run_boot_sequence`. Without this, a transient poll failure that
+/// silently skipped a phase used to leave the replica half-loaded but
+/// reporting Ready (caught in prod 2026-05-07 on bitdex-1).
 async fn run_streaming_pipeline(
     pool: &sqlx::PgPool,
     sync_config: &PgSyncConfig,
     bitdex_client: &BitdexClient,
     config: &FullSyncConfig,
     stage_dir: &Path,
-) {
+) -> bool {
     let total = config.dump_phases.len();
     let start = std::time::Instant::now();
 
@@ -653,6 +682,7 @@ async fn run_streaming_pipeline(
         "=== Streaming pipeline complete: {completed}/{total} dumps in {:.1}s ===",
         start.elapsed().as_secs_f64(),
     );
+    completed == total
 }
 
 // ---------------------------------------------------------------------------

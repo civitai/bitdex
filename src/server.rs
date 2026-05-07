@@ -1568,6 +1568,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             .route("/api/health", get(handle_health))
+            .route("/api/ready", get(handle_ready))
             .route("/debug/memory", get(handle_debug_memory))
             .route("/debug/heap-dump", axum::routing::post(handle_heap_dump))
             .route("/api/formats", get(handle_list_formats))
@@ -4933,6 +4934,34 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// Readiness probe — returns 200 only after pg-sync has finished its
+/// initial dump+load pipeline and written `<data_dir>/.ready`. Returns
+/// 503 otherwise, which keeps the K8s Service from routing traffic to a
+/// half-loaded replica.
+///
+/// Why a marker file (vs. an HTTP signal): pg-sync runs as a sidecar in
+/// the same pod with a shared PVC mount. A file write is durable across
+/// bitdex container restarts, so a mid-load liveness restart of the
+/// bitdex server can't lose the readiness signal — pg-sync only writes
+/// once per pipeline completion, and the file persists.
+///
+/// Liveness stays on /api/health so kubelet still kills genuinely-stuck
+/// containers; readiness gates traffic.
+async fn handle_ready(State(state): State<SharedState>) -> impl IntoResponse {
+    let marker = state.data_dir.join(".ready");
+    if marker.exists() {
+        (StatusCode::OK, Json(serde_json::json!({"ready": true})))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ready": false,
+                "reason": "dump pipeline pending — pg-sync has not written .ready marker"
+            })),
+        )
+    }
+}
+
 /// Memory budget endpoint — shows where every GB of RSS goes.
 /// Bitmap totals run on a blocking thread (can be slow at 107M records).
 /// Designed for manual debugging, not Prometheus scraping.
@@ -5454,6 +5483,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_rebuild_completed_total
                 .with_label_values(&[name])
                 .set(cwm.rebuild_completed_total.load(Ordering::Relaxed) as i64);
+            m.cache_evicted_on_overrun_total
+                .with_label_values(&[name])
+                .set(cwm.evicted_on_overrun_total.load(Ordering::Relaxed) as i64);
             // Iter 6 — put_batch fast/slow path counters
             let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
             m.docstore_put_batch_fast_path_total

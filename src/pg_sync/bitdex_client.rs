@@ -416,7 +416,22 @@ impl BitdexClient {
                 ));
             }
 
-            let dumps = self.get_dumps().await?;
+            // Tolerate transient HTTP failures during polling (e.g. bitdex
+            // container restarts under liveness pressure mid-load). Without
+            // this, a single connection-reset would bubble out and the
+            // caller's "continuing to next phase" handler would silently
+            // skip the rest of the dump pipeline, leaving the replica
+            // half-loaded but reporting Ready. Retry within the existing
+            // overall timeout — the dump itself keeps running on the
+            // server, so re-polling after a brief outage just resumes.
+            let dumps = match self.get_dumps().await {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("  poll: get_dumps transient failure ({e}) — retrying after {poll_interval_secs}s");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            };
             let dump_map = dumps.get("dumps").and_then(|d| d.as_object());
 
             let mut all_complete = true;
