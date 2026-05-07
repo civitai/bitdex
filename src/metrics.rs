@@ -106,6 +106,11 @@ pub struct Metrics {
     /// Cumulative count of cache rebuilds that completed (entry replaced via
     /// `store()` while the prior entry had `needs_rebuild=true`).
     pub cache_rebuild_completed_total: IntGaugeVec,
+    /// Cumulative count of cache entries removed entirely because their
+    /// estimated maintenance work exceeded `max_maintenance_work` or the
+    /// `compound_too_large` safety valve fired. The new path replaces the
+    /// older mark-for-rebuild-and-let-queries-pay strategy.
+    pub cache_evicted_on_overrun_total: IntGaugeVec,
 
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
@@ -697,6 +702,14 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_evicted_on_overrun_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_evicted_on_overrun_total",
+                "Cumulative count of cache entries evicted because maintenance work exceeded budget or compound_too_large fired (replaces mark-for-rebuild on overrun).",
+            ),
+            &["index"],
+        )
+        .unwrap();
         let docstore_put_batch_fast_path_total = IntGaugeVec::new(
             Opts::new(
                 "bitdex_docstore_put_batch_fast_path_total",
@@ -1225,6 +1238,7 @@ impl Metrics {
         registry.register(Box::new(cache_entries_needs_rebuild.clone())).unwrap();
         registry.register(Box::new(cache_marked_for_rebuild_total.clone())).unwrap();
         registry.register(Box::new(cache_rebuild_completed_total.clone())).unwrap();
+        registry.register(Box::new(cache_evicted_on_overrun_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
@@ -1373,6 +1387,7 @@ impl Metrics {
             cache_entries_needs_rebuild,
             cache_marked_for_rebuild_total,
             cache_rebuild_completed_total,
+            cache_evicted_on_overrun_total,
             docstore_put_batch_fast_path_total,
             docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,
