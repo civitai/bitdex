@@ -532,12 +532,26 @@ impl SortField {
         self.bit_layers.iter().all(|vb| vb.is_loaded())
     }
 
-    /// Load persisted base bitmaps into the sort layers, replacing existing bases.
-    /// Each layer becomes a clean VersionedBitmap (no diff).
+    /// Load persisted base bitmaps into the sort layers, replacing the base
+    /// while preserving any diff entries that accumulated while the layer was
+    /// unloaded. Marks each layer as loaded.
+    ///
+    /// Diff preservation is the critical invariant here. When a sort field is
+    /// unloaded (`save_and_unload` or `unload_from`), incoming ops continue to
+    /// land in the diff layer of the unloaded VersionedBitmap so they don't
+    /// disappear during the unload window. Lazy load reads the on-disk base
+    /// and must merge it with those queued diffs, not replace them. The
+    /// previous implementation built a fresh `VersionedBitmap::new(bm)` with
+    /// an empty diff, silently dropping every op that arrived between unload
+    /// and reload — leaving a sort field whose reconstructed values lagged
+    /// the actual write history by however many ops were queued. The longer
+    /// the unload window, the more drift a pod accumulated; this is the
+    /// dominant cause of the cross-pod bucket-count divergence observed at
+    /// the same WAL cursor in production.
     pub fn load_layers(&mut self, layers: Vec<RoaringBitmap>) {
         for (i, bm) in layers.into_iter().enumerate() {
             if i < self.bit_layers.len() {
-                self.bit_layers[i] = VersionedBitmap::new(bm);
+                self.bit_layers[i].replace_base_preserve_diff(bm);
             }
         }
     }
@@ -701,6 +715,74 @@ mod tests {
             eager_load: false,
             computed: None,
         }
+    }
+
+    /// REGRESSION: `load_layers` previously replaced each VersionedBitmap with
+    /// a fresh `VersionedBitmap::new(bm)` whose diff was empty, silently
+    /// dropping any ops that landed in the diff while the field was unloaded.
+    ///
+    /// Production effect: between save_and_unload and the first query (which
+    /// triggers lazy load), the WAL reader keeps applying sort_set/sort_clear
+    /// ops to the unloaded VersionedBitmap's diff. On lazy load, those diffs
+    /// vanished — the reload returned the on-disk snapshot, no more, no less.
+    /// Every restart erased ops written since the last save. With longer
+    /// unload windows or higher op rates, drift accumulated; in HA two pods
+    /// diverged by ~70K slots at the same WAL cursor because they hit the
+    /// load path with different amounts of queued diff.
+    #[test]
+    fn test_load_layers_preserves_diffs_accumulated_while_unloaded() {
+        let mut sf = SortField::new(make_config("sortAt"));
+        // Step 1: write an initial value (1234), save the fused state.
+        sf.insert(7, 1234);
+        sf.merge_all();
+        let saved_layers: Vec<RoaringBitmap> = sf
+            .layer_bases_fused()
+            .into_iter()
+            .map(|cow| cow.into_owned())
+            .collect();
+        // Step 2: unload — base goes empty, is_loaded=false. New ops land in
+        // the diff layer.
+        sf.clear_bases_and_unload();
+        for layer in &sf.bit_layers {
+            assert!(!layer.is_loaded(), "layers must be unloaded before reload");
+        }
+        // Apply a delta while unloaded: change slot 7's value to 5678.
+        // sort_set / sort_clear would normally route through write_coalescer,
+        // but the path under test is the per-bit diff merge, so update
+        // VersionedBitmap diffs directly to mirror that contract.
+        let target: u32 = 5678;
+        for bit in 0..sf.num_bits {
+            if (target >> bit) & 1 == 1 {
+                sf.bit_layers[bit].insert(7);
+            } else {
+                sf.bit_layers[bit].remove(7);
+            }
+        }
+        // Step 3: lazy load arrives. The disk-saved layers reflect the OLD
+        // value (1234). load_layers must replace base with disk while
+        // preserving the diff that holds the new value (5678).
+        sf.load_layers(saved_layers);
+        for layer in &sf.bit_layers {
+            assert!(layer.is_loaded(), "layers must be marked loaded after reload");
+        }
+        // Pre-merge: fused_contains must already see the diff applied on top
+        // of the disk-loaded base, so reconstruct returns the new value.
+        assert_eq!(
+            sf.reconstruct_value(7),
+            5678,
+            "fused_contains must reflect both the loaded base AND the preserved \
+             diff. If this returns 1234, load_layers wiped the diff and we \
+             regressed to the silent-drop behavior that drove cross-pod drift."
+        );
+        // Merge the preserved diff into the loaded base — final state must
+        // still equal the new value with no leakage from the old.
+        sf.merge_all();
+        assert_eq!(
+            sf.reconstruct_value(7),
+            5678,
+            "after merge, the slot's reconstructed value must equal the latest \
+             write. If higher than 5678, prior bits leaked through."
+        );
     }
 
     #[test]
