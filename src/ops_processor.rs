@@ -1068,25 +1068,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
             for source_field in &changed_sources {
                 if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Clear old computed value (using old source values, falling back to stored).
-                        // Do NOT fall through to sort_values — it has the NEW values, which would
-                        // make old_computed = new_computed and corrupt the bitmap clear.
-                        let old_values: Vec<u32> = dep.source_fields.iter()
-                            .map(|sf| old_sort_values.get(sf.as_str())
-                                .or_else(|| stored_sort_values.get(sf.as_str()))
-                                .copied()
-                                .unwrap_or(0))
-                            .collect();
-                        let old_computed = match dep.op {
-                            crate::config::ComputedOp::Greatest => *old_values.iter().max().unwrap_or(&0),
-                            crate::config::ComputedOp::Least => *old_values.iter().min().unwrap_or(&0),
-                        };
-                        for bit in 0..dep.target_bits {
-                            if (old_computed >> bit) & 1 == 1 {
-                                sink.sort_clear(dep.target_arc.clone(), bit, slot);
-                            }
-                        }
-                        // Set new computed value (using new source values, falling back to stored).
+                        // Compute the new value (using new source values, falling back to stored).
                         // Do NOT fall through to old_sort_values — for unchanged fields, the
                         // stored value IS the current (and thus new) value.
                         let new_values: Vec<u32> = dep.source_fields.iter()
@@ -1099,19 +1081,33 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             crate::config::ComputedOp::Greatest => *new_values.iter().max().unwrap_or(&0),
                             crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
                         };
-                        // Per-op diagnostic at trace level — was eprintln, ~100µs/op
-                        // stderr allocation + flush dominated the inner loop under
-                        // computed-sort bursts. Matches the conversion pattern at
-                        // :644 and :825 per `docs/_in/core-path-review-2026-04-25.md`
-                        // drift-hygiene-audit.
                         tracing::trace!(
-                            "computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
-                            dep.target, slot, old_values, old_computed, new_values, new_computed,
+                            "computed sort recomp: target={} slot={} new_vals={:?}→{} stored={:?}",
+                            dep.target, slot, new_values, new_computed,
                             stored_sort_values.keys().collect::<Vec<_>>(),
                         );
+                        // Full overwrite: write set OR clear for EVERY bit based on the
+                        // new computed value. Independent of any prior bitmap state.
+                        //
+                        // Earlier this path used old_computed (derived from old_sort_values
+                        // + stored_sort_values fallback) to decide which bits to clear, which
+                        // depended on a value that the bitmap may not actually carry —
+                        // either because old_sort_values fell back to 0 on a lookup miss,
+                        // or because the bitmap was already poisoned by an earlier write
+                        // that didn't fully overwrite. Bits that should have been cleared
+                        // were silently left set, and the next sort_set call OR'd new bits
+                        // on top, accumulating into a bitwise-superset corruption (slots
+                        // returning sortAt timestamps multi-year shifted from the doc).
+                        //
+                        // Symmetric set/clear matches process_set_op's semantics for direct
+                        // sort fields (see :1180) — every bit gets a definitive write so
+                        // bitmap state always equals new_computed exactly, regardless of
+                        // history.
                         for bit in 0..dep.target_bits {
                             if (new_computed >> bit) & 1 == 1 {
                                 sink.sort_set(dep.target_arc.clone(), bit, slot);
+                            } else {
+                                sink.sort_clear(dep.target_arc.clone(), bit, slot);
                             }
                         }
                         // Write computed sort value to docstore so future reads
@@ -2132,6 +2128,148 @@ mod tests {
         assert!(!published_at_writes.is_empty(), "source sort field writes must still happen");
     }
 
+    /// Reduce a sequence of (bit, set|clear) ops into the final bitmap value.
+    /// Returns Some(value) if every bit 0..bits got at least one definitive
+    /// write (set or clear). Returns None for any bit where no op was emitted
+    /// — that means the recompute path is leaving prior bitmap state untouched
+    /// for that bit position, which is exactly the corruption vector this
+    /// regression targets.
+    fn reconstruct_from_sink_ops(
+        sink: &RecordingSink,
+        target_field: &str,
+        slot: u32,
+        bits: usize,
+    ) -> Option<u32> {
+        // Walk the recorded ops in order and track each bit's final state.
+        let mut state: Vec<Option<bool>> = vec![None; bits];
+        let mut events: Vec<(usize, usize, bool)> = Vec::new();
+        for (idx, (f, b, s)) in sink.sort_sets.iter().enumerate() {
+            if f == target_field && *s == slot && *b < bits {
+                events.push((idx, *b, true));
+            }
+        }
+        for (idx, (f, b, s)) in sink.sort_clears.iter().enumerate() {
+            if f == target_field && *s == slot && *b < bits {
+                // Use a separate id space; clears appear after sets in the
+                // recorded order, but we want to honor the actual emission
+                // order. Tag clears with offset to keep them stable; the
+                // current recompute path emits set OR clear per bit per
+                // recompute call, never both, so no real ordering ambiguity
+                // exists in practice.
+                events.push((idx + 1_000_000_000, *b, false));
+            }
+        }
+        events.sort_by_key(|(idx, _, _)| *idx);
+        for (_, bit, set) in events {
+            state[bit] = Some(set);
+        }
+        let mut value: u32 = 0;
+        for (bit, s) in state.iter().enumerate() {
+            match s {
+                Some(true) => value |= 1u32 << bit,
+                Some(false) => {} // bit explicitly cleared
+                None => return None, // no definitive write — corruption vector
+            }
+        }
+        Some(value)
+    }
+
+    /// REGRESSION: computed-sort recompute must write a definitive set OR
+    /// clear for every bit in `target_bits` on every call, so the resulting
+    /// bitmap state equals new_computed exactly — no dependence on prior
+    /// state.
+    ///
+    /// Pre-fix behavior: only emitted sort_clear when old_computed had the
+    /// bit set, only emitted sort_set when new_computed had the bit set.
+    /// Bits where both old_computed and new_computed had 0 received NO op —
+    /// any bits the bitmap previously carried in those positions stayed set,
+    /// and subsequent updates OR'd new bits on top. Production symptom: slot
+    /// 32136507's reconstructed sortAt was multi-year shifted from the doc
+    /// because the same OR'd-superset accumulated over many trigger-driven
+    /// recomputes.
+    #[test]
+    fn test_computed_sort_recompute_full_overwrite_all_bits() {
+        let mut config = Config::default();
+        config.filter_fields = Vec::new();
+        config.sort_fields = vec![
+            SortFieldConfig {
+                name: "publishedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "existedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "sortAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: Some(crate::config::ComputedField {
+                    op: crate::config::ComputedOp::Greatest,
+                    source_fields: vec!["existedAt".into(), "publishedAt".into()],
+                }),
+            },
+        ];
+        let meta = FieldMeta::from_config(&config);
+        // Mirrors the prod symptom: a slot lives a long time, sees many
+        // publishedAt updates, and the bitmap accumulates if recompute ever
+        // skipped a bit. We cycle through values whose bit patterns differ
+        // significantly so any stale bits would be visible.
+        let test_values: &[(u32, u32)] = &[
+            (0x66F6_E6E3, 0x69F0_2766), // close to slot 32136507's source values
+            (0xFFFF_0000, 0x0000_FFFF), // disjoint halves
+            (0x0F0F_0F0F, 0xF0F0_F0F0), // alternating nibbles
+            (0xFFFF_FFFF, 0x0000_0000), // all-set then all-zero (max worst case)
+            (0x1234_5678, 0x8765_4321), // arbitrary
+            (0x0000_0001, 0x0000_0002), // tiny values — most bits MUST be cleared
+        ];
+        let mut sink = RecordingSink::new();
+        // First op creates the slot; subsequent ops are pure recomputes.
+        for (i, (a, b)) in test_values.iter().enumerate() {
+            let prev_a = if i == 0 { 0u32 } else { test_values[i - 1].0 };
+            let prev_b = if i == 0 { 0u32 } else { test_values[i - 1].1 };
+            let mut batch = vec![EntityOps {
+                entity_id: 7,
+                creates_slot: i == 0,
+                ops: vec![
+                    Op::Remove { field: "existedAt".into(), value: json!(prev_a as i64) },
+                    Op::Set { field: "existedAt".into(), value: json!(*a as i64) },
+                    Op::Remove { field: "publishedAt".into(), value: json!(prev_b as i64) },
+                    Op::Set { field: "publishedAt".into(), value: json!(*b as i64) },
+                ],
+            }];
+            let prev_sets = sink.sort_sets.len();
+            let prev_clears = sink.sort_clears.len();
+            let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+            assert_eq!(applied, 1);
+            assert_eq!(errors, 0);
+            // Carve out the ops emitted by THIS recompute alone.
+            let mut cycle_sink = RecordingSink::new();
+            cycle_sink.sort_sets = sink.sort_sets[prev_sets..].to_vec();
+            cycle_sink.sort_clears = sink.sort_clears[prev_clears..].to_vec();
+            // Every bit must have a definitive write — set or clear, never absent.
+            let reconstructed = reconstruct_from_sink_ops(&cycle_sink, "sortAt", 7, 32);
+            let expected = (*a).max(*b);
+            assert_eq!(
+                reconstructed,
+                Some(expected),
+                "computed sort recompute iter {}: every bit must be definitively written. \
+                 a=0x{:08x} b=0x{:08x} expected=0x{:08x} reconstructed={:?}",
+                i, a, b, expected, reconstructed.map(|v| format!("0x{:08x}", v)),
+            );
+        }
+    }
+
     /// Companion to the LCS-set test: removing a previously-inserted LCS
     /// value must resolve through the dictionary too. Unknown strings are
     /// no-ops on the remove path (no key was ever assigned, nothing to clear).
@@ -2669,33 +2807,35 @@ mod tests {
         let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
-        // sortAt should have sort_clears (old computed = max(500,1000) = 1000)
-        // and sort_sets (new computed = max(500,2000) = 2000)
+        // sortAt should have a definitive write (set OR clear) for EVERY bit
+        // based on new_computed = max(500, 2000) = 2000. The recompute path no
+        // longer relies on old_computed for clearing — full overwrite ensures
+        // the bitmap state equals new_computed exactly regardless of history.
         let sort_at_clears: Vec<_> = sink.sort_clears.iter()
             .filter(|(f, _, _)| f == "sortAt")
             .collect();
         let sort_at_sets: Vec<_> = sink.sort_sets.iter()
             .filter(|(f, _, _)| f == "sortAt")
             .collect();
-        assert!(!sort_at_clears.is_empty(), "should clear old sortAt bits");
-        assert!(!sort_at_sets.is_empty(), "should set new sortAt bits");
-        // Verify old value 1000 bits were cleared
-        let old_val: u32 = 1000;
-        for bit in 0..32 {
-            if (old_val >> bit) & 1 == 1 {
-                assert!(
-                    sort_at_clears.iter().any(|(_, b, s)| *b == bit && *s == 10),
-                    "should clear bit {bit} of old sortAt value {old_val}"
-                );
-            }
-        }
-        // Verify new value 2000 bits were set
         let new_val: u32 = 2000;
         for bit in 0..32 {
             if (new_val >> bit) & 1 == 1 {
                 assert!(
                     sort_at_sets.iter().any(|(_, b, s)| *b == bit && *s == 10),
                     "should set bit {bit} of new sortAt value {new_val}"
+                );
+                assert!(
+                    !sort_at_clears.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "must NOT clear bit {bit} of new sortAt value {new_val}"
+                );
+            } else {
+                assert!(
+                    sort_at_clears.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "should clear bit {bit} (zero in new sortAt value {new_val})"
+                );
+                assert!(
+                    !sort_at_sets.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "must NOT set bit {bit} (zero in new sortAt value {new_val})"
                 );
             }
         }
