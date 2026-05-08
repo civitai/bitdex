@@ -350,6 +350,20 @@ impl VersionedBitmap {
     pub fn swap_diff(&mut self, new_diff: Arc<BitmapDiff>) {
         self.diff = new_diff;
     }
+
+    /// Replace the base bitmap with the one read from disk, mark loaded, and
+    /// preserve any diff entries that accumulated while the bitmap was
+    /// unloaded. Used by sort field lazy-load: ops can land in the diff
+    /// between save_and_unload and reload, and the reload must keep them so
+    /// fused_contains reflects all writes since save.
+    ///
+    /// Distinct from `load_base` which OR's into the existing base — the
+    /// caller wants the disk state to BECOME the base, not merge with it.
+    pub fn replace_base_preserve_diff(&mut self, bitmap: RoaringBitmap) {
+        self.base = Arc::new(bitmap);
+        self.is_loaded = true;
+        // diff is intentionally preserved.
+    }
 }
 
 #[cfg(test)]
