@@ -38,27 +38,30 @@ async fn restart_handler(
     let reason = body
         .and_then(|b| b.0.reason)
         .unwrap_or_else(|| "unspecified".to_string());
+    // The bitdex_cursors row is keyed by `pg-sync-{replica_id}` (see
+    // src/bin/pg_sync.rs:192 and ops_poller.rs:189). Don't delete by raw
+    // replica_id — that targets a row that never existed.
+    let cursor_key = format!("pg-sync-{}", state.replica_id);
     eprintln!(
-        "[admin] /internal/restart received (reason={reason}) — deleting cursor row for replica_id={}",
-        state.replica_id
+        "[admin] /internal/restart received (reason={reason}) — deleting cursor row for key={cursor_key}"
     );
 
     // Delete the cursor row for THIS replica only. Other pods' cursors stay.
     let delete_result = sqlx::query(
         r#"DELETE FROM bitdex_cursors WHERE replica_id = $1"#,
     )
-    .bind(state.replica_id.as_ref())
+    .bind(&cursor_key)
     .execute(&state.pool)
     .await;
 
     let rows_affected = match delete_result {
         Ok(r) => {
             let n = r.rows_affected();
-            eprintln!("[admin] cursor delete: {n} row(s) removed");
+            eprintln!("[admin] cursor delete: {n} row(s) removed (key={cursor_key})");
             if n == 0 && reason == "redump" {
                 eprintln!(
-                    "[admin] WARNING: cursor row for replica_id={} not found — possible config drift or already deleted",
-                    state.replica_id
+                    "[admin] WARNING: cursor row for key={cursor_key} not found — \
+                     possible config drift, already deleted, or first-time boot"
                 );
             }
             n
@@ -86,6 +89,7 @@ async fn restart_handler(
         Json(json!({
             "ok": true,
             "replica_id": state.replica_id.as_ref(),
+            "cursor_key": cursor_key,
             "cursor_rows_deleted": rows_affected,
             "reason": reason,
         })),
