@@ -836,6 +836,36 @@ pub fn apply_ops_batch<S: BitmapSink>(
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
+
+    // Same-batch fan-out visibility barrier — runs ONCE per batch, just
+    // before the FIRST QueryOpSet entry is processed (not before the loop
+    // starts — at that point nothing's in CoalescerSink yet). Because we
+    // sorted all QueryOpSet entries to the end of the batch above, by the
+    // time we hit the first fan-out, every non-fan-out write (filter
+    // inserts, sort layer writes, doc writes) has already been emitted to
+    // the sink/doc_writer and just needs to be flushed → published →
+    // visible to `engine.execute_query` inside `apply_query_op_set`.
+    //
+    // Previous implementation called the barrier per-fan-out from inside
+    // `apply_query_op_set`. With many fan-outs per batch (e.g. a Post
+    // update fanning to 100+ Images, or a Model update fanning to
+    // thousands), that produced O(N) * 100ms latency on the WAL reader
+    // hot path and could back up the ops poller under sustained load.
+    // Hoisting to one call cuts worst-case to O(1) per batch.
+    //
+    // Timeout: 5s (vs the original 100ms inside apply_query_op_set). The
+    // flush thread normally publishes in well under 50ms; 5s is for
+    // pathological cases like back-pressure during lazy load. On true
+    // timeout we count an error per fan-out we're about to skip and
+    // suppress the fan-outs themselves rather than execute them against
+    // a known-stale snapshot — that's the original Bug B failure mode.
+    // The skipped ops are NOT recovered automatically (WAL cursor still
+    // advances) — operator response is to watch the
+    // `bitdex_fanout_barrier_skips_total` metric and trigger a fresh
+    // dump if it spikes.
+    let mut fanout_barrier_done = false;
+    let mut fanout_barrier_failed = false;
+
     for entry in batch.iter() {
         let entity_id = entry.entity_id;
         if entity_id < 0 || entity_id > u32::MAX as i64 {
@@ -954,7 +984,41 @@ pub fn apply_ops_batch<S: BitmapSink>(
                         continue;
                     }
                 };
-                if let Some(eng) = engine {
+                // First fan-out reached: drain CoalescerSink + DocWriter and
+                // wait for engine to publish a fresh snapshot containing
+                // every preceding non-fan-out write in this batch.
+                if !fanout_barrier_done {
+                    fanout_barrier_done = true;
+                    if let Some(eng) = engine {
+                        if let Some(ref mut dw) = doc_writer {
+                            dw.flush();
+                        }
+                        if let Err(e) = sink.flush() {
+                            tracing::warn!(
+                                "ops processor: sink.flush before fan-out failed: {e}"
+                            );
+                        }
+                        if !eng.force_publish_blocking(Duration::from_secs(5)) {
+                            tracing::error!(
+                                "ops processor: force_publish_blocking timed out \
+                                 after 5s — fan-outs in this batch will be SKIPPED \
+                                 to avoid stale-snapshot fan-out misses. WAL cursor \
+                                 still advances; operator must watch fanout_barrier \
+                                 skip metric."
+                            );
+                            fanout_barrier_failed = true;
+                        }
+                    }
+                }
+                if fanout_barrier_failed {
+                    // Barrier timed out: snapshot the fan-out resolves against
+                    // is known-stale. Skip rather than execute against it —
+                    // that's the Bug B failure mode we just fixed.
+                    tracing::warn!(
+                        "ops processor: queryOpSet '{query_str}' SKIPPED — pre-batch barrier timed out"
+                    );
+                    errors += 1;
+                } else if let Some(eng) = engine {
                     // §3b (bug #16): pass doc_writer so fan-out ops update the
                     // docstore alongside bitmaps. Without this, queryOpSet
                     // (e.g. Post → Image fan-out for publishedAt) updates the
@@ -1373,23 +1437,12 @@ fn apply_query_op_set<S: BitmapSink>(
         cursor: None,
         skip_cache: true,
     };
-    // Same-batch fan-out visibility barrier. The fan-out's `execute_query`
-    // resolves against the ArcSwap-published snapshot. Earlier ops in the
-    // same WAL batch sit in `CoalescerSink::pending` (channel-buffered) and
-    // pending DocWriter buffers — invisible to the snapshot. Without this
-    // flush + force_publish the fan-out's filter evaluation misses any slot
-    // whose filter values were just written upstream in the same batch
-    // (e.g., an Image's postId filter inserted right before a Post fan-out
-    // queries `postId eq P`). Repro: `tests/sortat_fanout_race.rs::t1`.
-    if let Some(ref mut dw) = doc_writer {
-        dw.flush();
-    }
-    let _ = sink.flush();
-    // Block briefly for the flush thread to drain the channel, apply
-    // mutations to staging, and publish. 100ms cap mirrors lazy-load's
-    // back-pressure budget at engine.rs:4711 — on timeout the fan-out
-    // proceeds against the current snapshot (legacy behavior).
-    let _ = engine.force_publish_blocking(Duration::from_millis(100));
+    // Same-batch fan-out visibility barrier is now hoisted to
+    // `apply_ops_batch` and runs ONCE per batch, just before the first
+    // QueryOpSet entry (which is sorted to the end of the batch). That
+    // means by the time we reach this fn, the engine snapshot already
+    // reflects every preceding non-fan-out write in the batch. See
+    // `apply_ops_batch` for rationale + timeout handling.
 
     // Mission #77: bump query_total so the existing query-rate dashboard reflects
     // the WAL-reader's queryOpSet fan-out queries, not just /api/.../query.

@@ -189,7 +189,7 @@ async fn main() {
             });
 
             // Run pollers concurrently (ops + optional metrics)
-            let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
+            let cursor_name = bitdex_v2::pg_sync::pg_sync_cursor_key(&sync_config.replica_id);
             let ops_disabled = sync_config.poll_interval_ms == Some(0);
 
             if ops_disabled {
@@ -338,7 +338,7 @@ async fn run_boot_sequence(
     run_setup(pool, full_sync_config).await;
 
     // Step 3: Capture pre-dump cursor (catches ops that arrive during dump)
-    let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
+    let cursor_name = bitdex_v2::pg_sync::pg_sync_cursor_key(&sync_config.replica_id);
     let pre_dump_cursor = if let Some(val) = cursor_override {
         eprintln!("Using cursor override: {val}");
         val
@@ -710,7 +710,7 @@ async fn run_sync_pg(
     _index_def: &IndexDefinition,
     bitdex_client: &BitdexClient,
 ) {
-    let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
+    let cursor_name = bitdex_v2::pg_sync::pg_sync_cursor_key(&sync_config.replica_id);
 
     eprintln!("Starting ops poller...");
     if let Err(e) = ops_poller::run_ops_poller(
