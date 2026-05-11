@@ -26,7 +26,7 @@
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{
-    ComputedField, ComputedOp, Config, FilterFieldConfig, SortFieldConfig,
+    ComputedField, ComputedOp, Config, DeferredAliveConfig, FilterFieldConfig, SortFieldConfig,
 };
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::ingester::CoalescerSink;
@@ -34,13 +34,47 @@ use bitdex_v2::ops_processor::{apply_ops_batch, DocWriter, FieldMeta};
 use bitdex_v2::pg_sync::ops::{EntityOps, Op};
 use serde_json::json;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const POST_ID: i64 = 999;
 const IMAGE_SLOT: i64 = 1;
 const T_PAST: u32 = 1_700_000_000;       // existedAt
 const T_FUTURE: u32 = 1_778_400_000;     // publishedAt scheduled 36h ahead
 const T_REPUBLISH: u32 = 1_700_100_000;  // republished publishedAt
+
+fn now_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
+
+fn build_config_with_deferred() -> Config {
+    let mut c = build_config();
+    c.deferred_alive = Some(DeferredAliveConfig {
+        source_field: "publishedAt".into(),
+        ms_to_seconds: false,
+    });
+    c
+}
+
+fn wait_for_bitmap_publishedAt(
+    engine: &ConcurrentEngine,
+    slot: u32,
+    expected: u32,
+    timeout: Duration,
+) -> u32 {
+    let deadline = Instant::now() + timeout;
+    let mut last = 0u32;
+    while Instant::now() < deadline {
+        last = read_sort_layer(engine, "publishedAt", slot);
+        if last == expected {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    last
+}
 
 fn build_config() -> Config {
     Config {
@@ -365,5 +399,202 @@ fn t2b_stuck_t_future_in_single_batch() {
     }
     if sort_at != expected_sort {
         panic!("BUG A T2b VARIANT: sortAt={sort_at} expected {expected_sort}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D3 — activate_due bakes stored doc into bitmap via diff_document's
+//      fresh-insert path. That path is SET-ONLY for sort layers (see
+//      src/mutation.rs:222-256) — it does not emit SortClear for 0-bits.
+//      So if the slot already has bitmap state from a prior write (e.g.
+//      an earlier publishedAt fan-out), activate_due OR-accumulates on
+//      top of it instead of overwriting cleanly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d3_pure_activate_due_writes_bitmap_from_deferred_doc() {
+    // Pure case: slot was never written via direct fan-out. Just deferred,
+    // then activate_due fires. Bitmap should end up matching doc.
+    let engine = ConcurrentEngine::new(build_config_with_deferred()).unwrap();
+
+    let t_past = now_secs() - 1000;
+    let t_future = now_secs() + 4; // ~4s out so activate_due can fire during test
+
+    // Step 1: Image insert (alive, postId, existedAt — no publishedAt)
+    let mut b1 = vec![EntityOps {
+        entity_id: IMAGE_SLOT,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(POST_ID) },
+            Op::Set { field: "existedAt".into(), value: json!(t_past as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b1);
+    wait_for_flush(&engine, 1, 5000);
+
+    // Step 2: Post fan-out with publishedAt = T_FUTURE → deferred branch
+    let mut b2 = vec![EntityOps {
+        entity_id: POST_ID,
+        creates_slot: false,
+        ops: vec![Op::QueryOpSet {
+            query: Some(format!("postId eq {POST_ID}")),
+            ops: vec![Op::Set {
+                field: "publishedAt".into(),
+                value: json!(t_future as i64),
+            }],
+        }],
+    }];
+    let _ = drain_batch(&engine, &mut b2);
+    thread::sleep(Duration::from_millis(200));
+
+    // Verify deferred state: bitmap untouched, doc updated
+    let pub_before = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+    let sort_before = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+    eprintln!(
+        "D3-pure pre-activate: bitmap.publishedAt={pub_before} bitmap.sortAt={sort_before} (deferred should leave bitmap=0/existedAt)"
+    );
+    assert_eq!(pub_before, 0, "deferred path must NOT write bitmap.publishedAt");
+    assert_eq!(sort_before, t_past, "bitmap.sortAt should still equal existedAt");
+
+    // Step 3: Wait for activate_due to fire (now passes t_future)
+    let pub_after = wait_for_bitmap_publishedAt(&engine, IMAGE_SLOT as u32, t_future, Duration::from_secs(10));
+    let sort_after = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+
+    eprintln!(
+        "D3-pure post-activate: bitmap.publishedAt={pub_after} bitmap.sortAt={sort_after} (expect publishedAt={t_future}, sortAt={})",
+        t_past.max(t_future)
+    );
+
+    assert_eq!(
+        pub_after, t_future,
+        "activate_due should write bitmap.publishedAt from stored doc"
+    );
+    assert_eq!(
+        sort_after,
+        t_past.max(t_future),
+        "activate_due should write bitmap.sortAt = max(existedAt, publishedAt)"
+    );
+}
+
+#[test]
+fn d3_activate_due_or_accumulates_over_prior_bitmap() {
+    // Bug case: slot was written with publishedAt = T_OLD via a direct
+    // (non-deferred) fan-out. Bitmap has T_OLD bits set. Later, a NEW
+    // fan-out with publishedAt > now takes the deferred branch — doc
+    // updates to T_FUTURE, bitmap untouched (still T_OLD). Time passes;
+    // activate_due fires. diff_document fresh-insert path emits
+    // SortSet for each 1-bit of T_FUTURE but NO SortClear for 0-bits.
+    // Bits set in T_OLD but not in T_FUTURE leak through.
+    //
+    // Pick values where T_OLD has bits that T_FUTURE doesn't, so the
+    // OR-accumulation is observable as bitmap > doc.
+
+    let engine = ConcurrentEngine::new(build_config_with_deferred()).unwrap();
+
+    let t_past_existed = now_secs() - 2000;
+
+    // Pick T_OLD with bits OUTSIDE T_FUTURE so OR-accumulation is visible.
+    // T_OLD must be < now (so the first fan-out is NOT deferred).
+    // T_FUTURE must be > now (so the second fan-out IS deferred).
+    let t_old: u32 = now_secs() - 100;     // recent past
+    let t_future: u32 = now_secs() + 4;     // 4s out
+
+    // Step 1: Image insert
+    let mut b1 = vec![EntityOps {
+        entity_id: IMAGE_SLOT,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(POST_ID) },
+            Op::Set { field: "existedAt".into(), value: json!(t_past_existed as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b1);
+    wait_for_flush(&engine, 1, 5000);
+
+    // Step 2: First fan-out (NORMAL branch, T_OLD < now): writes
+    // bitmap.publishedAt=T_OLD via process_set_op (full overwrite).
+    let mut b2 = vec![EntityOps {
+        entity_id: POST_ID,
+        creates_slot: false,
+        ops: vec![Op::QueryOpSet {
+            query: Some(format!("postId eq {POST_ID}")),
+            ops: vec![Op::Set {
+                field: "publishedAt".into(),
+                value: json!(t_old as i64),
+            }],
+        }],
+    }];
+    let _ = drain_batch(&engine, &mut b2);
+    thread::sleep(Duration::from_millis(200));
+
+    let pub_a = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+    assert_eq!(pub_a, t_old, "first fan-out should set bitmap.publishedAt = T_OLD");
+
+    // Step 3: Second fan-out (DEFERRED branch, T_FUTURE > now): writes
+    // doc.publishedAt=T_FUTURE, schedules deferred_alive. Bitmap UNCHANGED.
+    let mut b3 = vec![EntityOps {
+        entity_id: POST_ID,
+        creates_slot: false,
+        ops: vec![Op::QueryOpSet {
+            query: Some(format!("postId eq {POST_ID}")),
+            ops: vec![Op::Set {
+                field: "publishedAt".into(),
+                value: json!(t_future as i64),
+            }],
+        }],
+    }];
+    let _ = drain_batch(&engine, &mut b3);
+    thread::sleep(Duration::from_millis(200));
+
+    let pub_b = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+    eprintln!("D3-accum after deferred reschedule: bitmap.publishedAt={pub_b} (still expected T_OLD={t_old})");
+    assert_eq!(
+        pub_b, t_old,
+        "deferred fan-out must NOT write bitmap.publishedAt — bitmap stays at T_OLD"
+    );
+
+    // Step 4: Wait for activate_due to fire (now passes t_future).
+    // activate_due calls diff_document fresh-insert; we expect it to
+    // write bitmap.publishedAt=T_FUTURE. With the SET-ONLY bug, bits
+    // unique to T_OLD remain set → bitmap = T_OLD | T_FUTURE > T_FUTURE.
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut final_pub = pub_b;
+    while Instant::now() < deadline {
+        final_pub = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+        if final_pub != t_old {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let final_sort = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+    let or_accum = t_old | t_future;
+    let expected_correct = t_future;
+
+    eprintln!(
+        "D3-accum post-activate: bitmap.publishedAt={final_pub} bitmap.sortAt={final_sort}"
+    );
+    eprintln!(
+        "D3-accum expected if CORRECT: publishedAt={expected_correct} (full overwrite)"
+    );
+    eprintln!(
+        "D3-accum expected if BUGGY: publishedAt={or_accum} = T_OLD({t_old}) | T_FUTURE({t_future}) — OR-accumulation"
+    );
+
+    // Doc has publishedAt = T_FUTURE (from step 3 deferred-branch doc-write).
+    // Bitmap should match doc per the fix; with the bug it exceeds doc.
+    if final_pub == or_accum && or_accum != t_future {
+        panic!(
+            "BUG D3 REPRODUCED: bitmap.publishedAt = {final_pub} (= T_OLD | T_FUTURE), \
+             but doc.publishedAt = T_FUTURE = {t_future}. activate_due's diff_document \
+             fresh-insert path is set-only at src/mutation.rs:222-256 and OR-accumulates \
+             over prior bitmap state. bitmap > doc divergence confirmed."
+        );
+    }
+    if final_pub != t_future {
+        panic!(
+            "BUG D3 VARIANT: bitmap.publishedAt = {final_pub}, expected {t_future} \
+             (full overwrite from current doc). doc=T_FUTURE, bitmap diverges."
+        );
     }
 }

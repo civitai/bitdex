@@ -243,9 +243,25 @@ pub fn diff_document(
             if let Some(sort_val) = sort_val {
                 let arc_name = registry.get(&sort_config.name);
                 let num_bits = sort_config.bits as usize;
+                // Full overwrite: emit set OR clear for every bit. activate_due
+                // replays through this path with `old_doc=None` even when the
+                // slot already has bitmap state from prior writes (e.g. an
+                // earlier non-deferred fan-out, or the Image insert that
+                // seeded existedAt-only sortAt before the Post fan-out
+                // arrived). Without the clear half, 0-bits of `sort_val` leave
+                // any prior 1-bits stuck → bitmap OR-accumulates → bitmap >
+                // doc divergence. Mirror of process_set_op's full-overwrite
+                // pattern at src/ops_processor.rs:1219-1228.
+                // Repro: tests/sortat_fanout_race.rs::d3_*.
                 for bit in 0..num_bits {
                     if (sort_val >> bit) & 1 == 1 {
                         ops.push(MutationOp::SortSet {
+                            field: arc_name.clone(),
+                            bit_layer: bit,
+                            slots: vec![slot],
+                        });
+                    } else {
+                        ops.push(MutationOp::SortClear {
                             field: arc_name.clone(),
                             bit_layer: bit,
                             slots: vec![slot],
