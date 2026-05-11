@@ -6793,6 +6793,26 @@ impl ConcurrentEngine {
     pub fn flush_cycle(&self) -> u64 {
         self.flush_cycle.load(Ordering::Relaxed)
     }
+    /// Block until the flush thread drains any pending mutations from the
+    /// channel and publishes a fresh snapshot. Returns `true` on success,
+    /// `false` if the flush thread is gone or the timeout elapsed.
+    ///
+    /// Used by `apply_query_op_set` so that a fan-out's `execute_query` sees
+    /// in-batch CoalescerSink writes (e.g., a freshly inserted Image's postId
+    /// filter) before resolving the fan-out's match set. Without this barrier
+    /// the published snapshot lags the in-batch state and same-batch fan-outs
+    /// match zero slots — see `tests/sortat_fanout_race.rs`.
+    pub fn force_publish_blocking(&self, timeout: Duration) -> bool {
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        if self
+            .cmd_tx
+            .send(FlushCommand::ForcePublish { done: done_tx })
+            .is_err()
+        {
+            return false;
+        }
+        done_rx.recv_timeout(timeout).is_ok()
+    }
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()

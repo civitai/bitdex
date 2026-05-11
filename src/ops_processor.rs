@@ -806,6 +806,18 @@ pub fn apply_ops_batch<S: BitmapSink>(
             .start_timer()
     });
     dedup_ops(batch);
+    // Push fan-out entries to the end of the batch. `dedup_ops` reassembles
+    // entries from an AHashMap, which iterates in non-deterministic order —
+    // so a fan-out can land BEFORE the entries whose filter writes it
+    // depends on (e.g., a Post fan-out querying `postId eq P` arriving
+    // before the Image entity that sets `postId=P`). Even with the
+    // flush+force_publish barrier inside `apply_query_op_set`, there is
+    // nothing to flush when the fan-out runs first. Sorting fan-outs last
+    // makes the in-batch dependency order well-defined and lets the
+    // barrier do its job. Repro: `tests/sortat_fanout_race.rs::t2b`.
+    batch.sort_by_key(|e| {
+        e.ops.iter().any(|op| matches!(op, Op::QueryOpSet { .. }))
+    });
     // Per-batch diagnostic at trace level (was eprintln, hot-path cost).
     if !batch.is_empty() {
         tracing::trace!(
@@ -1361,6 +1373,24 @@ fn apply_query_op_set<S: BitmapSink>(
         cursor: None,
         skip_cache: true,
     };
+    // Same-batch fan-out visibility barrier. The fan-out's `execute_query`
+    // resolves against the ArcSwap-published snapshot. Earlier ops in the
+    // same WAL batch sit in `CoalescerSink::pending` (channel-buffered) and
+    // pending DocWriter buffers — invisible to the snapshot. Without this
+    // flush + force_publish the fan-out's filter evaluation misses any slot
+    // whose filter values were just written upstream in the same batch
+    // (e.g., an Image's postId filter inserted right before a Post fan-out
+    // queries `postId eq P`). Repro: `tests/sortat_fanout_race.rs::t1`.
+    if let Some(ref mut dw) = doc_writer {
+        dw.flush();
+    }
+    let _ = sink.flush();
+    // Block briefly for the flush thread to drain the channel, apply
+    // mutations to staging, and publish. 100ms cap mirrors lazy-load's
+    // back-pressure budget at engine.rs:4711 — on timeout the fan-out
+    // proceeds against the current snapshot (legacy behavior).
+    let _ = engine.force_publish_blocking(Duration::from_millis(100));
+
     // Mission #77: bump query_total so the existing query-rate dashboard reflects
     // the WAL-reader's queryOpSet fan-out queries, not just /api/.../query.
     #[cfg(feature = "server")]
