@@ -55,6 +55,11 @@ pub struct PgSyncConfig {
     /// Set to None to disable. Default: 9091.
     #[serde(default = "default_progress_port")]
     pub progress_port: Option<u16>,
+    /// Port for the sidecar admin HTTP listener (bound to 127.0.0.1).
+    /// Hosts `POST /internal/restart` used by the server's redump flow.
+    /// Set to None to disable. Default: 9192.
+    #[serde(default = "default_admin_port")]
+    pub admin_port: Option<u16>,
     /// Directory containing pre-fetched CSV files for bulk loading.
     /// If set, the loader reads CSVs from here instead of downloading from PG.
     /// Defaults to `{storage_dir}/load_stage` when not specified.
@@ -99,6 +104,9 @@ fn default_replica_id() -> String {
 }
 fn default_progress_port() -> Option<u16> {
     Some(9091)
+}
+fn default_admin_port() -> Option<u16> {
+    Some(9192)
 }
 
 impl PgSyncConfig {

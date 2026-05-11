@@ -2,6 +2,7 @@
 //!
 //! Config-driven dump pipeline + ops-based steady-state sync.
 
+pub mod admin_server;
 pub mod backfill;
 pub mod bitdex_client;
 pub mod bulk_loader;

@@ -16,6 +16,7 @@ static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
 
 use ahash::AHashSet as HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
@@ -173,6 +174,19 @@ async fn main() {
                 &pool, &sync_config, &index_def, &index_storage_dir,
                 &stage_dir, &bitdex_client, full_sync_config.as_ref(), cursor_override,
             ).await;
+
+            // Admin HTTP listener (POST /internal/restart) — used by the
+            // server's redump flow. Spawned after boot so we never restart
+            // a half-loaded sidecar.
+            let _admin_shutdown = sync_config.admin_port.map(|port| {
+                bitdex_v2::pg_sync::admin_server::spawn_admin_server(
+                    port,
+                    bitdex_v2::pg_sync::admin_server::AdminState {
+                        pool: pool.clone(),
+                        replica_id: Arc::<str>::from(sync_config.replica_id.as_str()),
+                    },
+                )
+            });
 
             // Run pollers concurrently (ops + optional metrics)
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);

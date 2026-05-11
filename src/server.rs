@@ -1538,6 +1538,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/compact", post(handle_compact))
             .route("/api/indexes/{name}/time-buckets/rebuild", post(handle_rebuild_time_buckets))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
+            .route("/api/indexes/{name}/redump", post(handle_redump))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
             .route("/api/indexes/{name}/cache/entry", get(handle_cache_entry_inspect))
@@ -6229,6 +6230,261 @@ async fn handle_clear_dumps(
 #[cfg(not(feature = "pg-sync"))]
 async fn handle_clear_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
     StatusCode::NOT_FOUND
+}
+
+// ---------------------------------------------------------------------------
+// Redump: wipe on-disk state and exit so the sidecar re-dumps from PG.
+//
+// Workflow:
+//   1. Server returns 202 immediately.
+//   2. Server removes the `.ready` marker so k8s readiness probe drops
+//      this pod from the Service. New traffic stops within ~10s.
+//   3. Server sleeps `drain_secs` so in-flight queries finish.
+//   4. Server calls sidecar `/internal/restart?reason=redump` so the
+//      sidecar deletes its row from `bitdex_cursors` and exits.
+//   5. Server wipes on-disk index state (bitmaps, docstore, WAL,
+//      cursors, deferred map, staged CSVs). Configmap-mounted configs
+//      are defensively skipped.
+//   6. Server exits. K8s restarts both containers; the sidecar boot
+//      sequence sees no `.ready`, no DumpRegistry, and re-runs the
+//      full dump pipeline.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RedumpBody {
+    /// Seconds to wait between flipping readiness off and wiping state.
+    /// Default 30s.
+    drain_secs: Option<u64>,
+    /// URL of the sidecar admin listener. Default: env
+    /// `BITDEX_SYNC_ADMIN_URL` or `http://127.0.0.1:9192`.
+    sidecar_admin_url: Option<String>,
+}
+
+#[cfg(feature = "pg-sync")]
+async fn handle_redump(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    body: Option<Json<RedumpBody>>,
+) -> impl IntoResponse {
+    // Validate index exists + matches the loaded one.
+    {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => {}
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not loaded", name)})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let body = body.map(|b| b.0).unwrap_or_default();
+    let drain_secs = body.drain_secs.unwrap_or(30);
+    let sidecar_url = body
+        .sidecar_admin_url
+        .or_else(|| std::env::var("BITDEX_SYNC_ADMIN_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:9192".to_string());
+
+    // Idempotency gate: marker file lives for the lifetime of the redump.
+    let marker_path = state.data_dir.join(".redump_in_progress");
+    if marker_path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "redump already in progress",
+                "marker": marker_path.display().to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    let redump_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+
+    if let Err(e) = std::fs::write(
+        &marker_path,
+        serde_json::json!({
+            "redump_id": &redump_id,
+            "started_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("write marker failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Clear DumpRegistry so a half-written .ready doesn't survive a crash
+    // before the wipe runs. After the wipe this is moot, but it covers the
+    // window between marker-write and wipe.
+    {
+        let mut reg = state.dump_registry.lock();
+        reg.clear();
+        let dumps_path = state.data_dir.join("dumps.json");
+        let _ = reg.save(&dumps_path);
+    }
+
+    // Flip readiness OFF immediately. K8s sees 503 on next probe.
+    let ready_path = state.data_dir.join(".ready");
+    let _ = std::fs::remove_file(&ready_path);
+    eprintln!(
+        "[redump] {redump_id}: readiness flipped off (.ready removed), drain={drain_secs}s, sidecar={sidecar_url}"
+    );
+
+    // Capture data needed by the background task.
+    let data_dir = state.data_dir.clone();
+    let index_name = name.clone();
+    let drain = std::time::Duration::from_secs(drain_secs);
+    let bg_redump_id = redump_id.clone();
+    let bg_sidecar_url = sidecar_url.clone();
+
+    tokio::spawn(async move {
+        let redump_id = bg_redump_id;
+        let sidecar_url = bg_sidecar_url;
+        // Phase 1: drain in-flight queries.
+        eprintln!("[redump] {redump_id}: draining for {drain_secs}s");
+        tokio::time::sleep(drain).await;
+
+        // Phase 2: tell sidecar to delete its cursor row + exit.
+        eprintln!("[redump] {redump_id}: calling sidecar restart at {sidecar_url}");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client");
+        let sidecar_endpoint = format!("{}/internal/restart", sidecar_url.trim_end_matches('/'));
+        match client
+            .post(&sidecar_endpoint)
+            .json(&serde_json::json!({ "reason": "redump" }))
+            .send()
+            .await
+        {
+            Ok(resp) => eprintln!(
+                "[redump] {redump_id}: sidecar restart returned {}",
+                resp.status()
+            ),
+            Err(e) => eprintln!(
+                "[redump] {redump_id}: WARNING sidecar restart call failed: {e} \
+                 — proceeding anyway; sidecar will eventually exit on shared pod \
+                 lifecycle when this process exits"
+            ),
+        }
+
+        // Phase 3: wipe on-disk index state.
+        eprintln!("[redump] {redump_id}: wiping {}", data_dir.display());
+        if let Err(e) = wipe_index_data_for_redump(&data_dir, &index_name) {
+            eprintln!("[redump] {redump_id}: WIPE FAILED: {e}");
+            // Do NOT exit — a half-wiped pod that comes back up would
+            // confuse the sidecar. Leave the marker, leave .ready off,
+            // operator inspects.
+            return;
+        }
+
+        // Phase 4: exit. K8s restarts the container; the sidecar's fresh
+        // boot re-runs the dump pipeline from a clean PVC.
+        eprintln!("[redump] {redump_id}: wipe complete — exiting");
+        std::process::exit(0);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "redump_id": redump_id,
+            "drain_secs": drain_secs,
+            "sidecar_admin_url": sidecar_url,
+            "next": "readiness flipped off; pod will exit after drain + wipe",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_redump(
+    AxumPath(_name): AxumPath<String>,
+    _body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    StatusCode::NOT_FOUND
+}
+
+/// Wipe per-index runtime state under `data_dir` for a clean redump.
+///
+/// Removes all engine-persisted state (bitmaps, docstore, WAL, cursors,
+/// deferred map, staged CSVs, capture snapshots, dump registry, readiness
+/// + in-progress markers). Defensively SKIPS configmap-mounted configs
+/// (`config.yaml`, `ui-config.yaml`) so an empty PVC doesn't break boot
+/// — though in production those files are read-only ConfigMap mounts
+/// anyway.
+///
+/// All paths are bounded under `data_dir` — every entry to delete is
+/// resolved relative to `data_dir` and the helper never recurses
+/// outside it.
+fn wipe_index_data_for_redump(
+    data_dir: &std::path::Path,
+    index_name: &str,
+) -> std::io::Result<()> {
+    let index_root = data_dir.join("indexes").join(index_name);
+
+    // Per-index runtime dirs (engine state).
+    let index_dirs = [
+        "shardstore",
+        "docstore",
+        "bitmaps",   // legacy BitmapFs
+        "cursors",
+        "system",    // deferred_alive.bin lives here
+        "load_stage", // staged CSVs
+    ];
+    for sub in &index_dirs {
+        let p = index_root.join(sub);
+        if p.exists() {
+            std::fs::remove_dir_all(&p)?;
+            eprintln!("[redump] wiped {}", p.display());
+        }
+    }
+
+    // Server-wide runtime dirs.
+    let global_dirs = ["wal", "captures"];
+    for sub in &global_dirs {
+        let p = data_dir.join(sub);
+        if p.exists() {
+            std::fs::remove_dir_all(&p)?;
+            eprintln!("[redump] wiped {}", p.display());
+        }
+    }
+
+    // DumpRegistry persisted JSON.
+    let dumps_path = data_dir.join("dumps.json");
+    if dumps_path.exists() {
+        std::fs::remove_file(&dumps_path)?;
+        eprintln!("[redump] wiped {}", dumps_path.display());
+    }
+
+    // Readiness marker LAST — once removed, k8s won't route traffic.
+    let ready = data_dir.join(".ready");
+    if ready.exists() {
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    // Marker stays until exit — its presence signals "still wiping".
+    // K8s will recreate the container; the new process starts with no
+    // marker (PVC has the marker but boot deletes it after dump completes,
+    // OR we delete it here as the last step so an aborted wipe retries).
+    let marker = data_dir.join(".redump_in_progress");
+    if marker.exists() {
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    Ok(())
 }
 
 /// GET /api/internal/sync-lag — Return latest sync metadata from all sources.
