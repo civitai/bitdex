@@ -598,3 +598,119 @@ fn d3_activate_due_or_accumulates_over_prior_bitmap() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// D4 — Deferred-doc bake-in via recompute (2026-05-12 prod regression)
+//
+// After my Bug A/B fixes shipped + a fresh redump, prod still showed
+// scheduled-future Posts at the top of sortAt-Desc queries. Root cause:
+// the deferred branch of apply_query_op_set writes doc.publishedAt =
+// T_FUTURE so activate_due can replay correctly. Any later op that
+// touches a different sort source field (e.g. an Image re-scan emitting
+// Set existedAt=new) triggers recompute_computed_sorts_for_slot for
+// that slot. publishedAt is not in the current op batch, so recompute
+// falls back to stored doc — reading T_FUTURE — and bakes it into
+// bitmap.sortAt via the full-overwrite path. Doc says future, bitmap
+// says future, slot sorts to the top.
+//
+// Fix: recompute now skips the stored-doc fallback for the configured
+// deferred_alive source field when its stored value > now.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d4_recompute_skips_deferred_stored_publishedAt() {
+    let engine = ConcurrentEngine::new(build_config_with_deferred()).unwrap();
+
+    let t_past_existed = now_secs() - 1000;
+    let t_future: u32 = now_secs() + 86_400 * 5; // 5 days out — well above any "now" jitter
+
+    // Step 1: Image insert (alive, no publishedAt).
+    let mut b1 = vec![EntityOps {
+        entity_id: IMAGE_SLOT,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(POST_ID) },
+            Op::Set { field: "existedAt".into(), value: json!(t_past_existed as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b1);
+    wait_for_flush(&engine, 1, 5000);
+
+    let sort_after_insert = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+    assert_eq!(
+        sort_after_insert, t_past_existed,
+        "post-insert sortAt should equal existedAt (no publishedAt yet)"
+    );
+
+    // Step 2: Post fan-out schedules T_FUTURE → deferred branch writes
+    // doc.publishedAt = T_FUTURE, no bitmap mutation.
+    let mut b2 = vec![EntityOps {
+        entity_id: POST_ID,
+        creates_slot: false,
+        ops: vec![Op::QueryOpSet {
+            query: Some(format!("postId eq {POST_ID}")),
+            ops: vec![Op::Set {
+                field: "publishedAt".into(),
+                value: json!(t_future as i64),
+            }],
+        }],
+    }];
+    let _ = drain_batch(&engine, &mut b2);
+    thread::sleep(Duration::from_millis(200));
+
+    let sort_after_defer = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+    let pub_after_defer = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+    eprintln!(
+        "D4 after defer: bitmap.sortAt={sort_after_defer} bitmap.publishedAt={pub_after_defer} (both should equal existedAt={t_past_existed}/0)"
+    );
+    assert_eq!(sort_after_defer, t_past_existed, "deferred path must not write bitmap.sortAt");
+    assert_eq!(pub_after_defer, 0, "deferred path must not write bitmap.publishedAt");
+
+    // Step 3: Image re-scan — emits Set existedAt=new_existed (sort source
+    // change, NOT publishedAt). Triggers recompute. WITHOUT the fix,
+    // recompute reads stored doc.publishedAt = T_FUTURE → bitmap.sortAt =
+    // T_FUTURE. WITH the fix, recompute skips deferred-stored publishedAt
+    // → bitmap.sortAt = new_existed.
+    let new_existed = t_past_existed + 30;
+    let mut b3 = vec![EntityOps {
+        entity_id: IMAGE_SLOT,
+        creates_slot: false,
+        ops: vec![
+            Op::Remove { field: "existedAt".into(), value: json!(t_past_existed as i64) },
+            Op::Set { field: "existedAt".into(), value: json!(new_existed as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b3);
+    thread::sleep(Duration::from_millis(200));
+
+    let final_sort = read_sort_layer(&engine, "sortAt", IMAGE_SLOT as u32);
+    let final_existed = read_sort_layer(&engine, "existedAt", IMAGE_SLOT as u32);
+    let final_pub = read_sort_layer(&engine, "publishedAt", IMAGE_SLOT as u32);
+
+    eprintln!(
+        "D4 final: bitmap.sortAt={final_sort} existedAt={final_existed} publishedAt={final_pub}"
+    );
+    eprintln!("D4 expected if CORRECT: sortAt={new_existed} (existedAt only, publishedAt skipped because deferred-future)");
+    eprintln!("D4 expected if BUGGY: sortAt={t_future} (T_FUTURE baked in from stored doc)");
+
+    assert_eq!(
+        final_existed, new_existed,
+        "bitmap.existedAt should match the re-scan value"
+    );
+    assert_eq!(
+        final_pub, 0,
+        "bitmap.publishedAt must stay zero — slot still deferred"
+    );
+    if final_sort == t_future {
+        panic!(
+            "BUG D4 REPRODUCED: bitmap.sortAt = {final_sort} = T_FUTURE. \
+             Recompute fell back to stored doc.publishedAt={t_future} > now and \
+             baked it into the bitmap during an unrelated source-field update."
+        );
+    }
+    assert_eq!(
+        final_sort, new_existed,
+        "bitmap.sortAt should equal existedAt only — publishedAt is deferred-future and must NOT contribute to the computed sort"
+    );
+}
+

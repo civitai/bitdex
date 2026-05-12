@@ -1168,6 +1168,34 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
     }
     // Read stored doc to fill in source fields not present in this ops batch.
     // Without this, missing sources default to 0 and break GREATEST/LEAST.
+    //
+    // Deferred-source skip: if the stored value of the configured
+    // `deferred_alive` source field (e.g. `publishedAt`) is in the FUTURE,
+    // the slot is in deferred-alive state — the doc holds the scheduled
+    // future timestamp as the raw PG truth (via the deferred branch of
+    // `apply_query_op_set`), but that value must NOT leak into the
+    // computed-sort bitmap. Otherwise any later op that touches another
+    // source field (e.g. an Image re-scan emitting `Set existedAt=new`)
+    // triggers a recompute whose `max(existedAt, T_FUTURE) = T_FUTURE`
+    // bakes the scheduled value into the sort layer — exactly the prod
+    // symptom from 2026-05-12 (bitmap.sortAt 50+ days ahead of now for
+    // post-redump-inserted slots). Repro:
+    // `tests/sortat_fanout_race.rs::d4_*`.
+    //
+    // Excluding the field from `stored_sort_values` makes the lookup
+    // unwrap_or(0) below, so the computed value derives from the
+    // currently-visible source fields only. `activate_due` doesn't go
+    // through this helper — it calls `diff_document` directly with the
+    // current (now-past-or-equal) publishedAt, so activation still
+    // writes the correct bitmap value at the right moment.
+    let now_secs_for_deferred = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    let deferred_field: Option<(&str, bool)> = meta
+        .deferred_alive_field
+        .as_ref()
+        .map(|(name, ms)| (name.as_str(), *ms));
     let stored_sort_values: HashMap<&str, u32> = if let Some(eng) = engine {
         let mut stored = HashMap::new();
         if let Ok(Some(doc)) = eng.get_document(slot) {
@@ -1186,7 +1214,22 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
                     if let Some(fv) = doc.fields.get(source_field) {
                         if let crate::mutation::FieldValue::Single(ref v) = fv {
                             if let Some(sv) = value_to_sort_u32(v) {
-                                stored.insert(source_field, sv);
+                                // Deferred-alive guard: if this stored field
+                                // is the deferred trigger AND it's in the
+                                // future, omit it from stored_sort_values.
+                                let skip_deferred = deferred_field
+                                    .map(|(name, _ms)| {
+                                        name == source_field && sv > now_secs_for_deferred
+                                    })
+                                    .unwrap_or(false);
+                                if !skip_deferred {
+                                    stored.insert(source_field, sv);
+                                } else {
+                                    tracing::trace!(
+                                        "computed sort recomp: slot={} skipping deferred stored {}={} (now={})",
+                                        slot, source_field, sv, now_secs_for_deferred
+                                    );
+                                }
                             }
                         }
                     }
