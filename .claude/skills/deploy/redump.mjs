@@ -22,7 +22,7 @@
  *   - Touch Flux (no scale-down; rolling redump keeps one pod serving)
  *   - Coordinate cross-pod dump snapshots (handoff Bug B, separate fix)
  */
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 
 const NS = 'bitdex';
 const STS = 'bitdex';
@@ -56,7 +56,7 @@ function heading(m) { console.log(`\n=== ${m} ===`); }
 
 function getAdminToken() {
   const b64 = kubectl(
-    `get secret bitdex-secrets -o jsonpath='{.data.BITDEX_ADMIN_TOKEN}'`,
+    `get secret bitdex-secrets -o jsonpath={.data.BITDEX_ADMIN_TOKEN}`,
   );
   if (!b64) throw new Error('BITDEX_ADMIN_TOKEN secret missing');
   return Buffer.from(b64, 'base64').toString('utf8').trim();
@@ -64,25 +64,30 @@ function getAdminToken() {
 
 function listPods() {
   // ordered by ordinal so redump-0 runs on bitdex-0, redump-1 on bitdex-1
+  // jsonpath has no spaces so cmd.exe (Windows shell) doesn't word-split it
   const raw = kubectl(
-    `get pods -l app=bitdex,statefulset.kubernetes.io/pod-name -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'`,
+    `get pods -l app=bitdex -o jsonpath={.items[*].metadata.name}`,
     { ignoreError: true },
   );
-  const fromLabel = raw.split('\n').filter(Boolean);
+  const fromLabel = raw.split(/\s+/).filter(Boolean);
   if (fromLabel.length) return fromLabel.sort();
-  // fallback: list by sts ownership
-  const all = kubectl(
-    `get pods -o jsonpath='{range .items[?(@.metadata.ownerReferences[0].name=="${STS}")]}{.metadata.name}{\"\\n\"}{end}'`,
-  );
-  return all.split('\n').filter(Boolean).sort();
+  return [];
 }
 
 function podReady(pod) {
-  const cond = kubectl(
-    `get pod ${pod} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'`,
+  // status.conditions is a list; flatten via two-step jq-style jsonpath that
+  // cmd.exe tolerates (no spaces, no nested quotes)
+  const conds = kubectl(
+    `get pod ${pod} -o jsonpath={.status.conditions[*].type}`,
     { ignoreError: true },
   );
-  return cond === 'True';
+  const statuses = kubectl(
+    `get pod ${pod} -o jsonpath={.status.conditions[*].status}`,
+    { ignoreError: true },
+  );
+  const idx = conds.split(/\s+/).indexOf('Ready');
+  if (idx < 0) return false;
+  return statuses.split(/\s+/)[idx] === 'True';
 }
 
 function step1_preflight() {
@@ -99,7 +104,7 @@ function step1_preflight() {
     log(`${p} Ready`);
   }
   const img = kubectl(
-    `get sts ${STS} -o jsonpath='{.spec.template.spec.containers[0].image}'`,
+    `get sts ${STS} -o jsonpath={.spec.template.spec.containers[0].image}`,
   );
   log(`Image: ${img}`);
   return pods;
@@ -109,7 +114,7 @@ async function redumpPod(pod, token) {
   heading(`Redumping ${pod}`);
 
   // port-forward in background
-  const pf = require('child_process').spawn(
+  const pf = spawn(
     'kubectl',
     [
       '--context', K8S_CONTEXT,
