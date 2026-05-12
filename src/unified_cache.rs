@@ -2050,7 +2050,16 @@ impl UnifiedCache {
         (work, Vec::new())
     }
     /// Phase C: Apply computed maintenance results.
+    ///
+    /// Marks each modified entry's shard dirty so the merge thread persists
+    /// the maintained state to BoundStore. Without this, in-memory cache
+    /// updates would be lost on pod restart — meta.bin reloads + lazy-loaded
+    /// bitmap shards would resurrect the pre-maintenance state. Most-visible
+    /// symptom: sort-only updates (e.g. reactionCount) on a cached top-N
+    /// entry stop appearing after a pod cycle, so different replicas serve
+    /// different cached top-N orderings for the same query.
     pub fn apply_maintenance_results(&self, results: &[CacheMaintenanceResult]) {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
         for result in results {
             let Some(mut entry_ref) = self.entries.get_mut(&result.key) else {
                 continue;
@@ -2070,6 +2079,14 @@ impl UnifiedCache {
             }
             if modified {
                 self.record_update();
+                if persistence {
+                    drop(entry_ref);
+                    let shard_key = ShardKey::new(
+                        result.key.sort_field.clone(),
+                        result.key.direction,
+                    );
+                    self.shard_dirty.lock().insert(shard_key);
+                }
             }
         }
     }
@@ -4959,6 +4976,85 @@ mod tests {
         cache.apply_maintenance_results(&results);
         let after = cache.stats().updates;
         assert!(after > before, "updates counter must increment after apply_maintenance_results with non-empty adds");
+    }
+
+    /// Regression: apply_maintenance_results must mark the entry's shard
+    /// dirty so the merge thread persists the maintained state to BoundStore.
+    ///
+    /// Without this, in-memory cache updates from sort-only (and filter)
+    /// flushes never reach disk. On pod restart, meta.bin + lazy-loaded
+    /// bitmap shards resurrect the pre-maintenance state — and replicas
+    /// diverge because their cache entries were last persisted at different
+    /// in-memory states. Caught in prod on v1.1.11 (sort=reactionCount
+    /// top-N divergence between bitdex-0 and bitdex-1 even with skip_cache
+    /// = true confirming bitmap state was identical).
+    #[test]
+    fn test_apply_maintenance_results_marks_shard_dirty_for_persistence() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        // Simulate the merge thread persisting + clearing dirty for that shard.
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "shard should be clean after explicit clear",
+        );
+
+        // Apply a sort-only maintenance result (the steady-state path for
+        // reactionCount changes that produced the prod divergence).
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![(99u32, 500u32)],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+
+        // The shard MUST be marked dirty again so the merge thread picks it
+        // up on its next persistence cycle.
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "apply_maintenance_results must mark the entry's shard dirty so \
+             the merge thread persists the maintained state to BoundStore",
+        );
+    }
+
+    /// Same regression on the no-op path: maintenance result with neither
+    /// adds nor removes must NOT mark the shard dirty (avoids spurious
+    /// writes when the evaluator found nothing to change).
+    #[test]
+    fn test_apply_maintenance_results_no_op_does_not_mark_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "no-op maintenance result must not mark shard dirty",
+        );
     }
 
     // ── B2 tests: native FilterClause evaluator ────────────────────────────
