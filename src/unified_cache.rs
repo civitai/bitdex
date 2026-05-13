@@ -484,8 +484,21 @@ impl UnifiedEntry {
     }
     /// Apply pending bucket diffs: subtract expired slots from the bitmap
     /// and update the bucket_cutoff to current.
-    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) {
+    ///
+    /// Sets `persist_dirty` and invalidates `sorted_keys` whenever the
+    /// bitmap shrinks — without these, the merge thread skips the entry
+    /// (no on-disk update) and the binary-search pagination path can still
+    /// return slots that were just expired. The caller is responsible for
+    /// marking the entry's shard dirty in the cache-level `shard_dirty` set.
+    ///
+    /// Returns `true` iff the bitmap actually shrunk (i.e. the entry's
+    /// cached bitmap intersected with `expired`). Callers should only mark
+    /// the cache-level `shard_dirty` set when this returns true — otherwise
+    /// the merge thread would rewrite an unchanged shard.
+    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) -> bool {
+        let mut shrunk = false;
         if !expired.is_empty() {
+            let old_len = self.bitmap.len();
             let bm = Arc::make_mut(&mut self.bitmap);
             *bm -= expired;
             // Also remove from radix if expanded
@@ -495,8 +508,14 @@ impl UnifiedEntry {
                     r.remove_blind(slot);
                 }
             }
+            if self.bitmap.len() < old_len {
+                self.persist_dirty.store(true, Ordering::Relaxed);
+                self.sorted_keys = None;
+                shrunk = true;
+            }
         }
         self.bucket_cutoff = new_cutoff;
+        shrunk
     }
     pub fn has_more(&self) -> bool {
         self.has_more
@@ -665,6 +684,10 @@ impl UnifiedEntry {
         if new_slots.len() < expected_chunk {
             self.has_more = false;
         }
+        // Mark dirty so the merge thread persists the expanded bitmap.
+        // Cache-level shard_dirty marking is the caller's responsibility,
+        // performed via `UnifiedCache::record_extension(&key)`.
+        self.persist_dirty.store(true, Ordering::Relaxed);
         self.max_capacity
     }
     /// Rebuild the entry from a fresh sort traversal.
@@ -1452,8 +1475,24 @@ impl UnifiedCache {
         self.updates.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache entry expansion from initial to expanded capacity.
-    pub fn record_extension(&self) {
+    ///
+    /// Marks the entry's shard dirty so the merge thread persists the
+    /// expanded bitmap to BoundStore — without this, the expanded entry
+    /// would only live in RAM and a pod restart would resurrect the
+    /// unexpanded 4K-capacity entry from disk, forcing repeated cold-miss
+    /// re-expansion on every restart.
+    pub fn record_extension(&self, key: &UnifiedKey) {
         self.extensions.fetch_add(1, Ordering::Relaxed);
+        if self.persistence_enabled.load(Ordering::Relaxed) {
+            self.shard_dirty.lock().insert(ShardKey::new(
+                key.sort_field.clone(),
+                key.direction,
+            ));
+            // meta.bin tracks per-entry `capacity` / `max_capacity`; expansion
+            // bumps `capacity` to `max_capacity`, so the persisted meta entry
+            // needs to be rewritten too.
+            self.meta_dirty.store(true, Ordering::Relaxed);
+        }
     }
     /// Record a cache wall hit (cursor went past cached entries, triggering expansion/slow path).
     pub fn record_wall_hit(&self) {
@@ -1804,24 +1843,39 @@ impl UnifiedCache {
     ///
     /// Called by the flush thread when a document is deleted. Targeted removal
     /// avoids marking all entries for rebuild, preserving cache effectiveness.
+    /// Tracks touched shards so the merge thread persists the removal — without
+    /// this, deleted slots would resurrect in cached bounds on pod restart.
     pub fn remove_slot_from_all(&self, slot: u32) {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
         for mut r in self.entries.iter_mut() {
+            let key = r.key().clone();
             r.value_mut().remove_slot_blind(slot);
+            if persistence {
+                dirty_shards.insert(ShardKey::new(key.sort_field.clone(), key.direction));
+            }
+        }
+        if !dirty_shards.is_empty() {
+            self.shard_dirty.lock().extend(dirty_shards);
         }
     }
     /// Batch version of `remove_slot_from_all`.
     ///
     /// Used by the async cache worker to remove all deleted slots in one pass
     /// rather than calling `remove_slot_from_all` once per slot. Amortizes the
-    /// outer `entries` iteration across all slots.
+    /// outer `entries` iteration across all slots. Touched shards are
+    /// collected into a single dirty-shard update at the end.
     pub fn remove_slots_from_all_batch(&self, slots: &[u32]) {
         if slots.is_empty() || self.entries.is_empty() {
             return;
         }
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
         // Each iter_mut yields a RefMutMulti — holds the shard's write lock
         // for the duration of the body. Per-shard locks keep concurrent
         // readers on other shards unblocked.
         for mut r in self.entries.iter_mut() {
+            let key = r.key().clone();
             let entry = r.value_mut();
             let bm = Arc::make_mut(&mut entry.bitmap);
             for &slot in slots {
@@ -1835,6 +1889,12 @@ impl UnifiedCache {
                     rx.remove_blind(slot);
                 }
             }
+            if persistence {
+                dirty_shards.insert(ShardKey::new(key.sort_field.clone(), key.direction));
+            }
+        }
+        if !dirty_shards.is_empty() {
+            self.shard_dirty.lock().extend(dirty_shards);
         }
     }
     // ── Two-Phase Maintenance (Lock-Free Evaluation) ────────────────────
@@ -2050,27 +2110,49 @@ impl UnifiedCache {
         (work, Vec::new())
     }
     /// Phase C: Apply computed maintenance results.
+    ///
+    /// Marks each modified entry's shard dirty so the merge thread persists
+    /// the maintained state to BoundStore. Without this, in-memory cache
+    /// updates would be lost on pod restart — meta.bin reloads + lazy-loaded
+    /// bitmap shards would resurrect the pre-maintenance state. Most-visible
+    /// symptom: sort-only updates (e.g. reactionCount) on a cached top-N
+    /// entry stop appearing after a pod cycle, so different replicas serve
+    /// different cached top-N orderings for the same query.
+    ///
+    /// Dirty shards accumulate into a local `HashSet` so the `shard_dirty`
+    /// mutex is locked exactly once for the entire batch — many entries in
+    /// the same `(sort_field, direction)` shard collapse to a single lock
+    /// acquisition + a single dirty bit.
     pub fn apply_maintenance_results(&self, results: &[CacheMaintenanceResult]) {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
         for result in results {
-            let Some(mut entry_ref) = self.entries.get_mut(&result.key) else {
-                continue;
-            };
-            let entry = entry_ref.value_mut();
-            if entry.needs_rebuild() {
-                continue;
-            }
             let mut modified = false;
-            if !result.adds.is_empty() {
-                entry.add_slots_bulk(&result.adds);
-                modified = true;
-            }
-            if !result.removes.is_empty() {
-                entry.remove_slots_bulk(&result.removes);
-                modified = true;
+            if let Some(mut entry_ref) = self.entries.get_mut(&result.key) {
+                let entry = entry_ref.value_mut();
+                if !entry.needs_rebuild() {
+                    if !result.adds.is_empty() {
+                        entry.add_slots_bulk(&result.adds);
+                        modified = true;
+                    }
+                    if !result.removes.is_empty() {
+                        entry.remove_slots_bulk(&result.removes);
+                        modified = true;
+                    }
+                }
             }
             if modified {
                 self.record_update();
+                if persistence {
+                    dirty_shards.insert(ShardKey::new(
+                        result.key.sort_field.clone(),
+                        result.key.direction,
+                    ));
+                }
             }
+        }
+        if !dirty_shards.is_empty() {
+            self.shard_dirty.lock().extend(dirty_shards);
         }
     }
     /// Phase C: Mark entries for rebuild in batch (budget exceeded or deadline hit).
@@ -2194,6 +2276,8 @@ impl UnifiedCache {
         // Reusable misses counter: we don't bump external metrics here since this
         // path is called from the flush thread (no metrics handle available).
         let _misses = std::sync::atomic::AtomicU64::new(0);
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
         for mut r in self.entries.iter_mut() {
             let key = r.key().clone();
             let entry = r.value_mut();
@@ -2206,9 +2290,14 @@ impl UnifiedCache {
             if !has_bucket {
                 continue;
             }
+            let mut modified = false;
             if !dropped_slots.is_empty() {
+                let old_len = entry.bitmap.len();
                 let bm = Arc::make_mut(&mut entry.bitmap);
                 *bm -= dropped_slots;
+                if entry.bitmap.len() < old_len {
+                    modified = true;
+                }
                 if let Some(ref mut radix) = entry.radix {
                     let rx = Arc::make_mut(radix);
                     for slot in dropped_slots.iter() {
@@ -2258,10 +2347,29 @@ impl UnifiedCache {
                         .map(|f| f.reconstruct_value(slot))
                         .unwrap_or(0);
                     if entry.sort_qualifies(sort_value, key.direction) {
+                        let old_len = entry.bitmap.len();
                         entry.add_slot(slot, sort_value);
+                        if entry.bitmap.len() > old_len {
+                            modified = true;
+                        }
                     }
                 }
             }
+            // Bucket drops and the manual `*bm -=` path don't set
+            // entry.persist_dirty or invalidate sorted_keys. Fix both here:
+            // without persist_dirty the merge thread skips the entry; without
+            // sorted_keys=None the binary-search pagination path can still
+            // return slots that were just removed from the bitmap.
+            if modified {
+                entry.persist_dirty.store(true, Ordering::Relaxed);
+                entry.sorted_keys = None;
+                if persistence {
+                    dirty_shards.insert(ShardKey::new(key.sort_field.clone(), key.direction));
+                }
+            }
+        }
+        if !dirty_shards.is_empty() {
+            self.shard_dirty.lock().extend(dirty_shards);
         }
     }
 }
@@ -4959,6 +5067,410 @@ mod tests {
         cache.apply_maintenance_results(&results);
         let after = cache.stats().updates;
         assert!(after > before, "updates counter must increment after apply_maintenance_results with non-empty adds");
+    }
+
+    /// Regression: apply_maintenance_results must mark the entry's shard
+    /// dirty so the merge thread persists the maintained state to BoundStore.
+    ///
+    /// Without this, in-memory cache updates from sort-only (and filter)
+    /// flushes never reach disk. On pod restart, meta.bin + lazy-loaded
+    /// bitmap shards resurrect the pre-maintenance state — and replicas
+    /// diverge because their cache entries were last persisted at different
+    /// in-memory states. Caught in prod on v1.1.11 (sort=reactionCount
+    /// top-N divergence between bitdex-0 and bitdex-1 even with skip_cache
+    /// = true confirming bitmap state was identical).
+    #[test]
+    fn test_apply_maintenance_results_marks_shard_dirty_for_persistence() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        // Simulate the merge thread persisting + clearing dirty for that shard.
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "shard should be clean after explicit clear",
+        );
+
+        // Apply a sort-only maintenance result (the steady-state path for
+        // reactionCount changes that produced the prod divergence).
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![(99u32, 500u32)],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+
+        // The shard MUST be marked dirty again so the merge thread picks it
+        // up on its next persistence cycle.
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "apply_maintenance_results must mark the entry's shard dirty so \
+             the merge thread persists the maintained state to BoundStore",
+        );
+    }
+
+    /// Same regression on the no-op path: maintenance result with neither
+    /// adds nor removes must NOT mark the shard dirty (avoids spurious
+    /// writes when the evaluator found nothing to change).
+    #[test]
+    fn test_apply_maintenance_results_no_op_does_not_mark_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "no-op maintenance result must not mark shard dirty",
+        );
+    }
+
+    /// Removes-only path should also mark the shard dirty.
+    #[test]
+    fn test_apply_maintenance_results_removes_marks_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![],
+            removes: vec![(5u32, 5u32)],
+        }];
+        cache.apply_maintenance_results(&results);
+
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "removes-only maintenance result must mark shard dirty",
+        );
+    }
+
+    /// Multi-entry results that share a `(sort_field, direction)` shard must
+    /// collapse to a single dirty mark — the local HashSet pattern dedupes
+    /// before taking the shard_dirty mutex.
+    #[test]
+    fn test_apply_maintenance_results_collapses_same_shard() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        // Two entries with different filters but same (sort_field, direction).
+        let key_a = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let key_b = make_key(&[("nsfwLevel", "eq", "2")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key_a.clone(), &[0u32, 1, 2], false, 10, |s| s);
+        cache.form_and_store(key_b.clone(), &[3u32, 4, 5], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key_a.sort_field.clone(),
+            key_a.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let results = vec![
+            crate::unified_cache::CacheMaintenanceResult {
+                key: key_a.clone(),
+                adds: vec![(99u32, 500u32)],
+                removes: vec![],
+            },
+            crate::unified_cache::CacheMaintenanceResult {
+                key: key_b.clone(),
+                adds: vec![(98u32, 400u32)],
+                removes: vec![],
+            },
+        ];
+        cache.apply_maintenance_results(&results);
+
+        // Both entries share the same shard, so dirty_shards should contain
+        // exactly one entry for this shard (cardinality test below).
+        let dirty = cache.dirty_shards();
+        assert!(dirty.contains(&shard_key), "shared shard must be dirty");
+        assert_eq!(
+            dirty.iter().filter(|sk| **sk == shard_key).count(),
+            1,
+            "shared shard must appear exactly once in dirty set",
+        );
+    }
+
+    /// Same regression on the bulk delete path: `remove_slots_from_all_batch`
+    /// previously set `entry.persist_dirty=true` but never inserted the
+    /// entry's shard into `shard_dirty`, so deletions could resurrect on
+    /// pod restart when only this code path had touched a shard since the
+    /// last persistence cycle.
+    #[test]
+    fn test_remove_slots_from_all_batch_marks_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[0u32, 1, 2, 3, 4], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        cache.remove_slots_from_all_batch(&[2u32, 3]);
+
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "remove_slots_from_all_batch must mark shard dirty",
+        );
+    }
+
+    /// Same regression on the single-slot delete path.
+    #[test]
+    fn test_remove_slot_from_all_marks_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[0u32, 1, 2, 3], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        cache.remove_slot_from_all(2);
+
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "remove_slot_from_all must mark shard dirty",
+        );
+    }
+
+    /// Persistence disabled: no path should touch `shard_dirty`. Cheap
+    /// invariant that protects test-only / headless modes from spurious
+    /// dirty tracking.
+    #[test]
+    fn test_maintenance_paths_respect_persistence_disabled() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        // persistence NOT enabled
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[0u32, 1, 2], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![(99u32, 500u32)],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+        cache.remove_slot_from_all(1);
+        cache.remove_slots_from_all_batch(&[2u32]);
+
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "persistence disabled paths must not mark shard dirty",
+        );
+    }
+
+    /// `UnifiedEntry::expand` previously didn't set `persist_dirty` and
+    /// `UnifiedCache::record_extension` didn't mark the entry's shard dirty.
+    /// Effect: an entry expanded from 4K → 64K items kept the expansion only
+    /// in RAM; the merge thread skipped the entry and a pod restart
+    /// resurrected the unexpanded 4K bitmap from disk. Cache hit rate
+    /// degraded post-restart, forcing repeated cold-miss re-expansion on
+    /// every pod cycle. Same class of bug as the sort-only-maintenance gap
+    /// caught in prod on v1.1.11.
+    #[test]
+    fn test_expand_marks_persist_dirty_and_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &(0..10).collect::<Vec<u32>>(), false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        cache.clear_meta_dirty();
+        if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().persist_dirty.store(false, Ordering::Relaxed);
+        }
+
+        // Drive an expansion: call expand on the entry then record_extension
+        // (matches the live caller pattern in concurrent_engine.rs).
+        let new_slots: Vec<u32> = (10..200).collect();
+        if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().expand(&new_slots, |s| s);
+        } else {
+            panic!("entry vanished");
+        }
+        cache.record_extension(&key);
+
+        let entry_ref = cache.entries.get(&key).expect("entry present");
+        assert!(
+            entry_ref.value().is_persist_dirty(),
+            "expand must set entry.persist_dirty so merge persists the expanded bitmap",
+        );
+        drop(entry_ref);
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "record_extension must mark the entry's shard dirty",
+        );
+        assert!(
+            cache.is_meta_dirty(),
+            "record_extension must mark meta dirty (capacity changes need meta.bin rewrite)",
+        );
+    }
+
+    /// `record_extension` with persistence disabled must NOT touch
+    /// `shard_dirty` or `meta_dirty`.
+    #[test]
+    fn test_record_extension_respects_persistence_disabled() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        // persistence NOT enabled
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[0u32, 1, 2], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        cache.clear_meta_dirty();
+
+        cache.record_extension(&key);
+
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "record_extension must not touch shard_dirty when persistence is off",
+        );
+        assert!(
+            !cache.is_meta_dirty(),
+            "record_extension must not touch meta_dirty when persistence is off",
+        );
+    }
+
+    /// `maintain_bucket_changes` must mark touched shards dirty when the
+    /// bitmap actually changes. Mirrors the prod-bug repro for the
+    /// time-bucket maintenance path.
+    #[test]
+    fn test_maintain_bucket_changes_marks_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        // Build an entry with a bucket clause so maintain_bucket_changes
+        // recognizes it.
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        cache.form_and_store(key.clone(), &[10u32, 20, 30, 40, 50], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let mut dropped = roaring::RoaringBitmap::new();
+        dropped.insert(20);
+        dropped.insert(40);
+
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        cache.maintain_bucket_changes(
+            "sortAt", "7d",
+            &dropped, &roaring::RoaringBitmap::new(),
+            &filters, &sorts, None, None,
+        );
+
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "maintain_bucket_changes must mark shard dirty when the bitmap changes",
+        );
+    }
+
+    /// `apply_bucket_diff` previously didn't set `persist_dirty` or invalidate
+    /// `sorted_keys` when the bitmap shrunk — the merge thread skipped the
+    /// entry and the binary-search pagination path could still return slots
+    /// that were just expired.
+    #[test]
+    fn test_apply_bucket_diff_sets_persist_dirty_and_invalidates_sorted_keys() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[10u32, 20, 30, 40, 50], false, 10, |s| s);
+
+        // Pre-state: stage a sorted_keys vec so we can prove it gets invalidated.
+        if let Some(mut r) = cache.entries.get_mut(&key) {
+            let entry = r.value_mut();
+            entry.persist_dirty.store(false, Ordering::Relaxed);
+            entry.sorted_keys = Some(Arc::new(vec![10u64, 20, 30, 40, 50]));
+        } else {
+            panic!("entry not present");
+        }
+
+        let mut expired = roaring::RoaringBitmap::new();
+        expired.insert(20);
+        expired.insert(40);
+
+        let shrunk = if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().apply_bucket_diff(&expired, 12345)
+        } else {
+            panic!("entry vanished");
+        };
+        assert!(shrunk, "apply_bucket_diff must return true when bitmap shrinks");
+
+        let entry_ref = cache.entries.get(&key).expect("entry present");
+        let entry = entry_ref.value();
+        assert!(
+            entry.is_persist_dirty(),
+            "apply_bucket_diff must set persist_dirty when bitmap shrinks",
+        );
+        assert!(
+            entry.sorted_keys().is_none(),
+            "apply_bucket_diff must invalidate sorted_keys when bitmap shrinks",
+        );
     }
 
     // ── B2 tests: native FilterClause evaluator ────────────────────────────
