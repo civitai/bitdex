@@ -3579,7 +3579,7 @@ impl ConcurrentEngine {
                                 if let Some(mut entry) = uc.get_mut(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
                                     entry.set_prefetching(false);
-                                    uc.record_extension();
+                                    uc.record_extension(&ukey);
                                     tracing::debug!(
                                         "Prefetch: expanded {} {:?} by {} slots",
                                         ukey.sort_field, ukey.direction, sorted_slots.len(),
@@ -5111,8 +5111,10 @@ impl ConcurrentEngine {
                             && entry.bucket_cutoff() < pending.current_cutoff()
                         {
                             if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
-                                applied_bucket_diff = true;
+                                applied_bucket_diff = entry.apply_bucket_diff(
+                                    pending.merged_expired(),
+                                    pending.current_cutoff(),
+                                );
                             } else {
                                 entry.mark_for_rebuild();
                             }
@@ -5215,7 +5217,7 @@ impl ConcurrentEngine {
                                 let uc = &self.unified_cache;
                                 if let Some(mut entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
-                                    uc.record_extension();
+                                    uc.record_extension(&ukey);
                                 }
                             }
                             self.unified_cache.record_wall_hit();
@@ -5439,8 +5441,10 @@ impl ConcurrentEngine {
                                 && entry.bucket_cutoff() < pending.current_cutoff()
                             {
                                 if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                    entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
-                                    applied_bucket_diff = true;
+                                    applied_bucket_diff = entry.apply_bucket_diff(
+                                        pending.merged_expired(),
+                                        pending.current_cutoff(),
+                                    );
                                 } else {
                                     entry.mark_for_rebuild();
                                 }
@@ -5559,7 +5563,7 @@ impl ConcurrentEngine {
                                 let uc = &self.unified_cache;
                                 if let Some(mut entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
-                                    uc.record_extension();
+                                    uc.record_extension(&ukey);
                                 }
                             }
                             self.unified_cache.record_wall_hit();
@@ -5746,7 +5750,7 @@ impl ConcurrentEngine {
                         let uc = &self.unified_cache;
                         if let Some(mut entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
+                            uc.record_extension(&ukey);
                         }
                     }
                     let uc = &self.unified_cache;
@@ -5962,7 +5966,7 @@ impl ConcurrentEngine {
                         let uc = &self.unified_cache;
                         if let Some(mut entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
+                            uc.record_extension(&ukey);
                         }
                     }
                     true
@@ -6124,7 +6128,7 @@ impl ConcurrentEngine {
                         let uc = &self.unified_cache;
                         if let Some(mut entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
+                            uc.record_extension(&ukey);
                         }
                     }
                     let uc = &self.unified_cache;
@@ -6326,7 +6330,7 @@ impl ConcurrentEngine {
                         let uc = &self.unified_cache;
                         if let Some(mut entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
+                            uc.record_extension(&ukey);
                         }
                     }
                     true

@@ -490,7 +490,13 @@ impl UnifiedEntry {
     /// (no on-disk update) and the binary-search pagination path can still
     /// return slots that were just expired. The caller is responsible for
     /// marking the entry's shard dirty in the cache-level `shard_dirty` set.
-    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) {
+    ///
+    /// Returns `true` iff the bitmap actually shrunk (i.e. the entry's
+    /// cached bitmap intersected with `expired`). Callers should only mark
+    /// the cache-level `shard_dirty` set when this returns true — otherwise
+    /// the merge thread would rewrite an unchanged shard.
+    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) -> bool {
+        let mut shrunk = false;
         if !expired.is_empty() {
             let old_len = self.bitmap.len();
             let bm = Arc::make_mut(&mut self.bitmap);
@@ -505,9 +511,11 @@ impl UnifiedEntry {
             if self.bitmap.len() < old_len {
                 self.persist_dirty.store(true, Ordering::Relaxed);
                 self.sorted_keys = None;
+                shrunk = true;
             }
         }
         self.bucket_cutoff = new_cutoff;
+        shrunk
     }
     pub fn has_more(&self) -> bool {
         self.has_more
@@ -676,6 +684,10 @@ impl UnifiedEntry {
         if new_slots.len() < expected_chunk {
             self.has_more = false;
         }
+        // Mark dirty so the merge thread persists the expanded bitmap.
+        // Cache-level shard_dirty marking is the caller's responsibility,
+        // performed via `UnifiedCache::record_extension(&key)`.
+        self.persist_dirty.store(true, Ordering::Relaxed);
         self.max_capacity
     }
     /// Rebuild the entry from a fresh sort traversal.
@@ -1463,8 +1475,24 @@ impl UnifiedCache {
         self.updates.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache entry expansion from initial to expanded capacity.
-    pub fn record_extension(&self) {
+    ///
+    /// Marks the entry's shard dirty so the merge thread persists the
+    /// expanded bitmap to BoundStore — without this, the expanded entry
+    /// would only live in RAM and a pod restart would resurrect the
+    /// unexpanded 4K-capacity entry from disk, forcing repeated cold-miss
+    /// re-expansion on every restart.
+    pub fn record_extension(&self, key: &UnifiedKey) {
         self.extensions.fetch_add(1, Ordering::Relaxed);
+        if self.persistence_enabled.load(Ordering::Relaxed) {
+            self.shard_dirty.lock().insert(ShardKey::new(
+                key.sort_field.clone(),
+                key.direction,
+            ));
+            // meta.bin tracks per-entry `capacity` / `max_capacity`; expansion
+            // bumps `capacity` to `max_capacity`, so the persisted meta entry
+            // needs to be rewritten too.
+            self.meta_dirty.store(true, Ordering::Relaxed);
+        }
     }
     /// Record a cache wall hit (cursor went past cached entries, triggering expansion/slow path).
     pub fn record_wall_hit(&self) {
@@ -5276,6 +5304,132 @@ mod tests {
         );
     }
 
+    /// `UnifiedEntry::expand` previously didn't set `persist_dirty` and
+    /// `UnifiedCache::record_extension` didn't mark the entry's shard dirty.
+    /// Effect: an entry expanded from 4K → 64K items kept the expansion only
+    /// in RAM; the merge thread skipped the entry and a pod restart
+    /// resurrected the unexpanded 4K bitmap from disk. Cache hit rate
+    /// degraded post-restart, forcing repeated cold-miss re-expansion on
+    /// every pod cycle. Same class of bug as the sort-only-maintenance gap
+    /// caught in prod on v1.1.11.
+    #[test]
+    fn test_expand_marks_persist_dirty_and_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &(0..10).collect::<Vec<u32>>(), false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        cache.clear_meta_dirty();
+        if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().persist_dirty.store(false, Ordering::Relaxed);
+        }
+
+        // Drive an expansion: call expand on the entry then record_extension
+        // (matches the live caller pattern in concurrent_engine.rs).
+        let new_slots: Vec<u32> = (10..200).collect();
+        if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().expand(&new_slots, |s| s);
+        } else {
+            panic!("entry vanished");
+        }
+        cache.record_extension(&key);
+
+        let entry_ref = cache.entries.get(&key).expect("entry present");
+        assert!(
+            entry_ref.value().is_persist_dirty(),
+            "expand must set entry.persist_dirty so merge persists the expanded bitmap",
+        );
+        drop(entry_ref);
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "record_extension must mark the entry's shard dirty",
+        );
+        assert!(
+            cache.is_meta_dirty(),
+            "record_extension must mark meta dirty (capacity changes need meta.bin rewrite)",
+        );
+    }
+
+    /// `record_extension` with persistence disabled must NOT touch
+    /// `shard_dirty` or `meta_dirty`.
+    #[test]
+    fn test_record_extension_respects_persistence_disabled() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        // persistence NOT enabled
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &[0u32, 1, 2], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+        cache.clear_meta_dirty();
+
+        cache.record_extension(&key);
+
+        assert!(
+            !cache.dirty_shards().contains(&shard_key),
+            "record_extension must not touch shard_dirty when persistence is off",
+        );
+        assert!(
+            !cache.is_meta_dirty(),
+            "record_extension must not touch meta_dirty when persistence is off",
+        );
+    }
+
+    /// `maintain_bucket_changes` must mark touched shards dirty when the
+    /// bitmap actually changes. Mirrors the prod-bug repro for the
+    /// time-bucket maintenance path.
+    #[test]
+    fn test_maintain_bucket_changes_marks_shard_dirty() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        cache.enable_persistence();
+        // Build an entry with a bucket clause so maintain_bucket_changes
+        // recognizes it.
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        cache.form_and_store(key.clone(), &[10u32, 20, 30, 40, 50], false, 10, |s| s);
+
+        let shard_key = crate::bound_store::ShardKey::new(
+            key.sort_field.clone(),
+            key.direction,
+        );
+        cache.clear_shard_dirty(&shard_key);
+
+        let mut dropped = roaring::RoaringBitmap::new();
+        dropped.insert(20);
+        dropped.insert(40);
+
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        cache.maintain_bucket_changes(
+            "sortAt", "7d",
+            &dropped, &roaring::RoaringBitmap::new(),
+            &filters, &sorts, None, None,
+        );
+
+        assert!(
+            cache.dirty_shards().contains(&shard_key),
+            "maintain_bucket_changes must mark shard dirty when the bitmap changes",
+        );
+    }
+
     /// `apply_bucket_diff` previously didn't set `persist_dirty` or invalidate
     /// `sorted_keys` when the bitmap shrunk — the merge thread skipped the
     /// entry and the binary-search pagination path could still return slots
@@ -5300,9 +5454,12 @@ mod tests {
         expired.insert(20);
         expired.insert(40);
 
-        if let Some(mut r) = cache.entries.get_mut(&key) {
-            r.value_mut().apply_bucket_diff(&expired, 12345);
-        }
+        let shrunk = if let Some(mut r) = cache.entries.get_mut(&key) {
+            r.value_mut().apply_bucket_diff(&expired, 12345)
+        } else {
+            panic!("entry vanished");
+        };
+        assert!(shrunk, "apply_bucket_diff must return true when bitmap shrinks");
 
         let entry_ref = cache.entries.get(&key).expect("entry present");
         let entry = entry_ref.value();
