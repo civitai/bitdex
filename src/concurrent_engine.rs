@@ -5103,7 +5103,8 @@ impl ConcurrentEngine {
                 };
                 let cache_data = {
                     let pending = self.pending_bucket_diffs.load();
-                    self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
+                    let mut applied_bucket_diff = false;
+                    let result = self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
                         let entry = entry_ref.value_mut();
                         if pending.current_cutoff() > 0
                             && entry.uses_bucket()
@@ -5111,6 +5112,7 @@ impl ConcurrentEngine {
                         {
                             if entry.bucket_cutoff() >= pending.oldest_cutoff() {
                                 entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
+                                applied_bucket_diff = true;
                             } else {
                                 entry.mark_for_rebuild();
                             }
@@ -5124,7 +5126,18 @@ impl ConcurrentEngine {
                         let direction = entry.direction();
                         let sorted_keys = entry.sorted_keys().map(Arc::clone);
                         (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                    })
+                    });
+                    if applied_bucket_diff {
+                        // Read path mutated the entry via bucket-diff expiration —
+                        // mark the shard dirty so the merge thread persists the
+                        // shrunk bitmap. Without this, expired slots resurrect on
+                        // pod restart.
+                        self.unified_cache.mark_shard_dirty(crate::bound_store::ShardKey::new(
+                            ukey.sort_field.clone(),
+                            ukey.direction,
+                        ));
+                    }
+                    result
                 };
                 if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
                     // Check if cursor is past the cache boundary
@@ -5419,13 +5432,15 @@ impl ConcurrentEngine {
                         // mark-for-rebuild). `lookup` returns a DashMap RefMut
                         // holding only the per-shard write lock — concurrent
                         // queries on other shards proceed in parallel.
-                        self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
+                        let mut applied_bucket_diff = false;
+                        let r = self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
                             let entry = entry_ref.value_mut();
                             if entry.uses_bucket()
                                 && entry.bucket_cutoff() < pending.current_cutoff()
                             {
                                 if entry.bucket_cutoff() >= pending.oldest_cutoff() {
                                     entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
+                                    applied_bucket_diff = true;
                                 } else {
                                     entry.mark_for_rebuild();
                                 }
@@ -5439,7 +5454,14 @@ impl ConcurrentEngine {
                             let direction = entry.direction();
                             let sorted_keys = entry.sorted_keys().map(Arc::clone);
                             (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                        })
+                        });
+                        if applied_bucket_diff {
+                            self.unified_cache.mark_shard_dirty(crate::bound_store::ShardKey::new(
+                                ukey.sort_field.clone(),
+                                ukey.direction,
+                            ));
+                        }
+                        r
                     } else {
                         // Hot fast path: no bucket diff to apply. `lookup_for_read`
                         // returns a DashMap Ref — concurrent reads on the same
