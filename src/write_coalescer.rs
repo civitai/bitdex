@@ -509,6 +509,16 @@ impl WriteCoalescer {
     pub fn pending_count(&self) -> usize {
         self.rx.len()
     }
+    /// Push raw ops directly into the next batch without going through the channel.
+    ///
+    /// Used by the flush thread to fold in mutations generated in-process (e.g.
+    /// deferred-alive activation replay) before `prepare()` groups everything.
+    /// Ops pushed here participate fully in the normal flush cycle: cache
+    /// maintenance reads them via `mutated_*` accessors and opslog append
+    /// persists them like channel ops.
+    pub fn push_ops(&mut self, ops: Vec<MutationOp>) {
+        self.batch.push_ops(ops);
+    }
     /// Drain the channel, group ops by target bitmap, and apply them in bulk.
     ///
     /// Called by ConcurrentEngine while holding the write lock on bitmap state.

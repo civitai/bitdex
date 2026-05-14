@@ -714,3 +714,138 @@ fn d4_recompute_skips_deferred_stored_publishedAt() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// D5 — activate_due routes activation ops through the main coalescer so the
+//      unified cache learns about freshly-activated slots. Repro of the
+//      cache-maintenance lag handoff at docs/_in/cache-maintenance-top-of-sort-lag-2026-05-13.md.
+//
+//      Setup: insert a baseline slot, run a query to populate a cache entry
+//      for postId+sortAt-Desc. Schedule a second slot with publishedAt in
+//      the near future via deferred-alive. Wait past activation time, run
+//      the same query (default, cached path), and verify the cached result
+//      contains the activated slot. Cache-bypass query (skip_cache=true)
+//      must agree.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d5_activate_due_updates_unified_cache() {
+    use bitdex_v2::query::{BitdexQuery, FilterClause, SortClause, SortDirection, Value};
+
+    let engine = ConcurrentEngine::new(build_config_with_deferred()).unwrap();
+
+    let t_baseline_existed = now_secs() - 2000;
+    let t_future = now_secs() + 4;
+
+    // Baseline slot 1: alive immediately with existedAt in the past.
+    let mut b1 = vec![EntityOps {
+        entity_id: 1,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(POST_ID) },
+            Op::Set { field: "existedAt".into(), value: json!(t_baseline_existed as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b1);
+    wait_for_flush(&engine, 1, 5000);
+
+    // Build the query: filter postId=POST_ID, sort by sortAt Desc.
+    let build_query = |skip_cache: bool| BitdexQuery {
+        filters: vec![FilterClause::Eq("postId".into(), Value::Integer(POST_ID))],
+        sort: Some(SortClause { field: "sortAt".into(), direction: SortDirection::Desc }),
+        limit: 100,
+        cursor: None,
+        offset: None,
+        skip_cache,
+    };
+
+    // Populate cache entry: run the cached-path query against the baseline.
+    // Run twice — first call may form a small-result entry; second confirms
+    // the cached path is reachable.
+    let _ = engine.execute_query(&build_query(false)).unwrap();
+    let pre = engine.execute_query(&build_query(false)).unwrap();
+    assert_eq!(pre.ids, vec![1], "baseline cached query should return slot 1");
+
+    // Slot 2: creates_slot=true WITH publishedAt=T_FUTURE in its own ops.
+    // This triggers the deferred-alive branch (ops_processor.rs:954-975):
+    // doc is written but ALL bitmaps are skipped (no alive, no postId
+    // filter, no sort layers). Slot 2 is only in the deferred map until
+    // activate_due fires. This isolates the path under test — slot 2
+    // cannot enter the cache via the normal filter-maintenance route
+    // because the postId filter bitmap is untouched by the deferred path.
+    let mut b2 = vec![EntityOps {
+        entity_id: 2,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(POST_ID) },
+            Op::Set { field: "existedAt".into(), value: json!(t_baseline_existed as i64) },
+            Op::Set { field: "publishedAt".into(), value: json!(t_future as i64) },
+        ],
+    }];
+    let _ = drain_batch(&engine, &mut b2);
+    // Slot 2 deferred: alive_count stays at 1, deferred_count becomes 1.
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        engine.alive_count(),
+        1,
+        "slot 2 must be deferred (not alive) before activation"
+    );
+
+    // Pre-activation: cached query must return ONLY slot 1. If it returns
+    // slot 2 here, the deferred path leaked bitmap state and this test
+    // doesn't actually gate the activate_due → cache route.
+    let pre_activation = engine.execute_query(&build_query(false)).unwrap();
+    assert_eq!(
+        pre_activation.ids,
+        vec![1],
+        "pre-activation cached query must return only slot 1 — slot 2 is deferred"
+    );
+
+    // Wait for activate_due to fire (now > t_future). Confirm via bitmap
+    // probe that the activation actually wrote slot 2's sort layers.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut activated_pub: u32 = 0;
+    while Instant::now() < deadline {
+        activated_pub = read_sort_layer(&engine, "publishedAt", 2);
+        if activated_pub == t_future {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        activated_pub, t_future,
+        "activate_due should have written publishedAt to slot 2's bitmap"
+    );
+    let activated_sort = read_sort_layer(&engine, "sortAt", 2);
+    assert_eq!(
+        activated_sort,
+        t_baseline_existed.max(t_future),
+        "sortAt should be max(existedAt, publishedAt) after activation"
+    );
+
+    // Give cache maintenance one more flush cycle to settle.
+    thread::sleep(Duration::from_millis(200));
+
+    let truth = engine.execute_query(&build_query(true)).unwrap();
+    let cached = engine.execute_query(&build_query(false)).unwrap();
+
+    eprintln!(
+        "D5: truth ids={:?} total={} | cached ids={:?} total={}",
+        truth.ids, truth.total_matched, cached.ids, cached.total_matched
+    );
+
+    // Core assertion: cached IDs must match truth after activate_due fires.
+    // Without the fix (activate_due bypassing the main coalescer), cache
+    // maintenance never sees the activation ops, so the cached path returns
+    // only [1] while truth returns [2, 1]. `cached.total_matched` is a
+    // separate bookkeeping field — its drift is tracked independently.
+    assert_eq!(
+        cached.ids, truth.ids,
+        "cached IDs must match truth IDs after activate_due — \
+         if they diverge, activation ops bypassed cache maintenance"
+    );
+    assert!(
+        cached.ids.contains(&2),
+        "cached result must include slot 2 after activation"
+    );
+}
+
