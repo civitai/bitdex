@@ -1274,6 +1274,72 @@ impl ConcurrentEngine {
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
                     let is_loading = flush_loading_mode.load(Ordering::Relaxed);
+                    // Activate deferred-alive slots whose scheduled time has arrived.
+                    //
+                    // Runs at the TOP of the cycle so activation ops are folded into
+                    // the main coalescer batch via `push_ops`; `prepare()` below then
+                    // groups them with channel-drained ops, `apply_prepared_traced()`
+                    // applies them to staging, and the cache-maintenance phase sees
+                    // them via `coalescer.mutated_*` accessors. Prior to this routing,
+                    // activation ops bypassed the coalescer entirely, so cached
+                    // sortAt-Desc top-of-sort queries silently missed freshly-published
+                    // scheduled Posts (see commit message for the prod symptom).
+                    //
+                    // Activation replays the stored doc as a fresh insert: read the
+                    // doc from docstore, diff against None (no prior state), and push
+                    // the resulting ops. The AliveInsert in those ops is redundant
+                    // with `staging.slots.activate_due()` setting the bit directly,
+                    // but harmless — extend on an already-set bit is a no-op.
+                    //
+                    // Deferred-map persistence is DELAYED until after opslog append
+                    // (see `deferred_persist_needed` write below) so a crash between
+                    // activate_due and opslog produces duplicate (idempotent)
+                    // activation on restart, not lost activation. Persisting eagerly
+                    // here would create a data-loss window: deferred map says slot
+                    // is gone, opslog hasn't recorded the activation ops yet, restart
+                    // would never reactivate the slot.
+                    let mut deferred_persist_needed = false;
+                    if !is_loading && staging.slots.deferred_count() > 0 {
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let activated = staging.slots.activate_due(now_unix);
+                        if !activated.is_empty() {
+                            let ds = docstore.read();
+                            for &slot in &activated {
+                                match ds.get(slot) {
+                                    Ok(Some(stored_doc)) => {
+                                        let doc = crate::mutation::Document {
+                                            fields: stored_doc.fields.clone(),
+                                        };
+                                        let ops = crate::mutation::diff_document(
+                                            slot,
+                                            None,
+                                            &doc,
+                                            &flush_config,
+                                            false,
+                                            &flush_field_registry,
+                                        );
+                                        coalescer.push_ops(ops);
+                                    }
+                                    Ok(None) => {
+                                        eprintln!("Warning: deferred slot {} has no stored doc, setting alive only", slot);
+                                        coalescer.push_ops(vec![
+                                            MutationOp::AliveInsert { slots: vec![slot] },
+                                        ]);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: failed to read deferred slot {}: {e}, setting alive only", slot);
+                                        coalescer.push_ops(vec![
+                                            MutationOp::AliveInsert { slots: vec![slot] },
+                                        ]);
+                                    }
+                                }
+                            }
+                            deferred_persist_needed = true;
+                        }
+                    }
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     let bitmap_count = coalescer.prepare();
                     if bitmap_count > 0 {
@@ -2241,69 +2307,23 @@ impl ConcurrentEngine {
                             flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                     }
-                    // Activate deferred alive slots whose time has come.
-                    // Runs every flush cycle regardless of write activity for sub-second
-                    // activation precision. On activation: read stored doc from docstore,
-                    // replay the full mutation pipeline (filter/sort/alive ops) as if the
-                    // document was just PUT for the first time. This ensures the document
-                    // only becomes visible in bitmaps at activation time.
-                    if staging.slots.deferred_count() > 0 {
-                        let now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let activated = staging.slots.activate_due(now_unix);
-                        if !activated.is_empty() {
-                            // Collect all mutation ops for activated slots into a WriteBatch,
-                            // then apply in bulk (same path as normal mutations).
-                            let mut activation_batch = crate::write_coalescer::WriteBatch::new();
-                            {
-                                let ds = docstore.read();
-                                for &slot in &activated {
-                                    match ds.get(slot) {
-                                        Ok(Some(stored_doc)) => {
-                                            let doc = crate::mutation::Document {
-                                                fields: stored_doc.fields.clone(),
-                                            };
-                                            let ops = crate::mutation::diff_document(
-                                                slot,
-                                                None, // fresh insert — no old doc
-                                                &doc,
-                                                &flush_config,
-                                                false, // not upsert
-                                                &flush_field_registry,
-                                            );
-                                            activation_batch.push_ops(ops);
-                                        }
-                                        Ok(None) => {
-                                            eprintln!("Warning: deferred slot {} has no stored doc, setting alive only", slot);
-                                            activation_batch.push_ops(vec![
-                                                MutationOp::AliveInsert { slots: vec![slot] },
-                                            ]);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Warning: failed to read deferred slot {}: {e}, setting alive only", slot);
-                                            activation_batch.push_ops(vec![
-                                                MutationOp::AliveInsert { slots: vec![slot] },
-                                            ]);
-                                        }
-                                    }
-                                }
-                            } // docstore lock released
-                            activation_batch.group_and_sort();
-                            activation_batch.apply(
-                                &mut staging.slots,
-                                &mut staging.filters,
-                                &mut staging.sorts,
-                            );
-                            staging_dirty = true;
-                            // Persist the deferred map AFTER activation so the activated
-                            // entries are already removed. On crash before persist, the
-                            // old map is re-read and those slots get re-activated (idempotent).
-                            if let Some(ref ms) = flush_meta_store {
-                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
-                                }
+                    // Deferred-alive activation runs at the top of the next flush
+                    // cycle (before `coalescer.prepare()`) so activation ops ride the
+                    // normal coalescer path and reach cache maintenance.
+                    //
+                    // Persist the deferred map AFTER opslog append for activation ops
+                    // is complete. This ordering matters: if we wrote the deferred
+                    // map first and crashed before opslog, the slot would be missing
+                    // from BOTH the persisted deferred map AND the opslog, losing the
+                    // activation permanently. With this ordering, a crash before
+                    // persist leaves the deferred map intact on disk; restart re-runs
+                    // activate_due for the same slot, which is idempotent on bitmap
+                    // state (set-already-set = no-op) and produces a duplicate opslog
+                    // entry at worst.
+                    if deferred_persist_needed {
+                        if let Some(ref ms) = flush_meta_store {
+                            if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
+                                eprintln!("Warning: failed to persist deferred alive map: {e}");
                             }
                         }
                     }
