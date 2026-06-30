@@ -1130,6 +1130,9 @@ struct CachePatch {
     /// marked for rebuild. Set to 0 to disable. Hot-tunable; takes effect on the
     /// next maintenance cycle.
     compound_eval_atom_limit: Option<u32>,
+    /// TTL (seconds) for time-bucket cache entries. 0 disables. Hot-tunable;
+    /// takes effect on the next read of an affected entry.
+    bucket_entry_ttl_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2501,6 +2504,10 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.compound_eval_atom_limit {
                         idx.definition.config.cache.compound_eval_atom_limit = v;
                         idx.engine.set_compound_eval_atom_limit(v);
+                    }
+                    if let Some(v) = cache_patch.bucket_entry_ttl_secs {
+                        idx.definition.config.cache.bucket_entry_ttl_secs = v;
+                        idx.engine.set_bucket_entry_ttl_secs(v);
                     }
                     if let Some(v) = cache_patch.async_maintenance {
                         // Updates the stored config (persisted on next save).

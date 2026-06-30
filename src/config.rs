@@ -463,6 +463,14 @@ pub struct CacheConfig {
     /// `PATCH /indexes/{name}/config` → `cache.compound_eval_atom_limit`.
     #[serde(default = "default_compound_eval_atom_limit")]
     pub compound_eval_atom_limit: u32,
+    /// Optional TTL (seconds) for time-bucket cache entries. When > 0, a bucket
+    /// entry older than this since its last full re-derivation is served as a
+    /// miss and rebuilt — a time-bounded self-heal fallback for the case where
+    /// incremental live maintenance misses a slot. Non-bucket entries are
+    /// unaffected. 0 disables (default). Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.bucket_entry_ttl_secs`.
+    #[serde(default = "default_bucket_entry_ttl_secs")]
+    pub bucket_entry_ttl_secs: u64,
 }
 fn default_cache_max_entries() -> usize {
     100_000
@@ -515,6 +523,9 @@ fn default_max_maintenance_ms() -> u64 {
 fn default_compound_eval_atom_limit() -> u32 {
     50 // 2× Civitai's dominant compound shape (~24 atoms)
 }
+fn default_bucket_entry_ttl_secs() -> u64 {
+    0 // disabled by default
+}
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -533,6 +544,7 @@ impl Default for CacheConfig {
             max_maintenance_ms: default_max_maintenance_ms(),
             async_maintenance: false,
             compound_eval_atom_limit: default_compound_eval_atom_limit(),
+            bucket_entry_ttl_secs: default_bucket_entry_ttl_secs(),
         }
     }
 }

@@ -190,6 +190,14 @@ pub struct UnifiedCacheConfig {
     /// Set to `0` to disable the guard (no limit). Hot-tunable via
     /// `PATCH /indexes/{name}/config` → `cache.compound_eval_atom_limit`.
     pub compound_eval_atom_limit: u32,
+    /// Optional TTL (seconds) for time-bucket cache entries (`uses_bucket=true`).
+    /// When > 0, a bucket entry older than this since its last full
+    /// re-derivation is treated as a miss on read and rebuilt, bounding
+    /// staleness regardless of whether incremental live maintenance kept it in
+    /// sync. Non-bucket entries are unaffected. `0` disables the fallback
+    /// (default). Hot-tunable via `PATCH /indexes/{name}/config` →
+    /// `cache.bucket_entry_ttl_secs`.
+    pub bucket_entry_ttl_secs: u64,
 }
 impl Default for UnifiedCacheConfig {
     fn default() -> Self {
@@ -203,6 +211,7 @@ impl Default for UnifiedCacheConfig {
             max_maintenance_ms: 10,
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0, // disabled by default
         }
     }
 }
@@ -241,6 +250,12 @@ pub struct UnifiedEntry {
     /// LRU timestamp as ms since UNIX_EPOCH. Atomic so readers can `touch()`
     /// the entry from the RwLock read path without taking a write lock.
     last_used: AtomicU64,
+    /// Wall-clock (ms since UNIX_EPOCH) when this entry's result set was last
+    /// fully re-derived from truth (entry creation / rebuild). Incremental live
+    /// maintenance does NOT bump it — it anchors the optional bucket-entry TTL,
+    /// which exists as a time-bounded self-heal for the case where live
+    /// maintenance misses a slot. Set once at construction; never mutated.
+    formed_at_ms: u64,
     /// Meta-index entry ID for this cache entry.
     meta_id: CacheEntryId,
     /// Dirty flag for persistence: set when bitmap modified by live maintenance,
@@ -343,6 +358,7 @@ impl UnifiedEntry {
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
             last_used: AtomicU64::new(now_ms()),
+            formed_at_ms: now_ms(),
             meta_id,
             persist_dirty: AtomicBool::new(true), // New entries need persisting
             sorted_keys,
@@ -437,6 +453,7 @@ impl UnifiedEntry {
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
             last_used: AtomicU64::new(now_ms()),
+            formed_at_ms: now_ms(),
             meta_id,
             persist_dirty: AtomicBool::new(false), // Just loaded from disk — clean
             sorted_keys,
@@ -477,6 +494,14 @@ impl UnifiedEntry {
     /// Mark this entry as using a time bucket clause.
     pub fn set_uses_bucket(&mut self, uses: bool) {
         self.uses_bucket = uses;
+    }
+    /// True when this is a time-bucket entry older than `ttl_ms` (since its last
+    /// full re-derivation). Used as a time-bounded self-heal fallback: bucket
+    /// entries depend on incremental live maintenance staying perfectly in sync,
+    /// and any missed slot otherwise lingers forever (no other staleness signal
+    /// fires for a hot entry). `ttl_ms == 0` disables the check.
+    pub fn is_bucket_ttl_expired(&self, now_ms: u64, ttl_ms: u64) -> bool {
+        self.uses_bucket && ttl_ms > 0 && now_ms.saturating_sub(self.formed_at_ms) > ttl_ms
     }
     /// The original FilterClause tree captured at entry formation.
     pub fn original_filter_clauses(&self) -> &Arc<Vec<FilterClause>> {
@@ -1005,6 +1030,15 @@ impl UnifiedCache {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
+                // TTL fallback for time-bucket entries: a stale bucket entry is
+                // marked for rebuild and served as a miss so the slow path
+                // re-derives it from truth.
+                let ttl_ms = self.bucket_entry_ttl_ms();
+                if ttl_ms > 0 && entry.value().is_bucket_ttl_expired(now_ms(), ttl_ms) {
+                    entry.value().mark_for_rebuild();
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 entry.value().touch();
                 Some(entry)
@@ -1027,6 +1061,13 @@ impl UnifiedCache {
         match self.entries.get(key) {
             Some(entry) => {
                 if entry.value().needs_rebuild() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                // TTL fallback for time-bucket entries (see `lookup`).
+                let ttl_ms = self.bucket_entry_ttl_ms();
+                if ttl_ms > 0 && entry.value().is_bucket_ttl_expired(now_ms(), ttl_ms) {
+                    entry.value().mark_for_rebuild();
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
@@ -1542,6 +1583,11 @@ impl UnifiedCache {
     /// Returns 0 when the guard is disabled.
     pub fn compound_eval_atom_limit(&self) -> u32 {
         self.config.load().compound_eval_atom_limit
+    }
+    /// Bucket-entry TTL in milliseconds (0 = disabled). Read from the live
+    /// config snapshot.
+    pub fn bucket_entry_ttl_ms(&self) -> u64 {
+        self.config.load().bucket_entry_ttl_secs.saturating_mul(1000)
     }
     /// Get the key for a meta_id. O(1) via reverse index. Returns a cloned
     /// `UnifiedKey` (the underlying DashMap entry's shard lock can't escape).
@@ -4147,6 +4193,63 @@ mod tests {
         );
     }
     #[test]
+    fn test_bucket_ttl_expiry_logic() {
+        let mut e = UnifiedEntry::new(&[1, 2, 3], 100, 1600, false, 3, 0, SortDirection::Desc, |s| 1000 - s);
+        // Non-bucket entries never expire, regardless of age.
+        assert!(!e.is_bucket_ttl_expired(u64::MAX, 1000));
+        e.set_uses_bucket(true);
+        e.formed_at_ms = 1_000;
+        // ttl_ms == 0 disables the check.
+        assert!(!e.is_bucket_ttl_expired(10_000, 0));
+        // Within the window (age 500 <= 1000).
+        assert!(!e.is_bucket_ttl_expired(1_500, 1000));
+        // Past the window (age 1001 > 1000).
+        assert!(e.is_bucket_ttl_expired(2_001, 1000));
+    }
+    #[test]
+    fn test_lookup_ttl_expired_bucket_entry_is_miss() {
+        let cache = UnifiedCache::new(UnifiedCacheConfig {
+            bucket_entry_ttl_secs: 1,
+            ..make_config()
+        });
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, false, 5, |s| 1000 - s);
+        // Mark it a bucket entry and backdate its formation well beyond the TTL.
+        {
+            let mut e = cache.get_mut(&key).unwrap();
+            e.set_uses_bucket(true);
+            e.formed_at_ms = 0;
+        }
+        assert!(
+            cache.lookup(&key).is_none(),
+            "a bucket entry older than the TTL must be served as a miss",
+        );
+        assert!(
+            cache.get(&key).unwrap().needs_rebuild(),
+            "an expired bucket entry must be marked for rebuild",
+        );
+    }
+    #[test]
+    fn test_lookup_ttl_ignores_non_bucket_entry() {
+        let cache = UnifiedCache::new(UnifiedCacheConfig {
+            bucket_entry_ttl_secs: 1,
+            ..make_config()
+        });
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, false, 5, |s| 1000 - s);
+        // Non-bucket entry: backdating formation must NOT cause a TTL miss.
+        {
+            let mut e = cache.get_mut(&key).unwrap();
+            e.formed_at_ms = 0;
+        }
+        assert!(
+            cache.lookup(&key).is_some(),
+            "TTL must not affect non-bucket entries",
+        );
+    }
+    #[test]
     fn test_maintain_alive_marks_all_for_rebuild() {
         let mut cache = UnifiedCache::new(make_config());
         let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
@@ -4409,6 +4512,7 @@ mod tests {
             max_maintenance_ms: 0,   // Disable time-based
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0,
         };
         let mut cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
@@ -4783,6 +4887,7 @@ mod tests {
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0,
         });
         // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
         cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
@@ -4887,6 +4992,7 @@ mod tests {
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0,
         });
         // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
@@ -5027,6 +5133,7 @@ mod tests {
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0,
         });
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
             if s == 1 { ts_slot1 } else { 0 }
@@ -6548,6 +6655,7 @@ mod tests {
             max_maintenance_ms: 1000, // generous deadline
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
+            bucket_entry_ttl_secs: 0,
         };
         let cache = UnifiedCache::new(cfg);
 
@@ -6812,6 +6920,7 @@ mod tests {
                 max_maintenance_ms: 5000,
                 prefetch_threshold: 0.95,
                 compound_eval_atom_limit: 50,
+                bucket_entry_ttl_secs: 0,
             };
             let cache = UnifiedCache::new(cfg);
             let fi = build_filter_index_two_fields(fa_keys, fa_bitmasks, fb_keys, fb_bitmasks);
