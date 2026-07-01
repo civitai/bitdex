@@ -652,6 +652,7 @@ impl ConcurrentEngine {
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
             compound_eval_atom_limit: config.cache.compound_eval_atom_limit,
+            bucket_entry_ttl_secs: config.cache.bucket_entry_ttl_secs,
         };
         // Cache-worker metrics created early so the cache can hold an Arc to
         // it for reason-attributed rebuild counters (alive_change,
@@ -7216,6 +7217,11 @@ impl ConcurrentEngine {
     /// Set to 0 to disable the guard. Takes effect on the next maintenance cycle.
     pub fn set_compound_eval_atom_limit(&self, v: u32) {
         self.unified_cache.with_config_mut(|c| c.compound_eval_atom_limit = v);
+    }
+    /// Update the time-bucket cache-entry TTL (seconds) on the live unified
+    /// cache. 0 disables the fallback.
+    pub fn set_bucket_entry_ttl_secs(&self, v: u64) {
+        self.unified_cache.with_config_mut(|c| c.bucket_entry_ttl_secs = v);
     }
     /// Update the max_maintenance_ms time budget on the live unified cache and
     /// the async cache worker (if running). Takes effect on the worker's next
