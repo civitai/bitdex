@@ -1541,11 +1541,24 @@ impl ConcurrentEngine {
                             // ago" in a single update was invisible to the
                             // periodic refresh forever.
                             let t_tb = Instant::now();
+                            // Slots whose time-bucket membership may have shifted this
+                            // cycle. Consumed by the cache's #274 bucket-membership
+                            // maintenance (entries filtered on a bucket but sorted by a
+                            // non-bucket field). Populated inside the tb block below.
+                            let mut bucket_changed_slots = roaring::RoaringBitmap::new();
                             if let Some(ref tb_arc) = flush_time_buckets {
                                 let alive_inserts = coalescer.alive_inserts();
                                 let alive_removes = coalescer.alive_removes();
                                 let mutated_slots = coalescer.mutated_sort_slots();
                                 let sort_field_name = tb_arc.load().sort_field_name().to_string();
+                                // Union of alive inserts/removes + bucket-sort-field
+                                // mutations = every slot whose bucket membership could
+                                // have changed this cycle.
+                                bucket_changed_slots.extend(alive_inserts.iter().copied());
+                                bucket_changed_slots.extend(alive_removes.iter().copied());
+                                if let Some(set) = mutated_slots.get(sort_field_name.as_str()) {
+                                    bucket_changed_slots.extend(set.iter().copied());
+                                }
                                 let sort_value_changed: Vec<u32> = mutated_slots
                                     .get(sort_field_name.as_str())
                                     .map(|set| {
@@ -1778,6 +1791,7 @@ impl ConcurrentEngine {
                                     alive_removes,
                                     mutated_filter_fields,
                                     has_alive_mutations,
+                                    bucket_changed_slots: std::mem::take(&mut bucket_changed_slots),
                                 };
                                 if !work_item.is_empty() {
                                     pending_async_work = Some(work_item);
@@ -2013,6 +2027,30 @@ impl ConcurrentEngine {
                                         .fetch_add(evicted, Ordering::Relaxed);
                                 }
                                 uc.reconcile_bytes();
+                            }
+                            // #274: bucket-membership maintenance for entries filtered
+                            // on a time bucket but sorted by a NON-bucket field — the
+                            // case evaluate_sort_work does not surface. Re-derives
+                            // membership of the changed slots against tb_ref (the flush
+                            // thread already updated the bucket bitmaps above).
+                            if !bucket_changed_slots.is_empty() {
+                                if let Some(tb) = tb_ref {
+                                    let bucket_field = tb.field_name();
+                                    let bucket_sort_field = tb.sort_field_name();
+                                    for name in tb.bucket_names() {
+                                        flush_unified_cache.maintain_bucket_membership(
+                                            bucket_field,
+                                            &name,
+                                            bucket_sort_field,
+                                            &bucket_changed_slots,
+                                            &staging.filters,
+                                            &staging.sorts,
+                                            tb_ref,
+                                            sm_ref,
+                                            Some(dict_ref),
+                                        );
+                                    }
+                                }
                             }
                             let phase_c_ns = t_phase_c.elapsed().as_nanos() as u64;
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);

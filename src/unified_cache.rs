@@ -2324,127 +2324,173 @@ impl UnifiedCache {
         }
         count
     }
-    // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
-    /// Maintain cache entries when a time bucket is rebuilt.
+    // ── Time Bucket Membership Maintenance (#274) ──────────────────────────
+    /// Maintain bucket-filtered cache entries when the time-bucket membership of
+    /// a set of slots changes — the ADD/DROP side for entries that FILTER on a
+    /// time bucket but SORT by a *different* field.
     ///
-    /// `field` is the bucket field (e.g., "sortAt").
-    /// `bucket_name` is the bucket name (e.g., "7d").
-    /// `dropped_slots` contains slots that fell out of the bucket (old ANDNOT new).
-    /// `added_slots` contains slots that entered the bucket (new ANDNOT old).
+    /// `evaluate_sort_work` already keeps a bucket-filtered entry fresh when the
+    /// entry's OWN sort field mutates: a slot entering the window via a `sortAt`
+    /// change surfaces the entry because its `key.sort_field == sortAt`. But an
+    /// entry sorted by e.g. `reactionCount` and filtered on `bucket(sortAt, 7d)`
+    /// is never surfaced by a `sortAt` mutation (`collect_sort_work` keys on
+    /// `reactionCount`) nor by `collect_filter_work` (`sortAtUnix` is not a
+    /// filter field). Such entries only self-corrected on rebuild — the #274
+    /// gap. This pass closes it.
     ///
-    /// Called by the flush thread after swapping in a rebuilt bucket bitmap.
-    pub fn maintain_bucket_changes(
+    /// - `field` is the bucket clause field (e.g. `sortAtUnix`), `bucket_name`
+    ///   the bucket (e.g. `7d`).
+    /// - `bucket_sort_field` is the manager's sort field (e.g. `sortAt`). Entries
+    ///   that sort by it are ALREADY covered by `evaluate_sort_work`, so they are
+    ///   skipped here to avoid redundant work.
+    /// - `changed_slots` is the (small) set of slots whose bucket membership may
+    ///   have changed this cycle (new alive inserts, `sortAt` jumps, alive
+    ///   removes).
+    /// - `bucket_mgr` MUST be the authoritative (post-flush) manager so the
+    ///   bucket clause re-resolves against current membership — the same live
+    ///   resolution the query and `evaluate_sort_work` paths use.
+    ///
+    /// Candidate entries are found via the meta-index (O(entries-with-this-bucket)),
+    /// not a full cache scan. Returns the number of entries modified.
+    #[allow(clippy::too_many_arguments)]
+    pub fn maintain_bucket_membership(
         &self,
         field: &str,
         bucket_name: &str,
-        dropped_slots: &RoaringBitmap,
-        added_slots: &RoaringBitmap,
+        bucket_sort_field: &str,
+        changed_slots: &RoaringBitmap,
         filters: &FilterIndex,
         sorts: &SortIndex,
+        bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
         string_maps: Option<&crate::executor::StringMaps>,
         dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
-    ) {
-        if dropped_slots.is_empty() && added_slots.is_empty() {
-            return;
+    ) -> u64 {
+        if changed_slots.is_empty() {
+            return 0;
         }
-        // Reusable misses counter: we don't bump external metrics here since this
-        // path is called from the flush thread (no metrics handle available).
-        let _misses = std::sync::atomic::AtomicU64::new(0);
+        // Candidate entries: those whose canonical filter key contains exactly
+        // this bucket clause. `entries_for_clause` returns a small bitmap — O(1)
+        // vs a full scan over every cache entry.
+        let candidate_ids: Vec<CacheEntryId> = {
+            let meta = self.meta.read();
+            match meta.entries_for_clause(field, "bucket", bucket_name) {
+                Some(bm) => bm.iter().collect(),
+                None => return 0,
+            }
+        };
+        if candidate_ids.is_empty() {
+            return 0;
+        }
+        // Resolve to the entries this pass is actually responsible for: bucket
+        // clause matches, but the entry does NOT sort by the bucket's own sort
+        // field (those are handled by evaluate_sort_work). Filtering here — off
+        // the entry locks — also lets us budget the per-slot work below.
+        let targets: Vec<UnifiedKey> = candidate_ids
+            .iter()
+            .filter_map(|id| self.meta_id_to_key.get(id).map(|k| k.value().clone()))
+            .filter(|key| key.sort_field.as_str() != bucket_sort_field)
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        // Work budget: this pass re-derives membership for `targets × changed`
+        // (slot_matches_filter per pair). Under a pathological batch (huge delete
+        // or a wide fan-out of sortAt changes) that product can spike the flush /
+        // worker cycle. When it would, fall back to marking the affected entries
+        // for rebuild — correctness-preserving (the next query re-derives from
+        // truth) and O(targets) instead of O(targets × changed).
+        const BUCKET_MAINT_WORK_BUDGET: u64 = 200_000;
+        let estimated = targets.len() as u64 * changed_slots.len();
+        if estimated > BUCKET_MAINT_WORK_BUDGET {
+            for key in &targets {
+                if let Some(r) = self.entries.get(key) {
+                    r.value().mark_for_rebuild();
+                }
+            }
+            self.invalidations.fetch_add(targets.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                "maintain_bucket_membership: bucket '{}' work {} > budget {} — marked {} entries for rebuild instead of inline maintenance",
+                bucket_name, estimated, BUCKET_MAINT_WORK_BUDGET, targets.len(),
+            );
+            return targets.len() as u64;
+        }
         let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let misses = std::sync::atomic::AtomicU64::new(0);
         let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
-        for mut r in self.entries.iter_mut() {
-            let key = r.key().clone();
+        let mut modified_entries = 0u64;
+        for key in targets {
+            let mut r = match self.entries.get_mut(&key) {
+                Some(r) => r,
+                None => continue,
+            };
             let entry = r.value_mut();
             if entry.needs_rebuild() {
                 continue;
             }
-            let has_bucket = key.filter_clauses.iter().any(|c| {
-                c.field == field && c.op == "bucket" && c.value_repr == bucket_name
-            });
-            if !has_bucket {
-                continue;
-            }
-            let mut modified = false;
-            if !dropped_slots.is_empty() {
-                let old_len = entry.bitmap.len();
-                let bm = Arc::make_mut(&mut entry.bitmap);
-                *bm -= dropped_slots;
-                if entry.bitmap.len() < old_len {
-                    modified = true;
-                }
-                if let Some(ref mut radix) = entry.radix {
-                    let rx = Arc::make_mut(radix);
-                    for slot in dropped_slots.iter() {
-                        rx.remove_blind(slot);
-                    }
-                }
-            }
-            if !added_slots.is_empty() {
-                let original = Arc::clone(entry.original_filter_clauses());
-                let use_native = !original.is_empty();
-                let misses = std::sync::atomic::AtomicU64::new(0);
-                for slot in added_slots.iter() {
-                    let other_clauses_match = if use_native {
-                        // B2 native path: evaluate non-bucket clauses via the
-                        // original FilterClause tree (handles Not/And/Or correctly).
-                        // We still skip the matching bucket clause itself since the
-                        // caller guarantees the slot is in the new bucket bitmap.
-                        let non_bucket: Vec<&FilterClause> = original
-                            .iter()
-                            .filter(|c| !matches!(c,
-                                FilterClause::BucketBitmap { field: f, bucket_name: bn, .. }
-                                if f == field && bn == bucket_name))
-                            .collect();
-                        non_bucket.iter().all(|c| {
-                            slot_matches_clause_native(
-                                slot, c, filters, sorts,
-                                None, // no bucket_mgr: bucket clause already excluded above
-                                string_maps, dictionaries,
-                                &misses,
-                            )
-                        })
-                    } else {
-                        // Legacy canonical path.
-                        key.filter_clauses.iter().all(|c| {
-                            if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
-                                true
-                            } else {
-                                slot_matches_clause(slot, c, filters, sorts, None)
-                            }
-                        })
-                    };
-                    if !other_clauses_match {
-                        continue;
-                    }
-                    let sort_value = sorts
-                        .get_field(&key.sort_field)
+            let original = Arc::clone(entry.original_filter_clauses());
+            let use_native = !original.is_empty();
+            let sort_field = sorts.get_field(&key.sort_field);
+            let mut adds: Vec<(u32, u32)> = Vec::new();
+            let mut removes: Vec<(u32, u32)> = Vec::new();
+            for slot in changed_slots.iter() {
+                // Re-derive full-predicate membership against LIVE state. The
+                // bucket clause resolves via `bucket_mgr` (authoritative), so a
+                // slot that entered/left the window is classified correctly even
+                // though the entry's own sort field never mutated.
+                let matches = if use_native {
+                    slot_matches_filter_native(
+                        slot,
+                        &original,
+                        filters,
+                        sorts,
+                        bucket_mgr,
+                        string_maps,
+                        dictionaries,
+                        &misses,
+                    )
+                } else {
+                    slot_matches_filter(slot, &key.filter_clauses, filters, sorts, bucket_mgr)
+                };
+                if matches {
+                    // In-window and matches every other filter. Add only if it
+                    // qualifies for the tracked top-N (same gate as
+                    // evaluate_sort_work); a non-qualifying slot isn't in the
+                    // cached working set, so there is nothing to do.
+                    let sort_value = sort_field
                         .map(|f| f.reconstruct_value(slot))
                         .unwrap_or(0);
                     if entry.sort_qualifies(sort_value, key.direction) {
-                        let old_len = entry.bitmap.len();
-                        entry.add_slot(slot, sort_value);
-                        if entry.bitmap.len() > old_len {
-                            modified = true;
-                        }
+                        adds.push((slot, sort_value));
                     }
+                } else {
+                    // No longer a member (left the window, deleted, or never
+                    // matched). `remove_slots_bulk` is a membership-guarded no-op
+                    // when the slot isn't cached, so blanket candidacy is cheap.
+                    removes.push((slot, 0));
                 }
             }
-            // Bucket drops and the manual `*bm -=` path don't set
-            // entry.persist_dirty or invalidate sorted_keys. Fix both here:
-            // without persist_dirty the merge thread skips the entry; without
-            // sorted_keys=None the binary-search pagination path can still
-            // return slots that were just removed from the bitmap.
+            let mut modified = false;
+            if !removes.is_empty() {
+                modified |= entry.remove_slots_bulk(&removes);
+            }
+            if !adds.is_empty() {
+                entry.add_slots_bulk(&adds);
+                modified = true;
+            }
+            // `add_slots_bulk` / `remove_slots_bulk` already set persist_dirty and
+            // invalidate sorted_keys; we only track shard dirtiness for the merge
+            // thread here.
             if modified {
-                entry.persist_dirty.store(true, Ordering::Relaxed);
-                entry.sorted_keys = None;
                 if persistence {
                     dirty_shards.insert(ShardKey::new(key.sort_field.clone(), key.direction));
                 }
+                modified_entries += 1;
             }
         }
         if !dirty_shards.is_empty() {
             self.shard_dirty.lock().extend(dirty_shards);
         }
+        modified_entries
     }
 }
 // ── Filter Evaluation ──────────────────────────────────────────────────────
@@ -4312,36 +4358,34 @@ mod tests {
         assert!(!cache.get(&key).unwrap().bitmap().contains(10));
     }
     #[test]
-    fn test_maintain_bucket_drops_expired_slots() {
+    fn test_maintain_bucket_membership_removes_slots_out_of_window() {
         let mut cache = UnifiedCache::new(make_config());
-        // Entry with bucket clause: bucket(sortAt, "7d")
+        // Entry FILTERED on bucket(sortAt, "7d") but SORTED by reactionCount —
+        // the #274 shape (sort field != bucket sort field).
         let key = UnifiedKey {
-            filter_clauses: vec![
-                CanonicalClause {
-                    field: "sortAt".to_string(),
-                    op: "bucket".to_string(),
-                    value_repr: "7d".to_string(),
-                },
-                CanonicalClause {
-                    field: "nsfwLevel".to_string(),
-                    op: "eq".to_string(),
-                    value_repr: "1".to_string(),
-                },
-            ],
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
             sort_field: "reactionCount".to_string(),
             direction: SortDirection::Desc,
         };
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         assert_eq!(cache.get(&key).unwrap().cardinality(), 10);
-        // Bucket rebuild: slots 0, 1, 2 dropped out of the 7d window
-        let mut dropped = RoaringBitmap::new();
-        dropped.insert(0);
-        dropped.insert(1);
-        dropped.insert(2);
-        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[])])]);
+        // Live 7d bucket now holds only slots 3..10 — slots 0,1,2 aged out.
+        let in_window: Vec<u32> = (3..10).collect();
+        let mgr = make_bucket_manager("7d", &in_window);
+        let filters = make_filter_index(&[]);
         let sorts = make_sort_index(&[("reactionCount", &[])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &dropped, &RoaringBitmap::new(), &filters, &sorts, None, None);
+        // Membership changed for 0,1,2. `bucket_sort_field` is "sortAt" (≠ the
+        // entry's reactionCount sort), so the entry is NOT skipped.
+        let mut changed = RoaringBitmap::new();
+        changed.extend([0u32, 1, 2]);
+        cache.maintain_bucket_membership(
+            "sortAt", "7d", "sortAt", &changed, &filters, &sorts, Some(&mgr), None, None,
+        );
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.cardinality(), 7);
         assert!(!entry.bitmap().contains(0));
@@ -4350,7 +4394,7 @@ mod tests {
         assert!(entry.bitmap().contains(3));
     }
     #[test]
-    fn test_maintain_bucket_adds_qualifying_new_slots() {
+    fn test_maintain_bucket_membership_adds_qualifying_new_slot() {
         let mut cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![
@@ -4370,14 +4414,46 @@ mod tests {
         };
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        // min_tracked_value = 996
-        // Slot 100 enters the bucket and matches nsfwLevel=1 with reactionCount=1500
-        let mut added = RoaringBitmap::new();
-        added.insert(100);
+        // min_tracked_value = 996. Slot 100 enters the 7d window, matches
+        // nsfwLevel=1, reactionCount=1500 — must be added even though its OWN
+        // sort field (reactionCount) never mutated.
+        let mgr = make_bucket_manager("7d", &[100]);
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[100])])]);
         let sorts = make_sort_index(&[("reactionCount", &[(100, 1500)])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &RoaringBitmap::new(), &added, &filters, &sorts, None, None);
+        let mut changed = RoaringBitmap::new();
+        changed.insert(100);
+        cache.maintain_bucket_membership(
+            "sortAt", "7d", "sortAt", &changed, &filters, &sorts, Some(&mgr), None, None,
+        );
         assert!(cache.get(&key).unwrap().bitmap().contains(100));
+    }
+    #[test]
+    fn test_maintain_bucket_membership_skips_entry_sorted_by_bucket_field() {
+        // An entry sorted BY the bucket's sort field is covered by
+        // evaluate_sort_work; maintain_bucket_membership must skip it (no add)
+        // to avoid redundant work.
+        let mut cache = UnifiedCache::new(make_config());
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        cache.form_and_store(key.clone(), &[0u32, 1, 2], true, 100, |s| 1000 - s);
+        let mgr = make_bucket_manager("7d", &[100]);
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[("sortAt", &[(100, 1500)])]);
+        let mut changed = RoaringBitmap::new();
+        changed.insert(100);
+        // bucket_sort_field == "sortAt" == key.sort_field → skipped.
+        let touched = cache.maintain_bucket_membership(
+            "sortAt", "7d", "sortAt", &changed, &filters, &sorts, Some(&mgr), None, None,
+        );
+        assert_eq!(touched, 0, "entry sorted by bucket field must be skipped");
+        assert!(!cache.get(&key).unwrap().bitmap().contains(100));
     }
     #[test]
     fn test_maintain_unaffected_entry_untouched() {
@@ -5746,23 +5822,21 @@ mod tests {
         );
     }
 
-    /// `maintain_bucket_changes` must mark touched shards dirty when the
-    /// bitmap actually changes. Mirrors the prod-bug repro for the
-    /// time-bucket maintenance path.
+    /// `maintain_bucket_membership` must mark touched shards dirty when the
+    /// bitmap actually changes, so the merge thread persists the entry.
     #[test]
-    fn test_maintain_bucket_changes_marks_shard_dirty() {
+    fn test_maintain_bucket_membership_marks_shard_dirty() {
         let config = make_config();
         let cache = UnifiedCache::new(config);
         cache.enable_persistence();
-        // Build an entry with a bucket clause so maintain_bucket_changes
-        // recognizes it.
+        // Bucket-filtered entry sorted by a NON-bucket field (#274 shape).
         let key = UnifiedKey {
             filter_clauses: vec![CanonicalClause {
                 field: "sortAt".to_string(),
                 op: "bucket".to_string(),
                 value_repr: "7d".to_string(),
             }],
-            sort_field: "sortAt".to_string(),
+            sort_field: "reactionCount".to_string(),
             direction: SortDirection::Desc,
         };
         cache.form_and_store(key.clone(), &[10u32, 20, 30, 40, 50], false, 10, |s| s);
@@ -5773,21 +5847,20 @@ mod tests {
         );
         cache.clear_shard_dirty(&shard_key);
 
-        let mut dropped = roaring::RoaringBitmap::new();
-        dropped.insert(20);
-        dropped.insert(40);
-
+        // Live 7d bucket no longer contains 20 or 40 → they must be removed.
+        let mgr = make_bucket_manager("7d", &[10, 30, 50]);
         let filters = make_filter_index(&[]);
-        let sorts = make_sort_index(&[]);
-        cache.maintain_bucket_changes(
-            "sortAt", "7d",
-            &dropped, &roaring::RoaringBitmap::new(),
-            &filters, &sorts, None, None,
+        let sorts = make_sort_index(&[("reactionCount", &[])]);
+        let mut changed = roaring::RoaringBitmap::new();
+        changed.insert(20);
+        changed.insert(40);
+        cache.maintain_bucket_membership(
+            "sortAt", "7d", "sortAt", &changed, &filters, &sorts, Some(&mgr), None, None,
         );
 
         assert!(
             cache.dirty_shards().contains(&shard_key),
-            "maintain_bucket_changes must mark shard dirty when the bitmap changes",
+            "maintain_bucket_membership must mark shard dirty when the bitmap changes",
         );
     }
 
