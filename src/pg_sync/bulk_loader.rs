@@ -863,49 +863,65 @@ pub async fn download_metrics_from_clickhouse(
     let csv_path = stage_dir.join(format!("{phase_name}.tsv"));
     eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
 
-    // Append the output format to the config-provided SQL (trim a trailing
-    // semicolon so `<sql>;\nFORMAT ...` doesn't become a syntax error).
-    let full_query = format!(
-        "{}\nFORMAT TSVWithNames",
-        query.trim().trim_end_matches(';').trim_end()
-    );
-
     let http = reqwest::Client::new();
-    let mut req = http.post(ch_url).body(full_query);
-
-    if let Some(username) = ch_username {
-        let password = ch_password.unwrap_or("");
-        req = req.basic_auth(username, Some(password));
-    }
-
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("ClickHouse request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("ClickHouse returned {status}: {body}"));
-    }
-
-    // Stream response to disk — don't buffer in memory (OOMKilled at 107M rows).
     let mut file = tokio::fs::File::create(&csv_path)
         .await
-        .map_err(|e| format!("create metrics.tsv: {e}"))?;
-    let mut bytes_written = 0u64;
+        .map_err(|e| format!("create {phase_name}.tsv: {e}"))?;
+
     let mut row_count = 0u64;
-    let mut stream = resp;
-    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("read CH chunk: {e}"))? {
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+    let mut bytes_written = 0u64;
+
+    // Chunked mode: when the config query carries {id_lo}/{id_hi} placeholders,
+    // the source view is too big to scan unbounded (~25s / CH-OOM risk), so we
+    // stream it in entityId ranges — the predicate pushes down to the view PK
+    // (~300ms per 1M slice). Only the FIRST chunk keeps its TSVWithNames header;
+    // subsequent chunks are header-stripped so the file stays single-header.
+    if query.contains("{id_lo}") && query.contains("{id_hi}") {
+        const CHUNK: i64 = 5_000_000;
+        // Headroom over the current max Image entityId (~135M per pipeline
+        // owner). Empty ranges return instantly (predicate pushdown), so an
+        // over-wide cap only costs a few no-op requests. Bump if IDs approach it.
+        const MAX_ID: i64 = 200_000_000;
+        let mut lo: i64 = 0;
+        let mut wrote_header = false;
+        while lo < MAX_ID {
+            let hi = lo + CHUNK;
+            let chunk_sql = query
+                .replace("{id_lo}", &lo.to_string())
+                .replace("{id_hi}", &hi.to_string());
+            let full_query = format!(
+                "{}\nFORMAT TSVWithNames",
+                chunk_sql.trim().trim_end_matches(';').trim_end()
+            );
+            let (rows, bytes) = stream_ch_query(
+                &http, ch_url, ch_username, ch_password, &full_query, &mut file, wrote_header,
+            )
             .await
-            .map_err(|e| format!("write metrics.tsv: {e}"))?;
-        row_count += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
-        bytes_written += chunk.len() as u64;
+            .map_err(|e| format!("metrics chunk [{lo},{hi}): {e}"))?;
+            wrote_header = true;
+            row_count += rows;
+            bytes_written += bytes;
+            if lo % 50_000_000 == 0 {
+                eprintln!("  metrics: scanned entityId < {hi}, {row_count} rows so far");
+            }
+            lo = hi;
+        }
+    } else {
+        let full_query = format!(
+            "{}\nFORMAT TSVWithNames",
+            query.trim().trim_end_matches(';').trim_end()
+        );
+        let (rows, bytes) = stream_ch_query(
+            &http, ch_url, ch_username, ch_password, &full_query, &mut file, false,
+        )
+        .await?;
+        row_count += rows;
+        bytes_written += bytes;
     }
+
     tokio::io::AsyncWriteExt::flush(&mut file)
         .await
-        .map_err(|e| format!("flush metrics.tsv: {e}"))?;
+        .map_err(|e| format!("flush {phase_name}.tsv: {e}"))?;
     eprintln!(
         "Downloaded {} metric rows from ClickHouse ({:.1} MB)",
         row_count,
@@ -916,4 +932,62 @@ pub async fn download_metrics_from_clickhouse(
         .map_err(|e| format!("write .done marker: {e}"))?;
 
     Ok(row_count)
+}
+
+/// POST one ClickHouse query and stream its response to `file`. When
+/// `skip_header` is true, the leading TSVWithNames header line is dropped
+/// (so chunked downloads keep a single header). Returns (rows_written,
+/// bytes_written). Streams chunk-by-chunk — never buffers the full response
+/// (OOM-safe at 107M rows).
+async fn stream_ch_query(
+    http: &reqwest::Client,
+    ch_url: &str,
+    ch_username: Option<&str>,
+    ch_password: Option<&str>,
+    full_query: &str,
+    file: &mut tokio::fs::File,
+    skip_header: bool,
+) -> Result<(u64, u64), String> {
+    let mut req = http.post(ch_url).body(full_query.to_string());
+    if let Some(username) = ch_username {
+        req = req.basic_auth(username, Some(ch_password.unwrap_or("")));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("ClickHouse request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ClickHouse returned {status}: {body}"));
+    }
+
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    // While true, we're still dropping bytes of the header line (up to and
+    // including the first newline), possibly across stream-chunk boundaries.
+    let mut dropping_header = skip_header;
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("read CH chunk: {e}"))? {
+        let data: &[u8] = if dropping_header {
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    dropping_header = false;
+                    &chunk[pos + 1..]
+                }
+                None => continue, // entire stream-chunk is still header
+            }
+        } else {
+            &chunk[..]
+        };
+        if data.is_empty() {
+            continue;
+        }
+        tokio::io::AsyncWriteExt::write_all(file, data)
+            .await
+            .map_err(|e| format!("write metrics tsv: {e}"))?;
+        rows += data.iter().filter(|&&b| b == b'\n').count() as u64;
+        bytes += data.len() as u64;
+    }
+    Ok((rows, bytes))
 }

@@ -160,12 +160,28 @@ dump_phases:
     slot_field: imageId
     fields: [techniqueIds]
 
-  # Phase 6: Metrics (1.4GB, from ClickHouse, TAB-separated)
+  # Phase 6: Metrics (from ClickHouse, TAB-separated)
+  #
+  # Source: entityMetricDailyAgg_v2 — the canonical all-time metrics view
+  # (reads entityMetricTotal_v3 via argMax(total, refreshVersion); abuse-user
+  # exclusion is baked upstream). This is what the Civitai feed reads, so the
+  # numbers match the site. metricType values: reactions = Like/Heart/Laugh/Cry
+  # (reactionCount = their sum, excludes Dislike for parity with the prior
+  # index); commentCount (NOT the legacy/empty 'Comment'); Collection.
+  #
+  # {id_lo}/{id_hi} are range placeholders: the sidecar chunks the full dump by
+  # entityId range (the predicate pushes down to the view's PK — ~300ms per 1M
+  # slice vs ~25s for an unbounded full scan). Keep them in the WHERE clause.
   - name: metrics
     source: clickhouse
     query: >
-      SELECT imageId, reactionCount, commentCount, collectedCount
-      FROM image_metrics
+      SELECT entityId AS imageId,
+        sumIf(total, metricType IN ('Like','Heart','Laugh','Cry')) AS reactionCount,
+        sumIf(total, metricType = 'commentCount') AS commentCount,
+        sumIf(total, metricType = 'Collection') AS collectedCount
+      FROM entityMetricDailyAgg_v2
+      WHERE entityType = 'Image' AND entityId >= {id_lo} AND entityId < {id_hi}
+      GROUP BY entityId
     format: tsv
     slot_field: imageId
     fields: [reactionCount, commentCount, collectedCount]
