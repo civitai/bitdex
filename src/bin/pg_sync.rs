@@ -550,22 +550,40 @@ async fn run_streaming_pipeline(
     let total = config.dump_phases.len();
     let start = std::time::Instant::now();
 
-    // Download ClickHouse metrics CSV in background (separate from PG COPY)
-    let mut ch_handle = if let Some(ref ch_url) = sync_config.clickhouse_url {
-        let ch_url = ch_url.clone();
-        let stage = stage_dir.to_path_buf();
-        let user = sync_config.clickhouse_username.clone();
-        let pass = sync_config.clickhouse_password.clone();
-        Some(tokio::spawn(async move {
-            if let Err(e) = bulk_loader::download_metrics_from_clickhouse(
-                &stage, &ch_url, user.as_deref(), pass.as_deref(),
-            ).await {
-                eprintln!("ERROR: ClickHouse metrics download failed: {e}");
-                eprintln!("  Metrics sort fields (reactionCount, commentCount, collectedCount) will be zero.");
+    // Download ClickHouse metrics CSV in background (separate from PG COPY).
+    // The query comes from the `clickhouse`-sourced dump phase in the sync
+    // config (config-driven), NOT a hardcoded string — so a ClickHouse schema
+    // change is a ConfigMap edit + reconcile, not a rebuild.
+    let ch_phase = config
+        .dump_phases
+        .iter()
+        .find(|p| p.source.as_deref() == Some("clickhouse"));
+    let mut ch_handle = match (&sync_config.clickhouse_url, ch_phase) {
+        (Some(ch_url), Some(phase)) => match phase.query.clone() {
+            Some(query) => {
+                let ch_url = ch_url.clone();
+                let stage = stage_dir.to_path_buf();
+                let user = sync_config.clickhouse_username.clone();
+                let pass = sync_config.clickhouse_password.clone();
+                let phase_name = phase.name.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = bulk_loader::download_metrics_from_clickhouse(
+                        &stage, &phase_name, &query, &ch_url, user.as_deref(), pass.as_deref(),
+                    ).await {
+                        eprintln!("ERROR: ClickHouse metrics download failed: {e}");
+                        eprintln!("  Metrics sort fields (reactionCount, commentCount, collectedCount) will be zero.");
+                    }
+                }))
             }
-        }))
-    } else {
-        None
+            None => {
+                eprintln!(
+                    "WARNING: clickhouse dump phase '{}' has no `query` configured — skipping metrics download",
+                    phase.name
+                );
+                None
+            }
+        },
+        _ => None,
     };
 
     // Check existing dump status for skip logic

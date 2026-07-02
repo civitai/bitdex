@@ -325,10 +325,10 @@ async fn fetch_metrics_from_clickhouse(
     let query = format!(
         r#"SELECT
             entityId as id,
-            sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
-            sumIf(total, metricType = 'Comment') as commentCount,
+            sumIf(total, metricType IN ('Like','Heart','Laugh','Cry')) as reactionCount,
+            sumIf(total, metricType = 'commentCount') as commentCount,
             sumIf(total, metricType = 'Collection') as collectedCount
-        FROM entityMetricDailyAgg
+        FROM entityMetricDailyAgg_v2
         WHERE entityType = 'Image'
           AND entityId IN (
             SELECT DISTINCT entityId
