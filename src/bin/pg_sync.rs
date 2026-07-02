@@ -27,7 +27,7 @@ use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
 use bitdex_v2::pg_sync::metrics_poller;
 use bitdex_v2::pg_sync::ops_poller;
 use bitdex_v2::pg_sync::queries;
-use bitdex_v2::pg_sync::sync_config::FullSyncConfig;
+use bitdex_v2::pg_sync::sync_config::{DumpPhase, FullSyncConfig};
 
 #[derive(Parser)]
 #[command(name = "bitdex-sync", about = "Config-driven sync system for BitDex")]
@@ -281,6 +281,39 @@ async fn run_setup(pool: &sqlx::PgPool, full_sync_config: Option<&FullSyncConfig
 // Boot sequence: fully autonomous initial load
 // ---------------------------------------------------------------------------
 
+/// Extract the set of dump names with status "Complete" from a `GET /dumps`
+/// response body (`{"dumps": {"<name>": {"status": "...", ...}, ...}, ...}`).
+fn completed_dump_names(dumps_resp: &serde_json::Value) -> HashSet<String> {
+    dumps_resp
+        .get("dumps")
+        .and_then(|d| d.as_object())
+        .map(|map| {
+            map.iter()
+                .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) == Some("Complete"))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True only if EVERY currently-configured dump phase is present in
+/// `completed_set`. Empty `phases` returns false (nothing configured is
+/// never "all complete" — callers should not treat that as skip-worthy).
+fn all_phases_complete(phases: &[DumpPhase], completed_set: &HashSet<String>) -> bool {
+    !phases.is_empty() && phases.iter().all(|p| completed_set.contains(&p.dump_name()))
+}
+
+/// Write the `.ready` marker that flips the bitdex server's `/api/ready`
+/// endpoint to 200 and lets the K8s Service start routing traffic.
+fn write_ready_marker(data_dir: &Path) {
+    let ready_marker = data_dir.join(".ready");
+    if let Err(e) = std::fs::write(&ready_marker, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        eprintln!("WARNING: Failed to write readiness marker {}: {e}", ready_marker.display());
+    } else {
+        eprintln!("Wrote readiness marker: {}", ready_marker.display());
+    }
+}
+
 /// Autonomous boot sequence for K8s deployment.
 ///
 /// 1. Wait for BitDex health check
@@ -314,23 +347,43 @@ async fn run_boot_sequence(
         });
     eprintln!("BitDex is healthy.");
 
-    // Step 1b: Check if ALL dump phases are already complete — skip dump if so.
-    // Uses per-phase completion check via GET /dumps to avoid skipping incomplete phases.
-    // Previous alive_count > 0 check was too aggressive (skipped tools/techniques when
-    // images loaded but other phases hadn't run yet).
+    // Step 1b: Check if EVERY dump phase *currently configured* is already
+    // complete — skip the whole pipeline only in that case. This must be
+    // checked per-phase against `config.dump_phases`, not via the dump
+    // registry's own `all_complete()` (which only looks at whatever dumps
+    // happen to be registered). If a configured phase was never registered
+    // (e.g. it failed before PUT /dumps, like a ClickHouse schema-drift
+    // failure on the metrics phase) the registry can be "all complete" for
+    // the dumps it knows about while a configured phase never ran — that
+    // caused a real incident where reactionCount/commentCount/collectedCount
+    // stayed zero forever because the registry only had the other 5 phases.
+    //
+    // Falling through here (when not all configured phases are complete)
+    // is safe: the per-phase loop below (run_streaming_pipeline) already
+    // skips phases whose dump_name() is in the completed set and only runs
+    // the missing/incomplete ones.
     if let Some(config) = full_sync_config {
-        let all_complete = match bitdex_client.get_dumps().await {
-            Ok(resp) => resp.get("all_complete").and_then(|v| v.as_bool()).unwrap_or(false),
-            Err(_) => false,
-        };
-        if all_complete && !config.dump_phases.is_empty() {
-            let alive_count = bitdex_client.get_alive_count().await;
-            eprintln!(
-                "All dump phases complete ({alive_count} alive docs) — skipping dump pipeline. \
-                 Transitioning directly to steady-state ops polling."
-            );
-            run_setup(pool, full_sync_config).await;
-            return;
+        if !config.dump_phases.is_empty() {
+            let completed_set = match bitdex_client.get_dumps().await {
+                Ok(resp) => completed_dump_names(&resp),
+                Err(_) => HashSet::default(),
+            };
+            if all_phases_complete(&config.dump_phases, &completed_set) {
+                let alive_count = bitdex_client.get_alive_count().await;
+                eprintln!(
+                    "All {} configured dump phases complete ({alive_count} alive docs) — \
+                     skipping dump pipeline. Transitioning directly to steady-state ops polling.",
+                    config.dump_phases.len()
+                );
+                run_setup(pool, full_sync_config).await;
+
+                // Write the readiness marker here too — this is a terminal
+                // path (we return below) so it must not depend on the
+                // later Step-10 write, or a fully-complete restart would
+                // never flip the pod to Ready (previous bug).
+                write_ready_marker(&sync_config.data_dir);
+                return;
+            }
         }
     }
 
@@ -411,12 +464,7 @@ async fn run_boot_sequence(
     // The marker is durable across bitdex container restarts on the shared
     // PVC mount.
     if dump_pipeline_complete {
-        let ready_marker = sync_config.data_dir.join(".ready");
-        if let Err(e) = std::fs::write(&ready_marker, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
-            eprintln!("WARNING: Failed to write readiness marker {}: {e}", ready_marker.display());
-        } else {
-            eprintln!("Wrote readiness marker: {}", ready_marker.display());
-        }
+        write_ready_marker(&sync_config.data_dir);
     } else {
         eprintln!(
             "WARNING: Dump pipeline did not finish all phases — NOT writing readiness marker. \
@@ -849,5 +897,123 @@ fn run_validate(
     } else {
         eprintln!("\nVALIDATION FAILED — missing required files.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod boot_skip_tests {
+    use super::*;
+
+    /// Six configured phases, mirroring the real incident shape: five
+    /// postgres-sourced phases plus a `metrics` clickhouse phase.
+    fn six_phase_config() -> FullSyncConfig {
+        let yaml = r#"
+index: test
+dump_phases:
+  - name: tags
+    slot_field: id
+    fields: [name]
+  - name: images
+    slot_field: id
+    sets_alive: true
+    fields: [nsfwLevel]
+  - name: resources
+    slot_field: id
+    fields: [modelId]
+  - name: tools
+    slot_field: id
+    fields: [toolIds]
+  - name: techniques
+    slot_field: id
+    fields: [techniqueIds]
+  - name: metrics
+    source: clickhouse
+    query: "SELECT id, reactionCount FROM metrics"
+    slot_field: id
+    fields: [reactionCount]
+triggers: []
+"#;
+        FullSyncConfig::from_yaml(yaml).unwrap()
+    }
+
+    fn dumps_response_for(names: &[&str]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for name in names {
+            map.insert(
+                (*name).to_string(),
+                serde_json::json!({ "status": "Complete" }),
+            );
+        }
+        serde_json::json!({ "dumps": map })
+    }
+
+    #[test]
+    fn all_phases_complete_when_every_configured_phase_is_in_registry() {
+        let config = six_phase_config();
+        let owned_names: Vec<String> = config.dump_phases.iter().map(|p| p.dump_name()).collect();
+        let refs: Vec<&str> = owned_names.iter().map(|s| s.as_str()).collect();
+        let resp = dumps_response_for(&refs);
+        let completed_set = completed_dump_names(&resp);
+
+        assert!(all_phases_complete(&config.dump_phases, &completed_set));
+    }
+
+    #[test]
+    fn one_missing_phase_blocks_the_all_complete_short_circuit() {
+        // Reproduces the incident: the `metrics` phase never made it into
+        // the registry (e.g. it failed before PUT /dumps), so the registry
+        // only knows about the other five phases.
+        let config = six_phase_config();
+        let owned_names: Vec<String> = config
+            .dump_phases
+            .iter()
+            .filter(|p| p.name != "metrics")
+            .map(|p| p.dump_name())
+            .collect();
+        let refs: Vec<&str> = owned_names.iter().map(|s| s.as_str()).collect();
+        let resp = dumps_response_for(&refs);
+        let completed_set = completed_dump_names(&resp);
+
+        assert!(!all_phases_complete(&config.dump_phases, &completed_set));
+        // And the missing phase specifically is the one not covered.
+        let metrics_phase = config.dump_phases.iter().find(|p| p.name == "metrics").unwrap();
+        assert!(!completed_set.contains(&metrics_phase.dump_name()));
+        // The other five ARE covered — a per-phase loop should skip them
+        // and run only `metrics`.
+        for phase in config.dump_phases.iter().filter(|p| p.name != "metrics") {
+            assert!(completed_set.contains(&phase.dump_name()));
+        }
+    }
+
+    #[test]
+    fn no_phases_complete_when_registry_is_empty() {
+        let config = six_phase_config();
+        let completed_set = completed_dump_names(&serde_json::json!({ "dumps": {} }));
+        assert!(!all_phases_complete(&config.dump_phases, &completed_set));
+        assert!(completed_set.is_empty());
+    }
+
+    #[test]
+    fn empty_configured_phases_is_never_treated_as_all_complete() {
+        // Guards against a future refactor accidentally short-circuiting
+        // on an empty (misconfigured / not-yet-loaded) phase list.
+        let completed_set: HashSet<String> = HashSet::default();
+        assert!(!all_phases_complete(&[], &completed_set));
+    }
+
+    #[test]
+    fn completed_dump_names_ignores_non_complete_statuses() {
+        let resp = serde_json::json!({
+            "dumps": {
+                "images-aaaa1111": { "status": "Complete" },
+                "metrics-bbbb2222": { "status": "Failed", "error": "CH schema drift" },
+                "tools-cccc3333": { "status": "Loading" },
+            }
+        });
+        let completed = completed_dump_names(&resp);
+        assert_eq!(completed.len(), 1);
+        assert!(completed.contains("images-aaaa1111"));
+        assert!(!completed.contains("metrics-bbbb2222"));
+        assert!(!completed.contains("tools-cccc3333"));
     }
 }
