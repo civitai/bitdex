@@ -835,36 +835,43 @@ mod tests {
 // ClickHouse metrics download
 // ---------------------------------------------------------------------------
 
-/// Download all-time aggregate metrics from ClickHouse to a TSV file.
-/// Query: entityMetricDailyAgg grouped by entityId for entityType='Image'.
-/// Output: metrics.tsv in stage_dir (id\treactionCount\tcommentCount\tcollectedCount).
+/// Download aggregate metrics from ClickHouse to a `<phase_name>.tsv` file.
+///
+/// The SQL is supplied by the caller (the `query` field of the `clickhouse`
+/// dump phase in the sync config) rather than hardcoded, so ClickHouse schema
+/// changes are a ConfigMap edit + reconcile, not a rebuild. The query must
+/// SELECT the header columns the phase's field mappings expect
+/// (e.g. `imageId, reactionCount, commentCount, collectedCount`); the output
+/// format (`FORMAT TSVWithNames`) is appended here so the config query stays
+/// pure SQL.
+///
+/// Output: `<phase_name>.tsv` in `stage_dir`.
 pub async fn download_metrics_from_clickhouse(
     stage_dir: &std::path::Path,
+    phase_name: &str,
+    query: &str,
     ch_url: &str,
     ch_username: Option<&str>,
     ch_password: Option<&str>,
 ) -> Result<u64, String> {
-    let done_path = stage_dir.join("metrics.tsv.done");
+    let done_path = stage_dir.join(format!("{phase_name}.tsv.done"));
     if done_path.exists() {
-        eprintln!("metrics.tsv already downloaded (found .done marker)");
+        eprintln!("{phase_name}.tsv already downloaded (found .done marker)");
         return Ok(0);
     }
 
-    let csv_path = stage_dir.join("metrics.tsv");
+    let csv_path = stage_dir.join(format!("{phase_name}.tsv"));
     eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
 
-    let query = r#"SELECT
-        entityId as imageId,
-        sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
-        sumIf(total, metricType = 'Comment') as commentCount,
-        sumIf(total, metricType = 'Collection') as collectedCount
-    FROM entityMetricDailyAgg
-    WHERE entityType = 'Image'
-    GROUP BY entityId
-    FORMAT TSVWithNames"#;
+    // Append the output format to the config-provided SQL (trim a trailing
+    // semicolon so `<sql>;\nFORMAT ...` doesn't become a syntax error).
+    let full_query = format!(
+        "{}\nFORMAT TSVWithNames",
+        query.trim().trim_end_matches(';').trim_end()
+    );
 
     let http = reqwest::Client::new();
-    let mut req = http.post(ch_url).body(query.to_string());
+    let mut req = http.post(ch_url).body(full_query);
 
     if let Some(username) = ch_username {
         let password = ch_password.unwrap_or("");
