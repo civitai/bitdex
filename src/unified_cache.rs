@@ -2381,20 +2381,44 @@ impl UnifiedCache {
         if candidate_ids.is_empty() {
             return 0;
         }
+        // Resolve to the entries this pass is actually responsible for: bucket
+        // clause matches, but the entry does NOT sort by the bucket's own sort
+        // field (those are handled by evaluate_sort_work). Filtering here — off
+        // the entry locks — also lets us budget the per-slot work below.
+        let targets: Vec<UnifiedKey> = candidate_ids
+            .iter()
+            .filter_map(|id| self.meta_id_to_key.get(id).map(|k| k.value().clone()))
+            .filter(|key| key.sort_field.as_str() != bucket_sort_field)
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        // Work budget: this pass re-derives membership for `targets × changed`
+        // (slot_matches_filter per pair). Under a pathological batch (huge delete
+        // or a wide fan-out of sortAt changes) that product can spike the flush /
+        // worker cycle. When it would, fall back to marking the affected entries
+        // for rebuild — correctness-preserving (the next query re-derives from
+        // truth) and O(targets) instead of O(targets × changed).
+        const BUCKET_MAINT_WORK_BUDGET: u64 = 200_000;
+        let estimated = targets.len() as u64 * changed_slots.len();
+        if estimated > BUCKET_MAINT_WORK_BUDGET {
+            for key in &targets {
+                if let Some(r) = self.entries.get(key) {
+                    r.value().mark_for_rebuild();
+                }
+            }
+            self.invalidations.fetch_add(targets.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                "maintain_bucket_membership: bucket '{}' work {} > budget {} — marked {} entries for rebuild instead of inline maintenance",
+                bucket_name, estimated, BUCKET_MAINT_WORK_BUDGET, targets.len(),
+            );
+            return targets.len() as u64;
+        }
         let persistence = self.persistence_enabled.load(Ordering::Relaxed);
         let misses = std::sync::atomic::AtomicU64::new(0);
         let mut dirty_shards: HashSet<ShardKey> = HashSet::new();
         let mut modified_entries = 0u64;
-        for id in candidate_ids {
-            let key = match self.meta_id_to_key.get(&id) {
-                Some(k) => k.value().clone(),
-                None => continue,
-            };
-            // Entries sorted by the bucket's own sort field are maintained by
-            // evaluate_sort_work — skip to avoid double work.
-            if key.sort_field.as_str() == bucket_sort_field {
-                continue;
-            }
+        for key in targets {
             let mut r = match self.entries.get_mut(&key) {
                 Some(r) => r,
                 None => continue,
