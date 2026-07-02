@@ -2876,10 +2876,32 @@ fn slot_matches_clause_native(
                 .unwrap_or(false);
             !is_null
         }
-        FilterClause::BucketBitmap { bitmap, .. } => {
-            // The Arc<RoaringBitmap> is carried directly on the clause — no
-            // manager lookup needed.  Authoritative for this slot because the
-            // flush thread updates bucket bitmaps before enqueuing maintenance.
+        FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+            // Time-bucket clauses MUST re-resolve against the live
+            // `TimeBucketManager`. The `bitmap` Arc carried on the clause is
+            // frozen at cache-entry creation time — it is a point-in-time
+            // snapshot of the bucket. A slot that entered the window AFTER the
+            // entry was cached is inserted into the manager's bucket bitmap by
+            // the flush thread (which runs insert_slot before enqueuing this
+            // maintenance), but it is NOT in the frozen clause bitmap. Reading
+            // the frozen bitmap here made `evaluate_sort_work`'s add path reject
+            // every newly-arrived slot, so bucket-keyed entries (e.g. the hot
+            // sortAt-Desc + 24h-window feed) never gained new members via live
+            // maintenance and only self-corrected on rebuild — the ADD-side
+            // leak. Re-resolving via the manager (as the canonical
+            // `slot_matches_clause` bucket arm already does) makes the add fire.
+            //
+            // Prefilter-substituted buckets (field == "__prefilter") are static
+            // registry-resolved bitmaps, not tracked by the manager — the
+            // captured Arc is authoritative for those, so keep using it.
+            if field != "__prefilter" {
+                if let Some(mgr) = bucket_mgr {
+                    return mgr
+                        .get_bucket(bucket_name)
+                        .map(|b| b.bitmap().contains(slot))
+                        .unwrap_or(false);
+                }
+            }
             bitmap.contains(slot)
         }
     }
@@ -4807,6 +4829,110 @@ mod tests {
         assert!(
             !slot_matches_clause(99, &clause, &filters, &sorts, Some(&mgr)),
             "slot not in bucket should return false"
+        );
+    }
+
+    /// Regression for the ADD-side time-bucket cache leak: the native
+    /// FilterClause evaluator must resolve time-bucket clauses against the LIVE
+    /// TimeBucketManager, not the (frozen) bitmap Arc captured on the clause at
+    /// cache-entry creation time. A slot that entered the window after the entry
+    /// was cached is in the manager's bitmap but NOT in the frozen clause bitmap;
+    /// reading the frozen one made `evaluate_sort_work` reject every new slot, so
+    /// bucket-keyed entries never gained members without a full rebuild.
+    #[test]
+    fn test_native_bucket_reresolves_live_manager_add_side() {
+        use crate::query::FilterClause;
+        use roaring::RoaringBitmap;
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+
+        // Live manager: slot 5 has since entered the 24h window.
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+
+        // Frozen clause bitmap: captured before slot 5 arrived — does NOT
+        // contain it (simulate an empty snapshot from entry-creation time).
+        let stale = Arc::new(RoaringBitmap::new());
+        let clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAtUnix".to_string(),
+            bucket_name: "24h".to_string(),
+            bitmap: Arc::clone(&stale),
+        }];
+
+        // Live manager wins: slot 5 is in the bucket → matches, even though the
+        // frozen clause bitmap is empty.
+        assert!(
+            slot_matches_filter_native(
+                5, &clauses, &filters, &sorts, Some(&mgr), None, None, &misses
+            ),
+            "new slot in live bucket must match even though frozen clause bitmap is empty (add-side leak)"
+        );
+    }
+
+    /// The live manager is also authoritative on the REMOVE direction: a slot in
+    /// the (stale) frozen clause bitmap that has since left the window must NOT
+    /// match, so `evaluate_sort_work` can evict it.
+    #[test]
+    fn test_native_bucket_reresolves_live_manager_remove_side() {
+        use crate::query::FilterClause;
+        use roaring::RoaringBitmap;
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+
+        // Live manager: slot 99 is NOT in the window.
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+
+        // Frozen clause bitmap still contains 99 (stale from when it qualified).
+        let mut stale_bm = RoaringBitmap::new();
+        stale_bm.insert(99);
+        let clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAtUnix".to_string(),
+            bucket_name: "24h".to_string(),
+            bitmap: Arc::new(stale_bm),
+        }];
+
+        assert!(
+            !slot_matches_filter_native(
+                99, &clauses, &filters, &sorts, Some(&mgr), None, None, &misses
+            ),
+            "slot that left the window must not match despite the stale frozen bitmap"
+        );
+    }
+
+    /// Prefilter-substituted buckets (`field == "__prefilter"`) are static
+    /// registry-resolved bitmaps not tracked by the TimeBucketManager, so the
+    /// native evaluator must keep using the captured Arc for them.
+    #[test]
+    fn test_native_bucket_prefilter_uses_captured_bitmap() {
+        use crate::query::FilterClause;
+        use roaring::RoaringBitmap;
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+
+        // A manager exists but knows nothing about the prefilter name.
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+
+        let mut captured = RoaringBitmap::new();
+        captured.insert(7);
+        let clauses = vec![FilterClause::BucketBitmap {
+            field: "__prefilter".to_string(),
+            bucket_name: "some_prefilter".to_string(),
+            bitmap: Arc::new(captured),
+        }];
+
+        assert!(
+            slot_matches_filter_native(
+                7, &clauses, &filters, &sorts, Some(&mgr), None, None, &misses
+            ),
+            "prefilter bucket must use the captured bitmap (7 is present)"
+        );
+        assert!(
+            !slot_matches_filter_native(
+                8, &clauses, &filters, &sorts, Some(&mgr), None, None, &misses
+            ),
+            "prefilter bucket must use the captured bitmap (8 is absent)"
         );
     }
 
