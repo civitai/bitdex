@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use roaring::RoaringBitmap;
+
 use crate::concurrent_engine::InnerEngine;
 use crate::unified_cache::{
     evaluate_filter_work, evaluate_sort_work, UnifiedCache,
@@ -61,6 +63,12 @@ pub struct CacheWorkItem {
     /// True when alive mutations occurred — triggers tombstone_all_unloaded
     /// on unloaded entries (matches Phase A behavior).
     pub has_alive_mutations: bool,
+    /// Slots whose time-bucket membership may have changed this cycle (union of
+    /// new alive inserts, alive removes, and mutated bucket-sort-field slots).
+    /// The worker re-derives membership against the live bucket manager for
+    /// bucket-filtered entries sorted by a NON-bucket field (#274) — the case
+    /// `evaluate_sort_work` does not surface.
+    pub bucket_changed_slots: RoaringBitmap,
 }
 
 impl CacheWorkItem {
@@ -70,6 +78,7 @@ impl CacheWorkItem {
             && self.sort_mutations.is_empty()
             && self.alive_removes.is_empty()
             && !self.has_alive_mutations
+            && self.bucket_changed_slots.is_empty()
     }
 }
 
@@ -183,6 +192,7 @@ pub fn coalesce_work_items(items: impl IntoIterator<Item = CacheWorkItem>) -> Ca
         alive_removes: Vec::new(),
         mutated_filter_fields: HashSet::new(),
         has_alive_mutations: false,
+        bucket_changed_slots: RoaringBitmap::new(),
     };
 
     // First pass: concatenate.
@@ -200,6 +210,7 @@ pub fn coalesce_work_items(items: impl IntoIterator<Item = CacheWorkItem>) -> Ca
         alive_set.extend(item.alive_removes);
         merged.mutated_filter_fields.extend(item.mutated_filter_fields);
         merged.has_alive_mutations |= item.has_alive_mutations;
+        merged.bucket_changed_slots |= item.bucket_changed_slots;
     }
 
     // Second pass: dedup + cancel (insert ⊖ remove) within each key.
@@ -551,6 +562,31 @@ impl CacheWorker {
                 }
             }
 
+            // #274: bucket-membership maintenance for entries that FILTER on a
+            // time bucket but SORT by a NON-bucket field. `evaluate_sort_work`
+            // already covers entries whose sort field IS the bucket's sort field;
+            // this closes the gap for the rest by re-deriving membership of the
+            // changed slots against the authoritative (post-publish) `tb_ref`.
+            if !merged.bucket_changed_slots.is_empty() {
+                if let Some(tb) = tb_ref {
+                    let bucket_field = tb.field_name();
+                    let bucket_sort_field = tb.sort_field_name();
+                    for name in tb.bucket_names() {
+                        uc.maintain_bucket_membership(
+                            bucket_field,
+                            &name,
+                            bucket_sort_field,
+                            &merged.bucket_changed_slots,
+                            &snap.filters,
+                            &snap.sorts,
+                            tb_ref,
+                            sm_ref,
+                            Some(dict_ref),
+                        );
+                    }
+                }
+            }
+
             let over_budget = (filter_over_budget.len()
                 + sort_over_budget.len()
                 + filter_compound_too_large.len()
@@ -645,6 +681,7 @@ mod tests {
             alive_removes: Vec::new(),
             mutated_filter_fields: fields,
             has_alive_mutations: false,
+            bucket_changed_slots: RoaringBitmap::new(),
         }
     }
 
@@ -660,6 +697,7 @@ mod tests {
             alive_removes: Vec::new(),
             mutated_filter_fields: fields,
             has_alive_mutations: false,
+            bucket_changed_slots: RoaringBitmap::new(),
         }
     }
 
@@ -715,6 +753,7 @@ mod tests {
             alive_removes: Vec::new(),
             mutated_filter_fields: HashSet::new(),
             has_alive_mutations: false,
+            bucket_changed_slots: RoaringBitmap::new(),
         };
         a.sort_mutations
             .insert(field.clone(), [1u32, 2, 3].iter().copied().collect());
@@ -725,6 +764,7 @@ mod tests {
             alive_removes: Vec::new(),
             mutated_filter_fields: HashSet::new(),
             has_alive_mutations: false,
+            bucket_changed_slots: RoaringBitmap::new(),
         };
         b.sort_mutations
             .insert(field.clone(), [3u32, 4, 5].iter().copied().collect());
@@ -750,6 +790,7 @@ mod tests {
                 alive_removes: vec![1, 2, 3],
                 mutated_filter_fields: [Arc::<str>::from("a")].iter().cloned().collect(),
                 has_alive_mutations: true,
+                bucket_changed_slots: RoaringBitmap::new(),
             },
             CacheWorkItem {
                 filter_inserts: HashMap::new(),
@@ -758,6 +799,7 @@ mod tests {
                 alive_removes: vec![2, 4],
                 mutated_filter_fields: [Arc::<str>::from("b")].iter().cloned().collect(),
                 has_alive_mutations: false,
+                bucket_changed_slots: RoaringBitmap::new(),
             },
         ];
         let merged = coalesce_work_items(items);
