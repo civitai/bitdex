@@ -7,7 +7,7 @@
 //! This bypasses the serialized_size() accuracy problem in unified cache —
 //! real RSS is the eviction signal, not tracked byte counts.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 /// Memory pressure configuration.
 #[derive(Debug, Clone)]

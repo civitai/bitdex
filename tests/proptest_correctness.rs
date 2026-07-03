@@ -375,7 +375,6 @@ proptest! {
 // ===========================================================================
 // S1.7: VersionedBitmap property tests
 // ===========================================================================
-use std::sync::Arc;
 use bitdex_v2::versioned_bitmap::VersionedBitmap;
 use roaring::RoaringBitmap;
 /// Operation on a VersionedBitmap: insert or remove a bit.

@@ -64,6 +64,7 @@ fn populate(cache: &mut UnifiedCache, n_entries: usize) {
         });
     }
 }
+#[allow(dead_code)]
 struct Stats {
     min: u128, p50: u128, avg: u128, p95: u128, max: u128,
 }
@@ -79,6 +80,7 @@ fn stats(mut s: Vec<u128>) -> Stats {
     }
 }
 fn fmt(ns: u128) -> String { format!("{:8.3} ms", ns as f64 / 1_000_000.0) }
+#[allow(dead_code)]
 fn report(name: &str, s: &Stats) {
     println!("[{:30}] min={} p50={} avg={} p95={} max={}",
         name, fmt(s.min), fmt(s.p50), fmt(s.avg), fmt(s.p95), fmt(s.max));
@@ -149,6 +151,7 @@ fn test_bulk_vs_individual(batch_sizes: &[usize], iters: usize) {
 // We stub the expensive per-(entry,slot) ops with a fixed integer compare so
 // we can isolate the loop SHAPE cost. The inverted loop should be ~flat in
 // total entries; the current loop should grow linearly.
+#[allow(dead_code)]
 fn test_loop_scaling(entry_counts: &[usize], mut_slots: usize, iters: usize) {
     println!("\n=== Test 2: Loop-shape scaling ===");
     println!("Fixed mut_slots={}, vary total cache entries. Lower is better.\n", mut_slots);

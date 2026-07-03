@@ -13,7 +13,6 @@
 //! - `O: OpCodec<Snapshot = S::Snapshot>` — how to serialize/deserialize ops, tied to snapshot type
 //! - `Sh: ShardingStrategy` — how to map keys to shard file paths
 
-use ahash::AHashSet as HashSet;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::fmt;
@@ -306,6 +305,7 @@ pub(crate) fn crc32_of(data: &[u8]) -> u32 {
 }
 
 /// CRC-32 lookup table (IEEE polynomial 0xEDB88320).
+#[allow(dead_code)]
 static CRC32_TABLE: [u32; 256] = {
     let mut table = [0u32; 256];
     let mut i = 0u32;
@@ -440,6 +440,7 @@ pub(crate) fn is_valid_shard_file(path: &Path) -> bool {
 }
 
 /// Append ops bytes to an existing shard file and update the header's ops_count.
+#[allow(dead_code)]
 fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32) -> io::Result<()> {
     append_ops_to_shard_opts(path, new_ops_bytes, additional_count, true)
 }

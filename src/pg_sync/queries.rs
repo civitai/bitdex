@@ -246,7 +246,7 @@ pub async fn run_setup_v2(
                     Err(e) => eprintln!("WARNING: Failed to drop stale trigger {existing_name}: {e}"),
                 }
                 // Also drop the function
-                let func_name = existing_name.replace(
+                let _func_name = existing_name.replace(
                     &existing_name[existing_name.rfind('_').unwrap_or(existing_name.len())..],
                     &format!("_ops{}", &existing_name[existing_name.rfind('_').unwrap_or(existing_name.len())..]),
                 );

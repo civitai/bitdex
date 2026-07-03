@@ -44,6 +44,7 @@ const DEFAULT_CONFIG: &str = include_str!("../../bitdex.default.toml");
 struct Config {
     port: u16,
     data_dir: PathBuf,
+    #[allow(dead_code)]
     index: Option<String>,
     index_dir: Option<PathBuf>,
     rebuild: bool,

@@ -1679,7 +1679,7 @@ mod tests {
     #[test]
     fn test_range_scan_guardrail_rejects_when_over_cap() {
         // Field with cap of 5, but we'll insert 10 distinct values (slots 0-9).
-        let mut filters = make_guarded_filter_index(Some(5));
+        let filters = make_guarded_filter_index(Some(5));
         let field = filters.get_field("postId").unwrap();
         // Insert 10 distinct values (value k → slot k) to exceed the cap.
         for k in 0u64..10 {
@@ -1688,7 +1688,7 @@ mod tests {
         // Merge to move diffs to base so loaded_value_count is accurate.
         field.merge_dirty();
 
-        let h = TestHarness::new();
+        let _h = TestHarness::new();
         let slots = SlotAllocator::new();
         let sorts = SortIndex::new();
         let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
@@ -1709,14 +1709,14 @@ mod tests {
     #[test]
     fn test_range_scan_guardrail_allows_when_under_cap() {
         // Field with cap of 100; we insert only 5 distinct values — under cap.
-        let mut filters = make_guarded_filter_index(Some(100));
+        let filters = make_guarded_filter_index(Some(100));
         let field = filters.get_field("postId").unwrap();
         for k in 1u64..=5 {
             field.insert(k, k as u32);
         }
         field.merge_dirty();
 
-        let h = TestHarness::new();
+        let _h = TestHarness::new();
         let slots = SlotAllocator::new();
         let sorts = SortIndex::new();
         let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
@@ -1736,7 +1736,7 @@ mod tests {
     #[test]
     fn test_range_scan_guardrail_none_means_unbounded() {
         // Field with no cap (None = default, backwards compatible).
-        let mut filters = make_guarded_filter_index(None);
+        let filters = make_guarded_filter_index(None);
         let field = filters.get_field("postId").unwrap();
         // Insert 1000 distinct values — would fail with a cap of 500.
         for k in 0u64..1000 {
@@ -1744,7 +1744,7 @@ mod tests {
         }
         field.merge_dirty();
 
-        let h = TestHarness::new();
+        let _h = TestHarness::new();
         let slots = SlotAllocator::new();
         let sorts = SortIndex::new();
         let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);

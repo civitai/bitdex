@@ -16,7 +16,9 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "server")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use roaring::RoaringBitmap;

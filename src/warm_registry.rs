@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cache::CanonicalClause;
-use crate::query::{FilterClause, SortClause, SortDirection};
+use crate::query::{FilterClause, SortDirection};
 
 /// Maximum number of shapes to track in memory.
 const MAX_TRACKED_SHAPES: usize = 10_000;

@@ -692,7 +692,7 @@ impl ConcurrentEngine {
         // filter_invalidation, deadline, count_budget, rebuild_completed).
         let cache_worker_metrics: Arc<crate::cache_worker::CacheWorkerMetrics> =
             Arc::new(crate::cache_worker::CacheWorkerMetrics::default());
-        let mut uc = UnifiedCache::new(uc_config);
+        let uc = UnifiedCache::new(uc_config);
         // Initialize BoundStore for unified cache persistence
         let bound_store = if let Some(ref path) = config.storage.bitmap_path {
             let bounds_path = path.join("shardstore").join("bounds");
@@ -1672,6 +1672,7 @@ impl ConcurrentEngine {
                                     }
                                     // Anomaly classification helper. Closures don't need to
                                     // borrow bridge_opt because each call site reads it.
+                                    #[cfg(feature = "server")]
                                     let classify_anomaly = |ts: u64| -> Option<&'static str> {
                                         if ts == 0 {
                                             Some("zero")
@@ -1875,12 +1876,12 @@ impl ConcurrentEngine {
                             } else {
                             // Inline path (async_maintenance=false) — unchanged.
                             let t_phase_a = Instant::now();
-                            let mut ct_uc_entries: usize = 0;
+                            let ct_uc_entries: usize;
                             let mut ct_alive_removes: usize = 0;
-                            let mut ct_filter_work_items: usize = 0;
-                            let mut ct_filter_over_budget: usize = 0;
-                            let mut ct_sort_work_items: usize = 0;
-                            let mut ct_sort_over_budget: usize = 0;
+                            let ct_filter_work_items: usize;
+                            let ct_filter_over_budget: usize;
+                            let ct_sort_work_items: usize;
+                            let ct_sort_over_budget: usize;
                             // Phase A: Brief lock — collect work items and do cheap ops
                             let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
                                 let uc = &flush_unified_cache;
@@ -5231,7 +5232,7 @@ impl ConcurrentEngine {
                                 // Some bucket names are gone (bucket config changed, prefilter
                                 // evicted). Mark for rebuild so the next read re-forms correctly.
                                 tombstoned_unresolvable += 1;
-                                let mut entry = UnifiedEntry::from_restored(
+                                let entry = UnifiedEntry::from_restored(
                                     se.bitmap,
                                     se.entry_id,
                                     config.initial_capacity,
@@ -7523,7 +7524,6 @@ impl ConcurrentEngine {
         let uc = &self.unified_cache;
         let cache_entries = uc.stats().entries;
         let cache_bytes = uc.stats().memory_bytes;
-        drop(uc);
         let filter_details: Vec<(String, usize, usize)> = snap
             .filters
             .per_field_bytes()
@@ -8781,7 +8781,8 @@ impl ConcurrentEngine {
     /// cascade — in loading mode, staging refcount=1 so clone is cheap.
     ///
     /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
-    pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
+    #[allow(dead_code)]
+    pub(crate) fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
         // In loading mode, the flush thread doesn't publish snapshots, so the
         // ArcSwap holds the sole reference. Clone is O(num_fields) — just Arc
         // pointer copies, no deep bitmap clones.
@@ -10813,7 +10814,7 @@ mod tests {
         }
         // Phase 2: Create a NEW engine from the same config+paths and verify restoration
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             // Verify alive count restored
             assert_eq!(
@@ -10950,13 +10951,13 @@ mod tests {
         let config = test_config_with_bitmap_path(bitmap_path.clone());
         // Save snapshot of empty engine
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             engine.save_snapshot().unwrap();
         }
         // Restore from empty snapshot
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             assert_eq!(engine.alive_count(), 0, "empty snapshot should restore to 0 alive");
             assert_eq!(engine.slot_counter(), 0, "empty snapshot should restore counter to 0");
@@ -11000,7 +11001,7 @@ mod tests {
         }
         // Restore and verify
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             assert_eq!(engine.alive_count(), 2, "should have 2 alive after delete");
             let result = engine
@@ -11058,7 +11059,7 @@ mod tests {
         }
         // Restore and verify sort order is preserved
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             let sort = SortClause {
                 field: "reactionCount".to_string(),
@@ -11259,7 +11260,7 @@ mod tests {
         engine.save_and_unload().unwrap();
         // Mutate while fields are unloaded — directly at the data structure level
         {
-            let mut staging = engine.clone_staging();
+            let staging = engine.clone_staging();
             // Simulate a mutation: add nsfwLevel=1 for slot 10
             if let Some(field) = staging.filters.get_field("nsfwLevel") {
                 field.insert(1, 10);
@@ -11944,7 +11945,7 @@ mod tests {
         // Restore — nsfwLevel and reactionCount should be eagerly loaded (not pending).
         // onSite should still be pending (lazy).
         {
-            let mut engine =
+            let engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             // nsfwLevel should NOT be in pending_filter_loads (eagerly loaded)
             assert!(
@@ -12065,7 +12066,7 @@ mod tests {
     #[test]
     fn test_compaction_worker_e2e() {
         use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::{DocStoreV3, SlotHexShard};
+        use crate::shard_store_doc::SlotHexShard;
 
         // Use an on-disk docstore so ShardStore ops and compaction can run.
         let dir = tempfile::tempdir().unwrap();

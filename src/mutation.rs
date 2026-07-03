@@ -1427,7 +1427,7 @@ mod tests {
     }
     #[test]
     fn test_computed_sort_fresh_insert() {
-        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let (_slots, _filters, _sorts, config, _docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
         let mut fields = HashMap::new();
@@ -1453,7 +1453,7 @@ mod tests {
     }
     #[test]
     fn test_computed_sort_upsert_source_changes() {
-        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let (_slots, _filters, _sorts, config, _docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
         // Old doc: existedAt=100, publishedAt=200 → sortAt=200
@@ -1490,7 +1490,7 @@ mod tests {
     }
     #[test]
     fn test_computed_sort_no_change_when_sources_unchanged() {
-        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let (_slots, _filters, _sorts, config, _docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
         let mut old_fields = HashMap::new();
@@ -1512,7 +1512,7 @@ mod tests {
     }
     #[test]
     fn test_computed_sort_patch_updates_computed() {
-        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let (_slots, _filters, _sorts, config, _docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
         // Old doc with both source fields

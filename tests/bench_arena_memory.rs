@@ -12,7 +12,7 @@ use roaring::RoaringBitmap;
 fn get_rss_mb() -> f64 {
     #[cfg(windows)]
     {
-        use std::mem;
+        
         extern "system" {
             fn GetCurrentProcess() -> isize;
             fn K32GetProcessMemoryInfo(p: isize, c: *mut [u8; 80], s: u32) -> i32;

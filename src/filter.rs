@@ -736,7 +736,7 @@ mod tests {
     }
     #[test]
     fn test_insert_and_get() {
-        let mut field = FilterField::new(make_single_value_config("nsfwLevel"));
+        let field = FilterField::new(make_single_value_config("nsfwLevel"));
         field.insert(1, 100);
         field.insert(1, 200);
         field.insert(2, 300);
@@ -751,7 +751,7 @@ mod tests {
     }
     #[test]
     fn test_remove_specific_value() {
-        let mut field = FilterField::new(make_single_value_config("userId"));
+        let field = FilterField::new(make_single_value_config("userId"));
         field.insert(42, 10);
         field.insert(42, 20);
         field.insert(42, 30);
@@ -763,7 +763,7 @@ mod tests {
     }
     #[test]
     fn test_remove_last_cleans_up() {
-        let mut field = FilterField::new(make_single_value_config("status"));
+        let field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
         field.merge_all();
         field.remove(1, 10);
@@ -773,7 +773,7 @@ mod tests {
     }
     #[test]
     fn test_remove_from_all() {
-        let mut field = FilterField::new(make_multi_value_config("tagIds"));
+        let field = FilterField::new(make_multi_value_config("tagIds"));
         field.insert(100, 5);
         field.insert(200, 5);
         field.insert(300, 5);
@@ -788,7 +788,7 @@ mod tests {
     }
     #[test]
     fn test_multi_value_field() {
-        let mut field = FilterField::new(make_multi_value_config("tagIds"));
+        let field = FilterField::new(make_multi_value_config("tagIds"));
         // Document at slot 5 has tags 100, 200, 300
         field.insert(100, 5);
         field.insert(200, 5);
@@ -804,7 +804,7 @@ mod tests {
     }
     #[test]
     fn test_boolean_field() {
-        let mut field = FilterField::new(make_bool_config("onSite"));
+        let field = FilterField::new(make_bool_config("onSite"));
         field.insert(1, 10); // true
         field.insert(1, 20); // true
         field.insert(0, 30); // false
@@ -814,7 +814,7 @@ mod tests {
     }
     #[test]
     fn test_union() {
-        let mut field = FilterField::new(make_single_value_config("status"));
+        let field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
         field.insert(1, 20);
         field.insert(2, 30);
@@ -830,7 +830,7 @@ mod tests {
     }
     #[test]
     fn test_intersection() {
-        let mut field = FilterField::new(make_multi_value_config("tagIds"));
+        let field = FilterField::new(make_multi_value_config("tagIds"));
         // Slot 5 has tags 100, 200
         field.insert(100, 5);
         field.insert(200, 5);
@@ -846,7 +846,7 @@ mod tests {
     }
     #[test]
     fn test_intersection_missing_value() {
-        let mut field = FilterField::new(make_single_value_config("status"));
+        let field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
         field.merge_all();
         let result = field.intersection(&[1, 999]).unwrap();

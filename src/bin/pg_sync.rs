@@ -331,7 +331,7 @@ fn write_ready_marker(data_dir: &Path) {
 async fn run_boot_sequence(
     pool: &sqlx::PgPool,
     sync_config: &PgSyncConfig,
-    index_def: &IndexDefinition,
+    _index_def: &IndexDefinition,
     index_storage_dir: &Path,
     stage_dir: &Path,
     bitdex_client: &BitdexClient,
