@@ -211,6 +211,18 @@ pub async fn run_metrics_poller(
         cfg.backfill_chunk_secs,
     );
 
+    // Surface a large catch-up up front so it's never a silent mystery.
+    let behind = current_epoch_secs() - cursor;
+    if behind > cfg.reconcile_window_secs as i64 {
+        let chunks = (behind as u64).div_ceil(cfg.backfill_chunk_secs.max(1));
+        let est_wall_secs = chunks.saturating_mul(cfg.poll_interval_secs);
+        eprintln!(
+            "Metrics: cursor is {behind}s behind — backfilling in ~{chunks} chunk(s) of {}s, \
+             est. ~{est_wall_secs}s wall time before steady state",
+            cfg.backfill_chunk_secs,
+        );
+    }
+
     loop {
         ticker.tick().await;
 
@@ -313,6 +325,43 @@ pub async fn run_metrics_poller(
     }
 }
 
+/// Earliest plausible cursor: 2020-01-01Z. Anything older is treated as
+/// corrupt (a real anchor is always recent). Guards against a 0/garbage cursor
+/// making the backfill walk forward from ~1970 for months.
+const MIN_SANE_ANCHOR_EPOCH: i64 = 1_577_836_800;
+/// Tolerance for a cursor slightly ahead of `now` (minor clock skew is fine).
+const MAX_ANCHOR_FUTURE_SKEW_SECS: i64 = 300;
+
+/// Validate a starting anchor (persisted cursor or `BITDEX_METRICS_SINCE`) is a
+/// sane unix-epoch **seconds** value. Fails closed so an operator mistake surfaces
+/// as a startup error instead of a silent no-op or a months-long empty backfill.
+///
+/// - A future cursor would make `compute_window` treat the poller as caught-up
+///   and silently discard the requested backfill — and the classic slip is
+///   PUTting milliseconds (`1_782_864_000_000`) instead of seconds.
+/// - A pre-2020 cursor is almost certainly corrupt.
+fn validate_anchor(ts: i64, now: i64, source: &str) -> Result<(), String> {
+    if ts > now + MAX_ANCHOR_FUTURE_SKEW_SECS {
+        let ms_hint = if ts > 100_000_000_000 {
+            " — this looks like MILLISECONDS; use unix-epoch SECONDS"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "{source}={ts} is in the future (now={now}){ms_hint}. A future anchor would \
+             silently cancel the backfill. Refusing to start."
+        ));
+    }
+    if ts < MIN_SANE_ANCHOR_EPOCH {
+        return Err(format!(
+            "{source}={ts} is older than 2020-01-01 ({MIN_SANE_ANCHOR_EPOCH}) — almost \
+             certainly corrupt. A real anchor is recent; refusing to start rather than \
+             backfill forward from the distant past."
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the starting `since_ts` for the poller loop.
 ///
 /// Behavior:
@@ -331,10 +380,12 @@ async fn resolve_initial_since(
     cursor_name: &str,
     reconcile_window_secs: u64,
 ) -> Result<i64, String> {
+    let now = current_epoch_secs();
     // Try persisted cursor first (must distinguish 404 → None from transient error → Err).
     match bitdex_client.get_cursor(cursor_name).await? {
         Some(s) => match s.trim().parse::<i64>() {
             Ok(ts) if ts > 0 => {
+                validate_anchor(ts, now, &format!("persisted cursor {cursor_name}"))?;
                 eprintln!("Metrics: resumed from persisted cursor (since_ts={ts})");
                 Ok(ts)
             }
@@ -362,6 +413,7 @@ async fn resolve_initial_since(
                         "{METRICS_SINCE_ENV}={ts} must be > 0. Either fix or unset the env var."
                     ));
                 }
+                validate_anchor(ts, now, METRICS_SINCE_ENV)?;
                 eprintln!("Metrics: cold start, {METRICS_SINCE_ENV}={ts} override active");
                 return Ok(ts);
             }
@@ -943,6 +995,25 @@ mod tests {
         let q = build_reconcile_query(&cfg, 0, 1).unwrap();
         assert!(q.contains("metricType IN ('ReactionLike','ReactionHeart')"));
         assert!(q.contains("metricType IN ('commentCount')"), "comment group still one value");
+    }
+
+    #[test]
+    fn anchor_validation_accepts_sane_and_rejects_bad() {
+        let now = 1_783_040_000; // ~2026-07-03
+        // Legit recovery anchor (~2 days old) — accepted.
+        assert!(validate_anchor(1_782_864_000, now, "test").is_ok());
+        // Recent cursor — accepted.
+        assert!(validate_anchor(now - 100, now, "test").is_ok());
+        // Slight future within skew — accepted.
+        assert!(validate_anchor(now + 100, now, "test").is_ok());
+        // Future beyond skew — rejected.
+        assert!(validate_anchor(now + 10_000, now, "test").is_err());
+        // Milliseconds fat-finger — rejected, and the message calls it out.
+        let e = validate_anchor(1_782_864_000_000, now, "test").unwrap_err();
+        assert!(e.contains("MILLISECONDS"), "got: {e}");
+        // Zero / pre-2020 corrupt — rejected.
+        assert!(validate_anchor(0, now, "test").is_err());
+        assert!(validate_anchor(1_000_000_000, now, "test").is_err());
     }
 
     #[test]
