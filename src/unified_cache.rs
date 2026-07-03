@@ -1049,6 +1049,15 @@ impl UnifiedCache {
             }
         }
     }
+    /// Seed `bucket_cutoff` on a just-created entry, bypassing hit/miss
+    /// counters and the `needs_rebuild`/TTL gates in `lookup` — this is
+    /// entry-creation follow-up, not a real cache access. No-op if the entry
+    /// is gone (evicted between creation and seeding).
+    pub fn set_entry_bucket_cutoff(&self, key: &UnifiedKey, cutoff: u64) {
+        if let Some(mut entry) = self.entries.get_mut(key) {
+            entry.value_mut().set_bucket_cutoff(cutoff);
+        }
+    }
     /// Look up a cache entry for read-only access. Returns `None` on miss.
     /// Increments hit/miss counters and refreshes LRU via atomics — no mutation
     /// of the entry itself, so the per-shard read lock is taken (concurrent
@@ -1239,13 +1248,17 @@ impl UnifiedCache {
             value_fn,
         );
         entry.set_uses_bucket(uses_bucket);
-        if uses_bucket {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            entry.set_bucket_cutoff(now);
-        }
+        // `bucket_cutoff` must live in the same *snapped* scale as
+        // `PendingBucketDiffs::current_cutoff()` (`snap(now - duration,
+        // refresh_interval)` — see `time_buckets.rs::TimeBucket::last_cutoff`),
+        // not raw wall-clock time. `UnifiedCache` has no visibility into the
+        // live pending-diffs cutoff, so it leaves `bucket_cutoff` at its
+        // zeroed default here; the caller (which does have that state) is
+        // responsible for seeding the real value via `set_bucket_cutoff`
+        // right after this call returns. Stamping wall-clock `now()` here
+        // used to make the read-path diff-apply check
+        // (`entry.bucket_cutoff() < pending.current_cutoff()`) structurally
+        // false for the entry's entire life — see bucket_window_slide leak.
         self.store(key, entry)
     }
 

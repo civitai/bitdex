@@ -4886,6 +4886,29 @@ impl ConcurrentEngine {
             FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => {}
         }
     }
+    /// Seed a freshly-created cache entry's `bucket_cutoff` with the live
+    /// `PendingBucketDiffs` cutoff instead of wall-clock time.
+    ///
+    /// `bucket_cutoff` must live in the same *snapped* scale as
+    /// `PendingBucketDiffs::current_cutoff()` (`snap(now - duration,
+    /// refresh_interval)` — see `time_buckets.rs::TimeBucket::last_cutoff`).
+    /// `UnifiedCache::form_and_store_with_clauses` has no visibility into
+    /// pending-diffs state, so it leaves `bucket_cutoff` zeroed; this is the
+    /// follow-up every production entry-creation path must call. Stamping
+    /// wall-clock `now()` instead (the old behavior) made the read-path
+    /// diff-apply check (`entry.bucket_cutoff() < pending.current_cutoff()`)
+    /// structurally false for the entry's entire life, since
+    /// `pending.current_cutoff()` trails `now()` by `duration_secs` — the
+    /// window-slide removal path was silently dead for every freshly formed
+    /// or restored bucket-filtered cache entry.
+    ///
+    /// No-op if the key's filter clauses don't use a time-bucket clause.
+    fn seed_bucket_cutoff(&self, ukey: &UnifiedKey) {
+        if ukey.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause) {
+            let cutoff = self.pending_bucket_diffs.load().current_cutoff();
+            self.unified_cache.set_entry_bucket_cutoff(ukey, cutoff);
+        }
+    }
     /// Execute a parsed BitdexQuery.
     /// Trigger background loading of a pending cache shard from disk.
     /// Non-blocking: sets loading sentinel and spawns a background thread.
@@ -4912,13 +4935,14 @@ impl ConcurrentEngine {
             let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
             let time_buckets_clone = self.time_buckets.as_ref().map(Arc::clone);
             let prefilter_registry_clone = Arc::clone(&self.prefilter_registry);
+            let pending_bucket_diffs_clone = Arc::clone(&self.pending_bucket_diffs);
             std::thread::Builder::new()
                 .name(format!("shard-load-{}_{:?}", sort_field, direction))
                 .spawn(move || {
                     Self::load_shard_background(
                         &bs, &uc_arc, &inner, &sort_field, direction,
                         &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
-                        time_buckets_clone, prefilter_registry_clone,
+                        time_buckets_clone, prefilter_registry_clone, &pending_bucket_diffs_clone,
                     );
                 })
                 .map_err(|e| {
@@ -4940,6 +4964,7 @@ impl ConcurrentEngine {
         boundstore_entries_skipped: &Arc<AtomicU64>,
         time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
         prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
+        pending_bucket_diffs: &Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
     ) {
             let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
@@ -5040,11 +5065,11 @@ impl ConcurrentEngine {
                         let restored_uses_bucket = key.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
                         entry.set_uses_bucket(restored_uses_bucket);
                         if restored_uses_bucket {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            entry.set_bucket_cutoff(now);
+                            // Must match PendingBucketDiffs' snapped-cutoff
+                            // scale — see `seed_bucket_cutoff` doc comment.
+                            // Wall-clock now() here permanently defeated the
+                            // read-path window-slide diff for restored shards.
+                            entry.set_bucket_cutoff(pending_bucket_diffs.load().current_cutoff());
                         }
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
@@ -5870,6 +5895,7 @@ impl ConcurrentEngine {
             }
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
+                let ukey_for_seed = ukey.clone();
                 self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
@@ -5878,6 +5904,7 @@ impl ConcurrentEngine {
                     Arc::clone(&original_clauses),
                     value_fn,
                 );
+                self.seed_bucket_cutoff(&ukey_for_seed);
                 let mut result = QueryResult {
                     ids: vec![],
                     total_matched: full_total_matched,
@@ -5933,11 +5960,11 @@ impl ConcurrentEngine {
             );
             new_entry.set_uses_bucket(uses_bucket);
             if uses_bucket {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                new_entry.set_bucket_cutoff(now);
+                // Must match PendingBucketDiffs' snapped-cutoff scale (see
+                // `seed_bucket_cutoff` doc comment) — wall-clock `now()`
+                // permanently defeats the read-path window-slide diff.
+                let cutoff = self.pending_bucket_diffs.load().current_cutoff();
+                new_entry.set_bucket_cutoff(cutoff);
             }
             // Brief lock 2: insert prebuilt entry + grab sorted_keys for
             // the immediate read.
@@ -6249,6 +6276,7 @@ impl ConcurrentEngine {
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };
+                let ukey_for_seed = ukey.clone();
                 self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
@@ -6257,6 +6285,7 @@ impl ConcurrentEngine {
                     Arc::clone(&original_clauses),
                     value_fn,
                 );
+                self.seed_bucket_cutoff(&ukey_for_seed);
                 let result = QueryResult {
                     ids: vec![],
                     total_matched: full_total_matched,
@@ -6297,6 +6326,7 @@ impl ConcurrentEngine {
                 Arc::clone(&original_clauses),
                 value_fn,
             );
+            self.seed_bucket_cutoff(&ukey);
             let cache_elapsed = t0.elapsed();
             tracing::debug!(
                 "  slow_path: cache_form={:.1}ms, total_slow={:.1}ms",
