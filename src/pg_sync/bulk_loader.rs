@@ -417,6 +417,7 @@ const FINALIZE_CHUNK_SIZE: u32 = 65_536;
 ///
 /// Processes alive slots in 65K-block chunks aligned to roaring container
 /// boundaries for efficient `bitmap.range()` iteration.
+#[allow(dead_code)]
 fn finalize_from_bitmaps(
     bulk_writer: &crate::shard_store_doc::ShardStoreBulkWriter,
     schema: &crate::config::DataSchema,
@@ -610,6 +611,7 @@ fn scalars_to_json(
 ///
 /// Returns the number of bitmaps that were modified (had orphan bits stripped).
 /// This enforces the clean bitmap invariant: filter bitmaps must be subsets of alive.
+#[allow(dead_code)]
 fn cleanup_orphan_bitmaps(accum: &mut BitmapAccum, alive: &RoaringBitmap) -> usize {
     let mut cleaned = 0;
     for value_map in accum.filter_maps.values_mut() {

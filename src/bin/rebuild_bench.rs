@@ -19,7 +19,6 @@ use roaring::RoaringBitmap;
 
 use bitdex_v2::shard_store_doc::{DocStoreV3, PackedValue, StoredDoc};
 use bitdex_v2::mutation::{value_to_bitmap_key, value_to_sort_u32};
-use bitdex_v2::query::Value;
 
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
@@ -56,6 +55,7 @@ fn parse_args() -> BenchConfig {
 }
 
 /// Count total shards by scanning the shard directory.
+#[allow(dead_code)]
 fn count_shards(docs_path: &Path) -> u32 {
     let shards_dir = docs_path.join("shards");
     let mut count = 0u32;
@@ -312,7 +312,7 @@ fn bench_single_field_rebuild(
         field_name, if is_sort { "sort" } else { "filter" });
 
     let reader = DocStoreV3::open(docs_path).expect("open docstore");
-    let docs_processed = AtomicU64::new(0);
+    let _docs_processed = AtomicU64::new(0);
 
     let chunk_size = 500u32;
     let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
@@ -577,10 +577,10 @@ fn bench_selective_decode(
     eprintln!("  Target fields: {:?}", target_fields);
 
     let reader = DocStoreV3::open(docs_path).expect("open docstore");
-    let field_to_idx = &reader;
+    let _field_to_idx = &reader;
 
     // We'll read raw shard bytes and decode only needed fields
-    let docs_processed = AtomicU64::new(0);
+    let _docs_processed = AtomicU64::new(0);
 
     let t0 = Instant::now();
 
@@ -601,7 +601,7 @@ fn bench_selective_decode(
                     Ok(d) => d,
                     Err(_) => continue,
                 };
-                for (slot_id, doc) in &docs {
+                for (_slot_id, doc) in &docs {
                     // Only access target fields — simulates selective decode
                     for &fname in target_fields {
                         let _ = doc.fields.get(fname);
@@ -808,7 +808,7 @@ fn run_full_build(data_dir: &Path, index_name: &str) {
     });
 
     eprintln!("Starting build...");
-    let t0 = Instant::now();
+    let _t0 = Instant::now();
 
     let (total_docs, elapsed) = engine.build_all_from_docstore(
         progress.clone(),
@@ -903,7 +903,7 @@ fn run_add_field(data_dir: &Path, index_name: &str, field_name: &str) {
     let bitmap_path = index_dir.join("bitmaps");
     config.storage.bitmap_path = Some(bitmap_path.clone());
 
-    let rss_before = get_rss_bytes();
+    let _rss_before = get_rss_bytes();
 
     let engine = ConcurrentEngine::new_with_path(config, &docs_path)
         .expect("create engine");
@@ -911,7 +911,7 @@ fn run_add_field(data_dir: &Path, index_name: &str, field_name: &str) {
     // Full build without the target field
     eprintln!("\n--- Phase 1: Full build (without '{}') ---", field_name);
     let progress = std::sync::Arc::new(AtomicU64::new(0));
-    let t_build = Instant::now();
+    let _t_build = Instant::now();
     let (total_docs, build_elapsed) = engine.build_all_from_docstore(
         progress.clone(),
         None,

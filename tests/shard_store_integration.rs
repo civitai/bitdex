@@ -8,12 +8,9 @@
 //! Tests are designed to be pluggable — they use the public ShardStore API
 //! and don't depend on ConcurrentEngine wiring.
 
-use std::collections::HashMap;
 use std::io::Read;
 
-use roaring::RoaringBitmap;
 
-use bitdex_v2::shard_store::ShardHeader;
 use bitdex_v2::shard_store_doc::*;
 use bitdex_v2::shard_store_bitmap::*;
 

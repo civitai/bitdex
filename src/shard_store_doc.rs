@@ -202,6 +202,7 @@ const PV_TAG_NULL: u8 = 0x07;
 
 /// Write a DocOp::Merge header: [tag][slot:u32][num_fields:u16].
 /// Caller follows with one write_field_* call per field.
+#[allow(dead_code)]
 pub(crate) fn write_merge_header(slot: u32, num_fields: u16, buf: &mut Vec<u8>) {
     buf.push(OP_TAG_MERGE);
     buf.extend_from_slice(&slot.to_le_bytes());
@@ -209,6 +210,7 @@ pub(crate) fn write_merge_header(slot: u32, num_fields: u16, buf: &mut Vec<u8>) 
 }
 
 /// Write a (field_idx, i64) pair: [field:u16][PV_TAG_I][i64 LE].
+#[allow(dead_code)]
 pub(crate) fn write_field_int(field: u16, value: i64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&field.to_le_bytes());
     buf.push(PV_TAG_I);
@@ -216,6 +218,7 @@ pub(crate) fn write_field_int(field: u16, value: i64, buf: &mut Vec<u8>) {
 }
 
 /// Write a (field_idx, bool) pair: [field:u16][PV_TAG_B][u8].
+#[allow(dead_code)]
 pub(crate) fn write_field_bool(field: u16, value: bool, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&field.to_le_bytes());
     buf.push(PV_TAG_B);
@@ -224,6 +227,7 @@ pub(crate) fn write_field_bool(field: u16, value: bool, buf: &mut Vec<u8>) {
 
 /// Write a (field_idx, &str) pair: [field:u16][PV_TAG_S][len:u32 LE][bytes].
 /// Zero-copy — borrows from caller's string slice.
+#[allow(dead_code)]
 pub(crate) fn write_field_str(field: u16, value: &str, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&field.to_le_bytes());
     buf.push(PV_TAG_S);
@@ -232,6 +236,7 @@ pub(crate) fn write_field_str(field: u16, value: &str, buf: &mut Vec<u8>) {
 }
 
 /// Write a (field_idx, &[i64]) pair: [field:u16][PV_TAG_MI][len:u32 LE][i64 LE...].
+#[allow(dead_code)]
 pub(crate) fn write_field_multi_int(field: u16, values: &[i64], buf: &mut Vec<u8>) {
     buf.extend_from_slice(&field.to_le_bytes());
     buf.push(PV_TAG_MI);
@@ -2245,7 +2250,7 @@ impl StreamingDocWriter {
         }
 
         // Check if a valid shard file already exists (e.g., from a previous phase)
-        let (file, existing_ops) = if path.exists() {
+        let (_file, _existing_ops) = if path.exists() {
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.len() >= crate::shard_store::HEADER_SIZE as u64 => {
                     // Try to open and validate existing file
@@ -2412,7 +2417,7 @@ mod tests {
             })).unwrap();
 
             let field_names: Vec<String> = schema.fields.iter().map(|f| f.target.clone()).collect();
-            let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+            let _writer = ds.prepare_streaming_writer(&field_names).unwrap();
 
             // Set defaults AFTER preparing writer (matches production: set_docstore_defaults
             // is called after engine creation, and prepare_streaming_writer inherits defaults)
@@ -2587,7 +2592,6 @@ mod tests {
     fn test_streaming_writer_shard_file_format_diagnostic() {
         // Diagnostic test: write via StreamingDocWriter, then raw-read the shard file
         // to verify the binary format matches what ShardStore expects.
-        use std::io::Read;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");

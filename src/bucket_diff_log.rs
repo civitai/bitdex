@@ -15,8 +15,8 @@
 //! Atomic rewrite (write tmp + rename) when entry count exceeds
 //! `max_diffs * (1 + compaction_threshold_pct)`.
 
-use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;

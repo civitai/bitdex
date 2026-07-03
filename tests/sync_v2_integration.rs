@@ -12,8 +12,8 @@ use tempfile::TempDir;
 use bitdex_v2::ops_wal::{WalReader, WalWriter};
 use bitdex_v2::pg_sync::op_dedup::dedup_ops;
 use bitdex_v2::pg_sync::ops::{EntityOps, Op, OpsBatch, SyncMeta};
-use bitdex_v2::pg_sync::dump::{DumpRegistry, DumpStatus, dump_name, config_hash};
-use bitdex_v2::pg_sync::trigger_gen::{SyncConfig, SyncSource, generate_trigger_sql};
+use bitdex_v2::pg_sync::dump::{DumpRegistry, dump_name, config_hash};
+use bitdex_v2::pg_sync::trigger_gen::{SyncConfig, generate_trigger_sql};
 
 // ── WAL Pipeline Integration ──
 

@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
+#[cfg(test)]
 use crate::shard_store_doc::PackedValue;
+#[cfg(test)]
 use crate::shard_store_doc::StreamingDocWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
@@ -104,6 +106,7 @@ impl RowTimings {
 /// Helper macro to time a block and accumulate into RowTimings field.
 /// No-op when dump-timing feature is off.
 #[cfg(feature = "dump-timing")]
+#[allow(unused_macros)]
 macro_rules! time_block {
     ($timings:expr, $field:ident, $block:expr) => {{
         let _t_start = std::time::Instant::now();
@@ -114,6 +117,7 @@ macro_rules! time_block {
 }
 
 #[cfg(not(feature = "dump-timing"))]
+#[allow(unused_macros)]
 macro_rules! time_block {
     ($timings:expr, $field:ident, $block:expr) => { $block };
 }
@@ -1001,6 +1005,7 @@ fn parse_field_to_str<'a>(bytes: &'a [u8]) -> Option<&'a str> {
 /// Extracts two integer columns by index without allocating a Vec of fields.
 /// Returns (slot_value, value_value) as (u32, i64).
 #[inline]
+#[allow(dead_code)]
 fn parse_two_cols_fast(line: &[u8], delimiter: u8, slot_idx: usize, value_idx: usize) -> Option<(u32, i64)> {
     let max_idx = slot_idx.max(value_idx);
     let mut col = 0;
@@ -4140,7 +4145,6 @@ mod tests {
     #[test]
     fn test_boolean_coercion_in_docstore_write() {
         use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4204,7 +4208,6 @@ mod tests {
     #[test]
     fn test_extra_i64_fields_in_docstore_write() {
         use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();

@@ -5378,10 +5378,13 @@ fn read_rss_all() -> RssReading {
 /// The walk holds the kernel's `mmap_lock` for read across all VMAs
 /// (~500-2000 at our thread count); throttling avoids contention with
 /// concurrent mmap/munmap on the hot path.
+#[allow(dead_code)]
 static MMAP_INVENTORY_LAST_REFRESH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[allow(dead_code)]
 static MMAP_INVENTORY_CACHE: parking_lot::Mutex<Vec<(&'static str, u64)>> =
     parking_lot::Mutex::new(Vec::new());
+#[allow(dead_code)]
 const MMAP_INVENTORY_REFRESH_SECS: u64 = 150;
 
 /// Mmap inventory by kind. Sums file-backed VMA lengths bucketed by path
@@ -6257,6 +6260,7 @@ async fn handle_clear_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoRespo
 //      full dump pipeline.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "pg-sync")]
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RedumpBody {
@@ -6436,6 +6440,7 @@ async fn handle_redump(
 /// All paths are bounded under `data_dir` — every entry to delete is
 /// resolved relative to `data_dir` and the helper never recurses
 /// outside it.
+#[cfg(feature = "pg-sync")]
 fn wipe_index_data_for_redump(
     data_dir: &std::path::Path,
     index_name: &str,

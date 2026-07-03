@@ -435,7 +435,7 @@ impl BitdexClient {
             let dump_map = dumps.get("dumps").and_then(|d| d.as_object());
 
             let mut all_complete = true;
-            let mut any_failed = false;
+            let any_failed = false;
 
             for name in dump_names {
                 if let Some(map) = &dump_map {
@@ -444,7 +444,6 @@ impl BitdexClient {
                         match status {
                             "Complete" => {}
                             "Failed" => {
-                                any_failed = true;
                                 let err = entry.get("status")
                                     .and_then(|s| s.get("Failed"))
                                     .and_then(|s| s.as_str())

@@ -11,7 +11,6 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Path, State};
@@ -57,7 +56,7 @@ pub async fn handle_events(
     };
 
     let rx = handle.sender.subscribe();
-    let keep_alive = Duration::from_secs(handle.keep_alive_seconds);
+    let _keep_alive = Duration::from_secs(handle.keep_alive_seconds);
     let metrics = state.metrics.clone();
     let channel_name = channel.clone();
 

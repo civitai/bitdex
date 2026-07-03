@@ -38,6 +38,7 @@ impl CaptureSink for NullSink {
 /// flush + close + fsync before exiting.
 pub struct CaptureManager {
     shutdown: tokio::sync::broadcast::Sender<()>,
+    #[allow(dead_code)]
     handles: Vec<tokio::task::JoinHandle<()>>,
     config: CaptureConfig,
 }

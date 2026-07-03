@@ -1258,7 +1258,7 @@ mod tests {
         let key_bytes = rmp_serde::to_vec(&filter_clauses_v1).unwrap();
         let sort_field = b"sortAt";
         let mut bm_buf = Vec::new();
-        let mut tombstones = RoaringBitmap::new();
+        let tombstones = RoaringBitmap::new();
         tombstones.serialize_into(&mut bm_buf).unwrap();
 
         let mut buf = Vec::new();

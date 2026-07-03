@@ -15,7 +15,7 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// DashMap with the project's standard ahash hasher.
 type AHashMap2<K, V> = DashMap<K, V, ahash::RandomState>;
@@ -3437,7 +3437,7 @@ mod tests {
     }
     #[test]
     fn test_store_and_exact_hit() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3447,13 +3447,13 @@ mod tests {
     }
     #[test]
     fn test_miss_returns_none() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         assert!(cache.lookup(&key).is_none());
     }
     #[test]
     fn test_different_sort_different_entry() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let key2 = make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
@@ -3465,7 +3465,7 @@ mod tests {
     }
     #[test]
     fn test_different_direction_different_entry() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key_desc = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let key_asc = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Asc);
         let slots: Vec<u32> = (0..50).collect();
@@ -3475,7 +3475,7 @@ mod tests {
     }
     #[test]
     fn test_lru_eviction_at_capacity() {
-        let mut cache = UnifiedCache::new(make_config()); // max_entries = 5
+        let cache = UnifiedCache::new(make_config()); // max_entries = 5
         let slots: Vec<u32> = (0..10).collect();
         // Fill to capacity
         for i in 0..5 {
@@ -3491,7 +3491,7 @@ mod tests {
         // regardless of how fast the test loop runs (sampled-LRU is random
         // when all timestamps are equal, making the test flaky otherwise).
         let key0 = make_key(&[("field", "eq", "0")], "sort", SortDirection::Desc);
-        if let Some(mut e) = cache.get_mut(&key0) {
+        if let Some(e) = cache.get_mut(&key0) {
             e.last_used.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         // Touch entries 1-4 to make entry 0 the LRU
@@ -3517,7 +3517,7 @@ mod tests {
             max_capacity: 100,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         // Provide 50 slots but capacity is 10
         let slots: Vec<u32> = (0..50).collect();
@@ -3534,7 +3534,7 @@ mod tests {
             max_capacity: 80,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         // Initial formation with 10 slots
         let slots: Vec<u32> = (0..10).collect();
@@ -3555,7 +3555,7 @@ mod tests {
             max_capacity: 20,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3576,7 +3576,7 @@ mod tests {
             max_capacity: 1600,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..100).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3595,7 +3595,7 @@ mod tests {
             max_capacity: 100,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3610,7 +3610,7 @@ mod tests {
     #[test]
     fn test_sort_qualification_desc() {
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         // Slots with values: 0->1000, 1->999, ..., 49->951
         let slots: Vec<u32> = (0..50).collect();
@@ -3626,7 +3626,7 @@ mod tests {
     #[test]
     fn test_sort_qualification_asc() {
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Asc);
         // Slots with ascending values: 0->0, 1->1, ..., 49->49
         let slots: Vec<u32> = (0..50).collect();
@@ -3646,7 +3646,7 @@ mod tests {
             max_capacity: 100,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3660,7 +3660,7 @@ mod tests {
     #[test]
     fn test_rebuild_guard() {
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3677,7 +3677,7 @@ mod tests {
     #[test]
     fn test_needs_rebuild_triggers_slow_path_on_read() {
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3699,7 +3699,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let metrics = Arc::new(CacheWorkerMetrics::default());
         cache.set_rebuild_metrics(Arc::clone(&metrics));
         let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
@@ -3739,7 +3739,7 @@ mod tests {
     #[test]
     fn test_concurrent_slow_path_single_flight() {
         let config = make_config();
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         // No entry — first call proceeds normally.
@@ -3773,7 +3773,7 @@ mod tests {
     }
     #[test]
     fn test_clear() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key, &slots, true, 100_000, |s| s);
@@ -3784,7 +3784,7 @@ mod tests {
     }
     #[test]
     fn test_overwrite_existing_entry() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots1: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots1, true, 100_000, |s| 1000 - s);
@@ -3797,7 +3797,7 @@ mod tests {
     }
     #[test]
     fn test_meta_index_registration() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(
             &[("nsfwLevel", "eq", "1"), ("type", "eq", "image")],
             "reactionCount",
@@ -3821,7 +3821,7 @@ mod tests {
             max_entries: 2,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
         // Add two entries
         let key1 = make_key(&[("field", "eq", "1")], "sort", SortDirection::Desc);
@@ -3851,7 +3851,7 @@ mod tests {
             max_capacity: 160,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3862,7 +3862,7 @@ mod tests {
     }
     #[test]
     fn test_empty_formation() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         cache.form_and_store(key.clone(), &[], false, 0, |_| 0);
         let entry = cache.get(&key).unwrap();
@@ -3872,7 +3872,7 @@ mod tests {
     }
     #[test]
     fn test_add_and_remove_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -3887,7 +3887,7 @@ mod tests {
     }
     #[test]
     fn test_meta_index_all_clause_types() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Register entry with diverse clause types: eq, noteq, gte, in, and compound
         let key = UnifiedKey {
             filter_clauses: vec![
@@ -3930,7 +3930,7 @@ mod tests {
     }
     #[test]
     fn test_meta_index_range_and_lt_clauses() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![
                 CanonicalClause {
@@ -3963,7 +3963,7 @@ mod tests {
             max_capacity: 100,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         // Values: slot 0 -> 1000, slot 1 -> 999, ..., slot 4 -> 996
         let slots: Vec<u32> = (0..5).collect();
@@ -3985,7 +3985,7 @@ mod tests {
             max_capacity: 100,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4009,7 +4009,7 @@ mod tests {
             max_capacity: 20,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4035,7 +4035,7 @@ mod tests {
             max_capacity: 10,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4100,7 +4100,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_filter_insert_adds_qualifying_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry: Eq(nsfwLevel, 1), sort by reactionCount Desc
         // Initial slots 0..5, sort values: 0->1000, 1->999, ...
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
@@ -4126,7 +4126,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_filter_remove_removes_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4149,7 +4149,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_filter_does_not_add_sort_unqualified() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry with min_tracked_value = 951 (Desc, slot 49 has value 951)
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
@@ -4173,7 +4173,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_filter_multi_clause_entry() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry: Eq(nsfwLevel, 1) AND Eq(type, 2)
         let key = make_key(
             &[("nsfwLevel", "eq", "1"), ("type", "eq", "2")],
@@ -4203,7 +4203,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_filter_noteq_clause() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry: NotEq(nsfwLevel, 5), sort by reactionCount Desc
         let key = make_key(&[("nsfwLevel", "neq", "5")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
@@ -4226,7 +4226,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_sort_adds_qualifying_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4244,7 +4244,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_sort_skips_filter_nonmatch() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4264,7 +4264,7 @@ mod tests {
     /// stale rank. (reactionCount downvote/moderation, decayed score, etc.)
     #[test]
     fn test_maintain_sort_removes_slot_dropped_below_bound() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4291,7 +4291,7 @@ mod tests {
     /// longer contains it.
     #[test]
     fn test_maintain_sort_removes_member_failing_filter() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4370,7 +4370,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_alive_marks_all_for_rebuild() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let key2 = make_key(&[("type", "eq", "2")], "sortAt", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
@@ -4384,7 +4384,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_skips_entries_needing_rebuild() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4410,7 +4410,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_bucket_membership_removes_slots_out_of_window() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry FILTERED on bucket(sortAt, "7d") but SORTED by reactionCount —
         // the #274 shape (sort field != bucket sort field).
         let key = UnifiedKey {
@@ -4446,7 +4446,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_bucket_membership_adds_qualifying_new_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![
                 CanonicalClause {
@@ -4483,7 +4483,7 @@ mod tests {
         // An entry sorted BY the bucket's sort field is covered by
         // evaluate_sort_work; maintain_bucket_membership must skip it (no add)
         // to avoid redundant work.
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![CanonicalClause {
                 field: "sortAt".to_string(),
@@ -4508,7 +4508,7 @@ mod tests {
     }
     #[test]
     fn test_maintain_unaffected_entry_untouched() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry on field "type", not "nsfwLevel"
         let key = make_key(&[("type", "eq", "2")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
@@ -4617,7 +4617,7 @@ mod tests {
     #[test]
     fn test_maintain_not_and_clause_does_not_reject_slot() {
         // E2E: cache entry with Not(And(...)) clause should keep slots during maintenance
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Entry with a Not(And(...)) clause
         let key = make_key(
             &[("nsfwLevel", "eq", "1"), ("type", "not(and)", "")],
@@ -4663,7 +4663,7 @@ mod tests {
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
         let key = make_key(
             &[("nsfwLevel", "eq", "1")],
@@ -4693,7 +4693,7 @@ mod tests {
     // ── Two-Phase Maintenance Tests ──────────────────────────────────────
     #[test]
     fn test_two_phase_filter_maintenance_adds_qualifying_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4723,7 +4723,7 @@ mod tests {
     }
     #[test]
     fn test_two_phase_filter_maintenance_removes_non_matching_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4744,7 +4744,7 @@ mod tests {
     }
     #[test]
     fn test_two_phase_sort_maintenance_adds_qualifying_slot() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         // min_tracked_value = value_fn(4) = 1000 - 4 = 996
@@ -4772,7 +4772,7 @@ mod tests {
             max_maintenance_ms: 0,
             ..make_config()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
@@ -4800,7 +4800,7 @@ mod tests {
             min_filter_size: 0,
             ..Default::default()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         cache.begin_restore();
         // Insert 10 entries via insert_restored_entry (the actual restore path)
         for i in 0..10u32 {
@@ -4853,7 +4853,7 @@ mod tests {
             max_maintenance_ms: 5,
             ..Default::default()
         };
-        let mut cache = UnifiedCache::new(config);
+        let cache = UnifiedCache::new(config);
         // Populate n_entries cache entries, all sorting by "reactionCount".
         // Each entry has a distinct filter clause so meta keys don't collide.
         let t_populate = Instant::now();
@@ -5130,7 +5130,7 @@ mod tests {
 
         // Initial cache entry: contains only slot 1 (pre-populated correctly).
         let initial_slots: Vec<u32> = vec![1];
-        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+        let cache = UnifiedCache::new(UnifiedCacheConfig {
             max_entries: 200,
             max_bytes: 64 * 1024 * 1024,
             initial_capacity: 100,
@@ -5235,7 +5235,7 @@ mod tests {
         // Form cache entry with slot 1 only (its sort value is the min_tracked).
         // Slot 20 has a higher sort value than slot 1, so it will qualify (Desc).
         let initial_slots: Vec<u32> = vec![1];
-        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+        let cache = UnifiedCache::new(UnifiedCacheConfig {
             max_entries: 200,
             max_bytes: 64 * 1024 * 1024,
             initial_capacity: 100,
@@ -5376,7 +5376,7 @@ mod tests {
             SortDirection::Desc,
         );
         let initial_slots: Vec<u32> = vec![1];
-        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+        let cache = UnifiedCache::new(UnifiedCacheConfig {
             max_entries: 200,
             max_bytes: 64 * 1024 * 1024,
             initial_capacity: 100,
@@ -5458,7 +5458,7 @@ mod tests {
     #[test]
     fn test_uses_bucket_false_for_prefilter_substituted_entry() {
         // An entry formed with a __prefilter clause must have uses_bucket=false.
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         // Simulates what prefilter.rs::substitute produces canonically
         let key = UnifiedKey {
             filter_clauses: vec![CanonicalClause {
@@ -5478,7 +5478,7 @@ mod tests {
     #[test]
     fn test_uses_bucket_true_for_time_bucket_entry() {
         // An entry formed with a genuine sortAt:bucket:7d clause must have uses_bucket=true.
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![CanonicalClause {
                 field: "sortAt".to_string(),
@@ -5500,7 +5500,7 @@ mod tests {
     fn test_invalidate_prefilter_marks_referencing_entry() {
         // Form a cache entry that references a __prefilter clause with name "safe".
         // Calling invalidate_prefilter("safe") must mark that entry needs_rebuild=true.
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = UnifiedKey {
             filter_clauses: vec![CanonicalClause {
                 field: "__prefilter".to_string(),
@@ -5526,7 +5526,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_prefilter_nonexistent_name_is_noop() {
-        let mut cache = UnifiedCache::new(make_config());
+        let cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
@@ -6941,7 +6941,7 @@ mod tests {
         //   baseModel key 1 → slots [10] ("SD XL" group — NOT slot 42)
         //   baseModel key 2 → slots [42] ("FLUX" group — slot 42 is here)
         //   nsfwLevel key 1 → slots [10, 42] (both slots have nsfwLevel=1)
-        let pre_mutation_filters = make_filter_index(&[
+        let _pre_mutation_filters = make_filter_index(&[
             ("baseModel", &[(1, &[10u32]), (2, &[42u32])]),
             ("nsfwLevel", &[(1, &[10u32, 42u32])]),
         ]);
@@ -7100,7 +7100,7 @@ mod tests {
                     max_range_scan_values: None,
                 });
             }
-            let decode = |key: u64, mask: u16, field: &FilterIndex| {
+            let decode = |key: u64, _mask: u16, field: &FilterIndex| {
                 let f = field.get_field(if key == u64::MAX { "fa" } else { "fa" }).unwrap();
                 let _ = f; // just for type inference; we do it inline below
             };

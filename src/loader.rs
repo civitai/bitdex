@@ -211,6 +211,7 @@ impl BitmapAccum {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn alive_len(&self) -> u64 {
         self.alive.len()
     }

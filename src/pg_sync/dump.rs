@@ -11,7 +11,7 @@
 //! 5. GET /dumps — check status per table
 
 use ahash::AHashMap as HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};

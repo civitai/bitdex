@@ -363,16 +363,19 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
 // Enrichment types for dump processing
 // ---------------------------------------------------------------------------
 /// Post enrichment data, keyed by post_id.
+#[allow(dead_code)]
 struct PostEnrichment {
     published_at_secs: Option<i64>,
     availability: String,
 }
 /// ModelVersion enrichment data, keyed by model_version_id.
+#[allow(dead_code)]
 struct MvEnrichment {
     base_model: Option<String>,
     model_id: i64,
 }
 /// Model enrichment data, keyed by model_id.
+#[allow(dead_code)]
 struct ModelEnrichment {
     poi: bool,
 }
@@ -610,6 +613,7 @@ fn write_shadow_target_docs(
 // ---------------------------------------------------------------------------
 /// Load posts.csv into a HashMap<post_id, PostEnrichment>.
 /// Posts: id, publishedAtSecs, availability, modelVersionId (4 columns CSV)
+#[allow(dead_code)]
 fn load_posts_enrichment(csv_dir: &Path) -> HashMap<i64, PostEnrichment> {
     use crate::pg_sync::copy_queries::parse_post_row;
     use std::io::BufRead;
@@ -642,6 +646,7 @@ fn load_posts_enrichment(csv_dir: &Path) -> HashMap<i64, PostEnrichment> {
 }
 /// Load model_versions.csv into a HashMap<mv_id, MvEnrichment>.
 /// ModelVersions: id, baseModel, modelId (3 columns CSV)
+#[allow(dead_code)]
 fn load_mv_enrichment(csv_dir: &Path) -> HashMap<i64, MvEnrichment> {
     use crate::pg_sync::copy_queries::parse_model_version_row;
     use std::io::BufRead;
@@ -674,6 +679,7 @@ fn load_mv_enrichment(csv_dir: &Path) -> HashMap<i64, MvEnrichment> {
 }
 /// Load models.csv into a HashMap<model_id, ModelEnrichment>.
 /// Models: id, poi, type (3 columns CSV)
+#[allow(dead_code)]
 fn load_model_enrichment(csv_dir: &Path) -> HashMap<i64, ModelEnrichment> {
     use crate::pg_sync::copy_queries::parse_model_row;
     use std::io::BufRead;
@@ -705,6 +711,7 @@ fn load_model_enrichment(csv_dir: &Path) -> HashMap<i64, ModelEnrichment> {
 }
 /// Resolve a string value through the field dictionary, returning the u64 bitmap key.
 #[inline]
+#[allow(dead_code)]
 fn resolve_string_dict(
     dicts: &HashMap<String, FieldDictionary>,
     field: &str,
@@ -714,6 +721,7 @@ fn resolve_string_dict(
 }
 /// Set sort layers for a u32 value on a slot in a BitmapAccum.
 #[inline]
+#[allow(dead_code)]
 fn accum_set_sort(
     sort_maps: &mut HashMap<String, HashMap<usize, roaring::RoaringBitmap>>,
     field: &str,
@@ -2823,7 +2831,6 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::shard_store_doc::PackedValue;
         use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
