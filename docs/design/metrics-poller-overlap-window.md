@@ -99,25 +99,43 @@ sub-linear in id count. A single wide reconcile every 30s is free — no hot/slo
 
 ## Suppression (avoids re-emitting ~9k×3 ops every 30s)
 
-Per-id last-sent `(reaction, comment, collected)` tuple in a bounded LRU. Emit
-`Op::Set` ops only for ids whose tuple changed since last send. Re-evaluated every
-cycle the id is in-window — so a not-yet-settled value is *not* silenced: the id
-stays in the 20-min window across the 2.5-min settle, gets re-read, and emits once
-the settled value differs. (Confirmed correct by Mark.)
+Per-id last-sent `(reaction, comment, collected)` tuple, retained ~2 windows past
+last sighting and hard-capped at `suppression_max_entries` (clear-on-overflow).
+Emit `Op::Set` ops only for ids whose tuple changed since last send. Re-evaluated
+every cycle the id is in-window — so a not-yet-settled value is *not* silenced:
+the id stays in the 20-min window across the 2.5-min settle, gets re-read, and
+emits once the settled value differs. (Confirmed correct by Mark.)
+
+**Commit-after-POST:** the emit set is chosen by a pure `peek_changed`; the cache
+is committed via `record` only *after* the ops POST succeeds. A failed POST leaves
+the cache untouched and the cursor un-advanced, so the same window is re-scanned
+and re-sent next cycle — no silently-dropped update. Windows are half-open lower /
+inclusive upper: `createdAt > since AND createdAt <= upper`.
 
 ## Config schema (PgSyncConfig / sync.toml)
 
 ```toml
-metrics_poll_interval_secs   = 30      # reconcile cadence
-metrics_table                = "entityMetricEvents_month"
-metrics_entity_type          = "Image"
-metrics_reconcile_window_secs = 1200   # steady trailing window (>> batch-lag, >> settle)
-metrics_backfill_chunk_secs  = 3600    # bounded forward chunk when catching up
+metrics_poll_interval_secs      = 30      # reconcile cadence
+metrics_table                   = "entityMetricEvents_month"   # discovery (CDC stream)
+metrics_totals_table            = "entityMetricDailyAgg_v2"    # all-time totals view
+metrics_entity_type             = "Image"
+metrics_cursor_name             = "metrics-poller-civitai"
+metrics_reconcile_window_secs   = 1200    # steady trailing window (>> batch-lag, >> settle)
+metrics_backfill_chunk_secs     = 3600    # bounded forward chunk when catching up
+metrics_reaction_types          = ["Like","Heart","Laugh","Cry"]  # vocab, config-driven
+metrics_comment_types           = ["commentCount"]
+metrics_collected_types         = ["Collection"]
+metrics_suppression_max_entries = 5000000 # memory safety valve
 ```
 
-Env overrides (pod-tunable): `BITDEX_METRICS_TABLE`, `BITDEX_METRICS_RECONCILE_WINDOW_SECS`,
-`BITDEX_METRICS_BACKFILL_CHUNK_SECS`. `BITDEX_METRICS_SINCE` (existing) seeds the
-cold-start cursor to force a wide backfill.
+All are validated at load (timing knobs must be `> 0` — fail closed, since a zero
+would make every window empty and silently stall). Env overrides (pod-tunable):
+`BITDEX_METRICS_TABLE`, `BITDEX_METRICS_TOTALS_TABLE`, `BITDEX_METRICS_ENTITY_TYPE`,
+`BITDEX_METRICS_CURSOR_NAME`, `BITDEX_METRICS_POLL_INTERVAL_SECS`,
+`BITDEX_METRICS_RECONCILE_WINDOW_SECS`, `BITDEX_METRICS_BACKFILL_CHUNK_SECS`.
+
+Recovery: PUT the cursor to an older epoch + bounce the sidecar (backfill mode
+drains it natively), or on a true cold start set `BITDEX_METRICS_SINCE=<epoch>`.
 
 ## Deploy / backfill (Josh)
 

@@ -43,12 +43,22 @@ pub struct MetricsPollerConfig {
     pub totals_table: String,
     /// `entityType` filtered in discovery + totals.
     pub entity_type: String,
+    /// Persisted cursor name (BitDex `/cursors` key).
+    pub cursor_name: String,
     /// Reconcile cadence in seconds.
     pub poll_interval_secs: u64,
     /// Steady-state trailing discovery window width in seconds.
     pub reconcile_window_secs: u64,
     /// Bounded forward chunk width in seconds used while catching up.
     pub backfill_chunk_secs: u64,
+    /// `metricType` values summed into `reactionCount` / `commentCount` /
+    /// `collectedCount`. Config-driven so an upstream vocab rename is a config
+    /// edit, not a rebuild.
+    pub reaction_types: Vec<String>,
+    pub comment_types: Vec<String>,
+    pub collected_types: Vec<String>,
+    /// Hard cap on suppression-cache entries (memory safety valve).
+    pub suppression_max_entries: usize,
 }
 
 /// Bounded per-id suppression cache. Holds the last-emitted `(reaction, comment,
@@ -62,29 +72,49 @@ pub struct MetricsPollerConfig {
 struct SuppressionCache {
     map: HashMap<i64, (MetricInfo, u64)>,
     retain_cycles: u64,
+    max_entries: usize,
 }
 
 impl SuppressionCache {
-    fn new(retain_cycles: u64) -> Self {
+    fn new(retain_cycles: u64, max_entries: usize) -> Self {
         Self {
             map: HashMap::new(),
             retain_cycles: retain_cycles.max(1),
+            max_entries: max_entries.max(1),
         }
     }
 
-    /// Record the current total for `id` at `cycle`; return true if it changed
-    /// (or is newly seen) and should be emitted.
-    fn changed(&mut self, id: i64, info: MetricInfo, cycle: u64) -> bool {
-        match self.map.insert(id, (info, cycle)) {
-            Some((prev, _)) if prev == info => false,
-            _ => true,
+    /// Whether emitting `id` with `info` would change what was last sent (or it
+    /// is newly seen). Pure read — does NOT mutate. The tuple is only committed
+    /// via `record` after the ops POST succeeds, so a failed POST leaves the
+    /// cache untouched and the update is re-sent next cycle.
+    fn peek_changed(&self, id: i64, info: MetricInfo) -> bool {
+        match self.map.get(&id) {
+            Some((prev, _)) => *prev != info,
+            None => true,
         }
     }
 
-    /// Drop entries not seen in the last `retain_cycles` cycles.
+    /// Commit the last-sent tuple + last-seen cycle for `id`. Called for every
+    /// discovered id (changed or not) after a successful POST, so unchanged
+    /// in-window ids keep their last-seen fresh and survive the sweep.
+    fn record(&mut self, id: i64, info: MetricInfo, cycle: u64) {
+        self.map.insert(id, (info, cycle));
+    }
+
+    /// Drop entries not seen in the last `retain_cycles` cycles, then enforce the
+    /// hard cap as a last-resort memory valve (clear on overflow — a one-time
+    /// re-emit that suppression collapses again next cycle).
     fn sweep(&mut self, cycle: u64) {
         let cutoff = cycle.saturating_sub(self.retain_cycles);
         self.map.retain(|_, (_, seen)| *seen >= cutoff);
+        if self.map.len() > self.max_entries {
+            eprintln!(
+                "Metrics: suppression cache exceeded {} entries — clearing (one-time re-emit)",
+                self.max_entries
+            );
+            self.map.clear();
+        }
     }
 
     #[cfg(test)]
@@ -98,11 +128,10 @@ impl SuppressionCache {
 /// V2 pipeline: fetches aggregate counts from ClickHouse, converts them to
 /// `Op::Set` ops for sort fields, and POSTs via the `/ops` endpoint.
 /// No PG round-trip needed — metrics are self-contained sort-field updates.
-/// Cursor name used to persist the metrics poller's high-water-mark on the
-/// BitDex side via the `/cursors` API. The value is the unix-epoch upper
-/// bound of the most recently *fully successful* poll cycle.
-const METRICS_CURSOR_NAME: &str = "metrics-poller-civitai";
-
+/// The cursor name (BitDex `/cursors` key) is config-driven — see
+/// `MetricsPollerConfig::cursor_name`. Its value is the unix-epoch upper bound
+/// of the most recently *fully successful* reconcile cycle.
+///
 /// Optional env-var override read once at startup, ONLY honored on cold start
 /// (no persisted cursor exists). If set to a unix-epoch integer, the poller
 /// seeds the cold-start cursor from this value. Restarts after the first
@@ -126,16 +155,19 @@ const METRICS_SINCE_ENV: &str = "BITDEX_METRICS_SINCE";
 ///
 /// Backfill advances the cursor until it lands within the trailing window, so the
 /// final backfill chunk and the first steady window overlap — no seam gap.
+///
+/// Saturating arithmetic throughout so a corrupt/absurd persisted cursor can't
+/// overflow (which would panic in debug and wrap in release).
 fn compute_window(
     cursor: i64,
     now: i64,
     reconcile_window_secs: i64,
     backfill_chunk_secs: i64,
 ) -> (i64, i64) {
-    if now - cursor > reconcile_window_secs {
-        (cursor, (cursor + backfill_chunk_secs).min(now))
+    if now.saturating_sub(cursor) > reconcile_window_secs {
+        (cursor, cursor.saturating_add(backfill_chunk_secs).min(now))
     } else {
-        (now - reconcile_window_secs, now)
+        (now.saturating_sub(reconcile_window_secs), now)
     }
 }
 
@@ -150,16 +182,19 @@ pub async fn run_metrics_poller(
     // Resolve the starting cursor from the persisted cursor (with optional env
     // override on cold start). Fails CLOSED on transient API errors so a restart
     // during a BitDex outage doesn't silently skip the backlog.
-    let mut cursor = match resolve_initial_since(bitdex_client, cfg.reconcile_window_secs).await {
-        Ok(ts) => ts,
-        Err(e) => return Err(format!("Metrics: refusing to start: {e}")),
-    };
+    let mut cursor =
+        match resolve_initial_since(bitdex_client, &cfg.cursor_name, cfg.reconcile_window_secs)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => return Err(format!("Metrics: refusing to start: {e}")),
+        };
 
     // Retain suppression state for an id ~2 reconcile windows past its last
     // sighting — comfortably longer than the window that keeps re-discovering it.
     let retain_cycles =
         (cfg.reconcile_window_secs / cfg.poll_interval_secs.max(1)).saturating_mul(2) + 4;
-    let mut suppression = SuppressionCache::new(retain_cycles);
+    let mut suppression = SuppressionCache::new(retain_cycles, cfg.suppression_max_entries);
     let mut cycle_num: u64 = 0;
 
     let mut bitdex_was_down = false;
@@ -192,6 +227,17 @@ pub async fn run_metrics_poller(
         }
 
         let now = current_epoch_secs();
+
+        // Clock-regression guard: if wall-clock stepped back below the cursor
+        // (NTP correction / container skew), don't let the cursor walk backwards
+        // and churn. Wait for the clock to catch up rather than re-scan.
+        if now < cursor {
+            eprintln!(
+                "Metrics: clock regression (now={now} < cursor={cursor}); waiting for catch-up"
+            );
+            continue;
+        }
+
         let (since, upper) = compute_window(
             cursor,
             now,
@@ -199,8 +245,7 @@ pub async fn run_metrics_poller(
             cfg.backfill_chunk_secs as i64,
         );
 
-        // Guard against a clock regression (NTP correction / container skew) that
-        // would put `upper` at or below `since` — nothing to scan, just wait.
+        // Nothing to scan (e.g. zero-width window from a boundary) — just wait.
         if upper <= since {
             continue;
         }
@@ -246,7 +291,7 @@ pub async fn run_metrics_poller(
                 // keep the old cursor and re-scan next cycle (Set ops are
                 // idempotent, and suppression collapses the repeat to a no-op).
                 if let Err(e) = bitdex_client
-                    .set_cursor(METRICS_CURSOR_NAME, &upper.to_string())
+                    .set_cursor(&cfg.cursor_name, &upper.to_string())
                     .await
                 {
                     eprintln!("Metrics: cursor persist failed ({e}); will retry next cycle");
@@ -282,18 +327,19 @@ pub async fn run_metrics_poller(
 ///   silent fallback would convert state corruption into permanent data loss.
 async fn resolve_initial_since(
     bitdex_client: &BitdexClient,
+    cursor_name: &str,
     reconcile_window_secs: u64,
 ) -> Result<i64, String> {
     // Try persisted cursor first (must distinguish 404 → None from transient error → Err).
-    match bitdex_client.get_cursor(METRICS_CURSOR_NAME).await? {
+    match bitdex_client.get_cursor(cursor_name).await? {
         Some(s) => match s.trim().parse::<i64>() {
             Ok(ts) if ts > 0 => {
                 eprintln!("Metrics: resumed from persisted cursor (since_ts={ts})");
                 Ok(ts)
             }
             _ => Err(format!(
-                "persisted cursor {METRICS_CURSOR_NAME}={s:?} is unparseable. \
-                 Recovery: PUT a valid unix-epoch integer to /cursors/{METRICS_CURSOR_NAME} \
+                "persisted cursor {cursor_name}={s:?} is unparseable. \
+                 Recovery: PUT a valid unix-epoch integer to /cursors/{cursor_name} \
                  (or DELETE it to force a cold start). Refusing to silently restart \
                  from now-interval — that would discard the backlog."
             )),
@@ -347,12 +393,17 @@ struct Reconcile {
     emitted: usize,
 }
 
-/// Single reconcile cycle. Discovers ids with metric activity in `[since_ts,
+/// Single reconcile cycle. Discovers ids with metric activity in `(since_ts,
 /// upper_ts]`, fetches their all-time totals, and POSTs `Op::Set` ops for the
 /// ids whose totals changed since last emission (per `suppression`).
 ///
 /// The window overlaps the previous cycle's (steady mode), so an id discovered
 /// here may have been emitted before — suppression collapses that to a no-op.
+///
+/// Suppression is committed ONLY after the POSTs succeed: `peek_changed` (pure)
+/// selects the emit set, and `record` runs afterwards. So a failed POST leaves
+/// the cache untouched — the caller keeps the old cursor and the same window is
+/// re-scanned and re-sent next cycle (no silently-dropped update).
 async fn poll_metrics_and_push(
     http: &Client,
     ch_config: &ClickHouseConfig,
@@ -370,51 +421,73 @@ async fn poll_metrics_and_push(
         return Ok(Reconcile { discovered: 0, emitted: 0 });
     }
 
-    // Suppress ids whose totals are unchanged since the last emission. Records
-    // every discovered id at `cycle` so it survives the post-cycle sweep.
-    let changed: HashMap<i64, MetricInfo> = metrics
-        .into_iter()
-        .filter(|(id, info)| suppression.changed(*id, *info, cycle))
+    // Select ids whose totals changed since last emission — pure peek, no commit.
+    let changed: Vec<(i64, MetricInfo)> = metrics
+        .iter()
+        .filter(|(id, info)| suppression.peek_changed(**id, **info))
+        .map(|(id, info)| (*id, *info))
         .collect();
 
     let emitted = changed.len();
-    if emitted == 0 {
-        return Ok(Reconcile { discovered, emitted: 0 });
+
+    if emitted > 0 {
+        let entity_ops = metrics_to_entity_ops(changed.iter().copied());
+        // Send in batches to keep request sizes manageable. A failure here
+        // returns Err BEFORE any `record` below, so nothing is suppressed.
+        for chunk in entity_ops.chunks(OPS_BATCH_SIZE) {
+            let batch = OpsBatch {
+                ops: chunk.to_vec(),
+                meta: Some(SyncMeta {
+                    source: "clickhouse-metrics".into(),
+                    cursor: None,
+                    max_id: None,
+                    lag_rows: None,
+                }),
+            };
+            bitdex_client.post_ops(&batch).await?;
+        }
     }
 
-    let entity_ops = metrics_to_entity_ops(changed);
-
-    // Send in batches to keep request sizes manageable.
-    for chunk in entity_ops.chunks(OPS_BATCH_SIZE) {
-        let batch = OpsBatch {
-            ops: chunk.to_vec(),
-            meta: Some(SyncMeta {
-                source: "clickhouse-metrics".into(),
-                cursor: None,
-                max_id: None,
-                lag_rows: None,
-            }),
-        };
-        bitdex_client.post_ops(&batch).await?;
+    // Commit only now that the POSTs (if any) succeeded. Record EVERY discovered
+    // id — including unchanged ones — so their last-seen cycle stays fresh and
+    // they survive the sweep while still in the trailing window.
+    for (id, info) in &metrics {
+        suppression.record(*id, *info, cycle);
     }
 
     Ok(Reconcile { discovered, emitted })
 }
 
-/// Validate a config-supplied SQL identifier (table / entityType value). These
-/// come from operator config, not user input, but a strict allowlist keeps a
-/// typo'd config from producing a malformed or surprising query.
+/// Validate a config-supplied SQL identifier or string-literal value (table,
+/// entityType, metricType). These come from operator config, not user input, but
+/// a strict allowlist keeps a typo'd config from producing a malformed query and
+/// blocks quote/paren/semicolon injection into the interpolated SQL. A single `.`
+/// is allowed so `db.table`-qualified names work.
 fn validate_ident(kind: &str, s: &str) -> Result<(), String> {
     if s.is_empty()
         || !s
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
     {
         return Err(format!(
-            "invalid metrics {kind} {s:?}: must be non-empty ASCII alphanumeric/underscore"
+            "invalid metrics {kind} {s:?}: must be non-empty ASCII alphanumeric/underscore/dot"
         ));
     }
     Ok(())
+}
+
+/// Build a `metricType IN ('a','b',...)` predicate from a config-supplied set of
+/// metric-type values, validating each so nothing breaks out of the quotes.
+fn metric_type_in_clause(kind: &str, types: &[String]) -> Result<String, String> {
+    if types.is_empty() {
+        return Err(format!("metrics {kind} must list at least one metricType"));
+    }
+    let mut quoted = Vec::with_capacity(types.len());
+    for t in types {
+        validate_ident(kind, t)?;
+        quoted.push(format!("'{t}'"));
+    }
+    Ok(format!("metricType IN ({})", quoted.join(",")))
 }
 
 /// Build the two-phase reconcile query.
@@ -425,8 +498,9 @@ fn validate_ident(kind: &str, s: &str) -> Result<(), String> {
 ///    counts for those ids, so the emitted values are absolute (idempotent Set),
 ///    which is what makes overlapping windows and re-scans safe.
 ///
-/// `metricType` values live in the totals view (bare names: Like/Heart/Laugh/Cry,
-/// commentCount, Collection); discovery does NOT filter by metricType.
+/// The `metricType` groups (which CH types sum into reaction/comment/collected)
+/// are config-driven, so an upstream vocab rename is a config edit, not a rebuild.
+/// Discovery does NOT filter by metricType.
 fn build_reconcile_query(
     cfg: &MetricsPollerConfig,
     since_ts: i64,
@@ -435,12 +509,15 @@ fn build_reconcile_query(
     validate_ident("table", &cfg.table)?;
     validate_ident("totals_table", &cfg.totals_table)?;
     validate_ident("entity_type", &cfg.entity_type)?;
+    let reaction_in = metric_type_in_clause("reaction_types", &cfg.reaction_types)?;
+    let comment_in = metric_type_in_clause("comment_types", &cfg.comment_types)?;
+    let collected_in = metric_type_in_clause("collected_types", &cfg.collected_types)?;
     Ok(format!(
         r#"SELECT
             entityId as id,
-            sumIf(total, metricType IN ('Like','Heart','Laugh','Cry')) as reactionCount,
-            sumIf(total, metricType = 'commentCount') as commentCount,
-            sumIf(total, metricType = 'Collection') as collectedCount
+            sumIf(total, {reaction_in}) as reactionCount,
+            sumIf(total, {comment_in}) as commentCount,
+            sumIf(total, {collected_in}) as collectedCount
         FROM {totals}
         WHERE entityType = '{etype}'
           AND entityId IN (
@@ -532,7 +609,9 @@ async fn fetch_metrics_from_clickhouse(
 /// Each image gets three `Op::Set` ops (reactionCount, commentCount, collectedCount).
 /// `creates_slot` is false because these are sort-only field updates — they should
 /// never create new alive slots.
-fn metrics_to_entity_ops(metrics: HashMap<i64, MetricInfo>) -> Vec<EntityOps> {
+fn metrics_to_entity_ops(
+    metrics: impl IntoIterator<Item = (i64, MetricInfo)>,
+) -> Vec<EntityOps> {
     metrics
         .into_iter()
         .map(|(image_id, info)| {
@@ -716,9 +795,14 @@ mod tests {
             table: "entityMetricEvents_month".into(),
             totals_table: "entityMetricDailyAgg_v2".into(),
             entity_type: "Image".into(),
+            cursor_name: "metrics-poller-civitai".into(),
             poll_interval_secs: 30,
             reconcile_window_secs: 1200,
             backfill_chunk_secs: 3600,
+            reaction_types: ["Like", "Heart", "Laugh", "Cry"].iter().map(|s| s.to_string()).collect(),
+            comment_types: vec!["commentCount".into()],
+            collected_types: vec!["Collection".into()],
+            suppression_max_entries: 5_000_000,
         }
     }
 
@@ -763,37 +847,62 @@ mod tests {
 
     #[test]
     fn suppression_emits_on_change_skips_on_repeat() {
-        let mut s = SuppressionCache::new(4);
-        // First sighting -> emit.
-        assert!(s.changed(1, info(10, 0, 0), 1));
+        let mut s = SuppressionCache::new(4, 1000);
+        // First sighting -> emit; commit it.
+        assert!(s.peek_changed(1, info(10, 0, 0)));
+        s.record(1, info(10, 0, 0), 1);
         // Same total next cycle -> suppressed.
-        assert!(!s.changed(1, info(10, 0, 0), 2));
+        assert!(!s.peek_changed(1, info(10, 0, 0)));
         // Total changes (e.g. settled value) -> emit again.
-        assert!(s.changed(1, info(11, 0, 0), 3));
+        assert!(s.peek_changed(1, info(11, 0, 0)));
         // New id always emits.
-        assert!(s.changed(2, info(0, 0, 0), 3));
+        assert!(s.peek_changed(2, info(0, 0, 0)));
+    }
+
+    #[test]
+    fn suppression_peek_is_pure_until_recorded() {
+        // BLOCKER regression: peek must NOT commit, so a failed POST (no record)
+        // leaves the id re-emittable next cycle.
+        let mut s = SuppressionCache::new(4, 1000);
+        assert!(s.peek_changed(1, info(10, 0, 0)));
+        assert!(s.peek_changed(1, info(10, 0, 0)), "peek alone must not suppress");
+        // Only after record does it suppress.
+        s.record(1, info(10, 0, 0), 1);
+        assert!(!s.peek_changed(1, info(10, 0, 0)));
     }
 
     #[test]
     fn suppression_does_not_silence_unsettled_value() {
         // Discover with pre-settle total, emit; later the settled value differs
         // and must still be emitted (the settle-lag trap).
-        let mut s = SuppressionCache::new(100);
-        assert!(s.changed(7, info(5, 0, 0), 1)); // pre-settle
-        assert!(!s.changed(7, info(5, 0, 0), 2)); // unchanged re-read
-        assert!(s.changed(7, info(5, 3, 0), 3)); // comment count settled -> emit
+        let mut s = SuppressionCache::new(100, 1000);
+        assert!(s.peek_changed(7, info(5, 0, 0))); // pre-settle
+        s.record(7, info(5, 0, 0), 1);
+        assert!(!s.peek_changed(7, info(5, 0, 0))); // unchanged re-read
+        assert!(s.peek_changed(7, info(5, 3, 0))); // comment count settled -> emit
     }
 
     #[test]
     fn suppression_sweep_evicts_stale_ids() {
-        let mut s = SuppressionCache::new(2);
-        s.changed(1, info(1, 0, 0), 1);
-        s.changed(2, info(1, 0, 0), 5);
+        let mut s = SuppressionCache::new(2, 1000);
+        s.record(1, info(1, 0, 0), 1);
+        s.record(2, info(1, 0, 0), 5);
         // Sweep at cycle 5 with retain=2 -> cutoff 3; id 1 (seen@1) evicted.
         s.sweep(5);
         assert_eq!(s.len(), 1);
-        // Evicted id re-emits when seen again (fresh insert).
-        assert!(s.changed(1, info(1, 0, 0), 6));
+        // Evicted id re-emits when seen again.
+        assert!(s.peek_changed(1, info(1, 0, 0)));
+    }
+
+    #[test]
+    fn suppression_hard_cap_clears_on_overflow() {
+        let mut s = SuppressionCache::new(1_000_000, 3);
+        for id in 0..10 {
+            s.record(id, info(id, 0, 0), 1);
+        }
+        // retain is huge so the cycle-sweep keeps all 10; the hard cap (3) trips.
+        s.sweep(1);
+        assert_eq!(s.len(), 0, "cache cleared once it blew past max_entries");
     }
 
     #[test]
@@ -815,5 +924,31 @@ mod tests {
         let mut cfg2 = test_cfg();
         cfg2.entity_type = "".into();
         assert!(build_reconcile_query(&cfg2, 0, 1).is_err());
+        // Injection attempt in a metricType value is rejected (would break quotes).
+        let mut cfg3 = test_cfg();
+        cfg3.reaction_types = vec!["Like') OR 1=1 --".into()];
+        assert!(build_reconcile_query(&cfg3, 0, 1).is_err());
+        // Empty metricType group is rejected.
+        let mut cfg4 = test_cfg();
+        cfg4.comment_types = vec![];
+        assert!(build_reconcile_query(&cfg4, 0, 1).is_err());
+    }
+
+    #[test]
+    fn reconcile_query_uses_config_vocab() {
+        // A vocab rename is a config edit, not a rebuild.
+        let mut cfg = test_cfg();
+        cfg.reaction_types = vec!["ReactionLike".into(), "ReactionHeart".into()];
+        let q = build_reconcile_query(&cfg, 0, 1).unwrap();
+        assert!(q.contains("metricType IN ('ReactionLike','ReactionHeart')"));
+        assert!(q.contains("metricType IN ('commentCount')"), "comment group still one value");
+    }
+
+    #[test]
+    fn db_qualified_table_name_is_allowed() {
+        let mut cfg = test_cfg();
+        cfg.table = "default.entityMetricEvents_month".into();
+        let q = build_reconcile_query(&cfg, 0, 1).unwrap();
+        assert!(q.contains("FROM default.entityMetricEvents_month"));
     }
 }
