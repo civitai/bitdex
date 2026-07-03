@@ -143,7 +143,8 @@ impl SuppressionCache {
 /// API. The env var is intentionally narrow.
 const METRICS_SINCE_ENV: &str = "BITDEX_METRICS_SINCE";
 
-/// Decide the `[since, upper]` createdAt window for a reconcile cycle.
+/// Decide the `(since, upper]` createdAt window for a reconcile cycle
+/// (half-open lower, inclusive upper — see the query in `build_reconcile_query`).
 ///
 /// - **Backfill** (cursor more than one reconcile window behind — fresh boot with
 ///   an old `BITDEX_METRICS_SINCE`, or long downtime): walk forward in a bounded,

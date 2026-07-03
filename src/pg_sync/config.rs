@@ -253,6 +253,16 @@ impl PgSyncConfig {
         if let Ok(name) = std::env::var("BITDEX_METRICS_CURSOR_NAME") {
             config.metrics_cursor_name = name;
         }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_SUPPRESSION_MAX_ENTRIES") {
+            match v.trim().parse::<usize>() {
+                Ok(n) => config.metrics_suppression_max_entries = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_SUPPRESSION_MAX_ENTRIES={v:?} is not a valid usize ({e})"
+                    ));
+                }
+            }
+        }
         if let Ok(v) = std::env::var("BITDEX_METRICS_POLL_INTERVAL_SECS") {
             match v.trim().parse::<u64>() {
                 Ok(n) => config.metrics_poll_interval_secs = n,
@@ -284,16 +294,21 @@ impl PgSyncConfig {
             }
         }
 
-        // Fail closed on non-positive timing knobs. A zero window/interval/chunk
+        // Fail closed on out-of-range timing knobs. A zero window/interval/chunk
         // would make every reconcile window empty (`upper <= since`) and silently
-        // stall the poller forever — turn that misconfig into a startup error.
+        // stall the poller; an absurd value would overflow the `u64 as i64` cast
+        // in the window math. Bound to (0, 10 years] — turn misconfig into a
+        // startup error.
+        const MAX_METRICS_SECS: u64 = 10 * 365 * 24 * 3600;
         for (name, val) in [
             ("metrics_poll_interval_secs", config.metrics_poll_interval_secs),
             ("metrics_reconcile_window_secs", config.metrics_reconcile_window_secs),
             ("metrics_backfill_chunk_secs", config.metrics_backfill_chunk_secs),
         ] {
-            if val == 0 {
-                return Err(format!("{name} must be > 0 (got 0) — would stall the metrics poller"));
+            if val == 0 || val > MAX_METRICS_SECS {
+                return Err(format!(
+                    "{name}={val} out of range — must be in (0, {MAX_METRICS_SECS}] seconds"
+                ));
             }
         }
         if config.metrics_suppression_max_entries == 0 {
