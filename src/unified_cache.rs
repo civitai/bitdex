@@ -1084,6 +1084,18 @@ impl UnifiedCache {
             }
         }
     }
+    /// Mark a just-created entry for rebuild, bypassing hit/miss counters —
+    /// used at entry-creation time when the entry's bucket-diff state can't
+    /// be safely determined (e.g. a multi-bucket-name entry — see
+    /// `BucketDiffState::Rebuild` in `concurrent_engine.rs`) so it can never
+    /// silently drift stale via incremental diffs it was never validated
+    /// against. No-op if the entry is gone (evicted between creation and
+    /// seeding).
+    pub fn mark_entry_for_rebuild(&self, key: &UnifiedKey) {
+        if let Some(entry) = self.entries.get(key) {
+            entry.value().mark_for_rebuild();
+        }
+    }
     /// Look up a cache entry for read-only access. Returns `None` on miss.
     /// Increments hit/miss counters and refreshes LRU via atomics — no mutation
     /// of the entry itself, so the per-shard read lock is taken (concurrent

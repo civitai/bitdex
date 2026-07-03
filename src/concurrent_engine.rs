@@ -407,6 +407,28 @@ pub struct ConcurrentEngine {
     /// Warm registry: tracks popular query shapes for auto-warming on boot.
     warm_registry: Arc<crate::warm_registry::WarmRegistry>,
 }
+
+/// Outcome of resolving a cache entry's bucket-diff state
+/// (`ConcurrentEngine::resolve_bucket_diff_state[_for]`). Distinguishes two
+/// DIFFERENT reasons a caller might not get a usable diff to apply — they
+/// require opposite handling, which a single `Option::None` can't express
+/// (an earlier version conflated them and silently under-served the
+/// `Rebuild` case as a no-op — see the multi-bucket-clause review note on
+/// `resolve_bucket_diff_state_for`):
+/// - `Rebuild`: correctness can't be verified (multi-bucket-name entry, or a
+///   referenced bucket name no longer resolves) — caller MUST call
+///   `mark_for_rebuild()`. Silently skipping here would serve a
+///   potentially-stale entry forever (until TTL, if any).
+/// - `Noop`: nothing to apply YET, but nothing is wrong either (the entry's
+///   single bucket exists but hasn't pushed a diff since boot) — caller
+///   should just skip, not rebuild (rebuilding on every read until the
+///   first refresh cycle would be wasteful and pointless).
+#[derive(Debug)]
+enum BucketDiffState {
+    Apply(RoaringBitmap, u64, u64),
+    Rebuild,
+    Noop,
+}
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
@@ -4958,8 +4980,8 @@ impl ConcurrentEngine {
             .map(|c| c.value_repr.clone())
             .collect()
     }
-    /// Resolve the effective `(candidates, new_cutoff, oldest_cutoff)` for an
-    /// entry that depends on one or more bucket names.
+    /// Resolve the effective bucket-diff state for an entry that depends on
+    /// one or more bucket names.
     ///
     /// `PendingBucketDiffs` is keyed per bucket NAME (24h/7d/30d/1y are
     /// independent windows with unrelated cutoff scales — see
@@ -4977,15 +4999,16 @@ impl ConcurrentEngine {
     /// AND vs. OR semantics from the flattened clause list — a union-based
     /// live-bitmap would UNDER-remove for AND (a slot that fell out of only
     /// one of the two ANDed bucket windows should be dropped, but survives
-    /// in the union) — this bails to `None` for >1 distinct name, which
-    /// forces the caller's `mark_for_rebuild()` fallback: always correct,
-    /// just costs a rebuild for a shape that shouldn't occur in practice.
+    /// in the union) — this returns `Rebuild` for >1 distinct name (or an
+    /// empty list, which shouldn't happen if the caller only calls this when
+    /// `uses_bucket()`/`is_time_bucket_clause` was true — treated the same
+    /// defensively): always correct, just costs a rebuild for a shape that
+    /// shouldn't occur in practice.
     ///
-    /// Returns `None` if `bucket_names` is empty or has >1 distinct name,
-    /// references an unconfigured bucket, or the referenced bucket hasn't
+    /// Returns `Noop` if the single referenced bucket exists but hasn't
     /// pushed a diff yet (`current_cutoff() == 0`) — callers should
     /// seed/leave `bucket_cutoff` at its zero default rather than guess.
-    fn resolve_bucket_diff_state(&self, bucket_names: &[String]) -> Option<(RoaringBitmap, u64, u64)> {
+    fn resolve_bucket_diff_state(&self, bucket_names: &[String]) -> BucketDiffState {
         Self::resolve_bucket_diff_state_for(&self.pending_bucket_diffs, bucket_names)
     }
     /// Free-standing version of `resolve_bucket_diff_state` for callers
@@ -4994,27 +5017,36 @@ impl ConcurrentEngine {
     fn resolve_bucket_diff_state_for(
         pending_bucket_diffs: &HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>,
         bucket_names: &[String],
-    ) -> Option<(RoaringBitmap, u64, u64)> {
-        if bucket_names.is_empty() || bucket_names.len() > 1 {
-            return None;
+    ) -> BucketDiffState {
+        // Empty is a defensive default, not the "ambiguous" case: callers
+        // are expected to only call this when the key/entry actually
+        // references a bucket (non-empty `bucket_names`); if one doesn't,
+        // there's nothing to resolve — Noop, not Rebuild. Only >1 distinct
+        // name is the genuinely unresolvable case (see the doc comment
+        // above).
+        if bucket_names.is_empty() {
+            return BucketDiffState::Noop;
         }
-        let mut candidates = RoaringBitmap::new();
-        let mut new_cutoff: Option<u64> = None;
-        let mut oldest_cutoff: Option<u64> = None;
-        for name in bucket_names {
-            let cell = pending_bucket_diffs.get(name.as_str())?;
-            let diffs = cell.load();
-            if diffs.current_cutoff() == 0 {
-                continue; // this bucket hasn't refreshed yet
-            }
-            candidates |= diffs.merged_expired().as_ref();
-            new_cutoff = Some(new_cutoff.map_or(diffs.current_cutoff(), |c: u64| c.min(diffs.current_cutoff())));
-            oldest_cutoff = Some(oldest_cutoff.map_or(diffs.oldest_cutoff(), |c: u64| c.max(diffs.oldest_cutoff())));
+        if bucket_names.len() > 1 {
+            return BucketDiffState::Rebuild;
         }
-        match (new_cutoff, oldest_cutoff) {
-            (Some(nc), Some(oc)) => Some((candidates, nc, oc)),
-            _ => None,
+        let name = &bucket_names[0];
+        let cell = match pending_bucket_diffs.get(name.as_str()) {
+            Some(cell) => cell,
+            // Referenced bucket name doesn't exist in the configured set
+            // (config changed) — can't verify, same as an unresolvable name
+            // during shard restore (`resolve_bucket_clauses` tombstones it).
+            None => return BucketDiffState::Rebuild,
+        };
+        let diffs = cell.load();
+        if diffs.current_cutoff() == 0 {
+            return BucketDiffState::Noop; // this bucket hasn't refreshed yet
         }
+        BucketDiffState::Apply(
+            RoaringBitmap::clone(diffs.merged_expired().as_ref()),
+            diffs.current_cutoff(),
+            diffs.oldest_cutoff(),
+        )
     }
     /// Seed a freshly-created cache entry's `bucket_cutoff` with the live
     /// per-bucket `PendingBucketDiffs` cutoff instead of wall-clock time.
@@ -5031,13 +5063,25 @@ impl ConcurrentEngine {
     /// window-slide removal path was silently dead for every freshly formed
     /// or restored bucket-filtered cache entry.
     ///
-    /// No-op if the key's filter clauses don't use a time-bucket clause, or
-    /// no referenced bucket has pushed a diff yet (leaves the zero default,
-    /// which is safe — see `resolve_bucket_diff_state`).
+    /// No-op if the key's filter clauses don't use a time-bucket clause.
+    /// `Noop` (no referenced bucket has pushed a diff yet) leaves
+    /// `bucket_cutoff` at its zero default, which is safe — see
+    /// `resolve_bucket_diff_state`. `Rebuild` (a multi-bucket-name entry —
+    /// see `BucketDiffState`) marks the just-created entry for rebuild
+    /// immediately: it was built fresh from truth so this costs nothing
+    /// correctness-wise, but it's the only way to keep a
+    /// can't-safely-diff entry from silently drifting stale later, since no
+    /// per-bucket incremental diff can ever be trusted to apply to it.
     fn seed_bucket_cutoff(&self, ukey: &UnifiedKey) {
         let names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
-        if let Some((_, new_cutoff, _)) = self.resolve_bucket_diff_state(&names) {
-            self.unified_cache.set_entry_bucket_cutoff(ukey, new_cutoff);
+        match self.resolve_bucket_diff_state(&names) {
+            BucketDiffState::Apply(_, new_cutoff, _) => {
+                self.unified_cache.set_entry_bucket_cutoff(ukey, new_cutoff);
+            }
+            BucketDiffState::Rebuild => {
+                self.unified_cache.mark_entry_for_rebuild(ukey);
+            }
+            BucketDiffState::Noop => {}
         }
     }
     /// Union of the LIVE ground-truth bitmaps for the given bucket names.
@@ -5240,10 +5284,16 @@ impl ConcurrentEngine {
                             // Wall-clock now() here permanently defeated the
                             // read-path window-slide diff for restored shards.
                             let names = Self::bucket_names_from_canonical(&key.filter_clauses);
-                            if let Some((_, new_cutoff, _)) =
-                                Self::resolve_bucket_diff_state_for(pending_bucket_diffs, &names)
-                            {
-                                entry.set_bucket_cutoff(new_cutoff);
+                            match Self::resolve_bucket_diff_state_for(pending_bucket_diffs, &names) {
+                                BucketDiffState::Apply(_, new_cutoff, _) => {
+                                    entry.set_bucket_cutoff(new_cutoff);
+                                }
+                                // Can't safely verify (multi-bucket-name
+                                // entry) — mark for rebuild immediately;
+                                // `entry` isn't inserted yet so this is a
+                                // plain local mutation, not a cache lookup.
+                                BucketDiffState::Rebuild => entry.mark_for_rebuild(),
+                                BucketDiffState::Noop => {}
                             }
                         }
                         uc.insert_restored_entry(key, entry);
@@ -5371,29 +5421,41 @@ impl ConcurrentEngine {
                     let mut applied_bucket_diff = false;
                     let result = self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
                         let entry = entry_ref.value_mut();
-                        if let Some((ref candidates, new_cutoff, oldest_cutoff)) = bucket_diff_state {
-                            if entry.uses_bucket() && entry.bucket_cutoff() < new_cutoff {
-                                if entry.bucket_cutoff() >= oldest_cutoff {
-                                    // Scope removal to THIS entry's own
-                                    // bucket(s): `candidates` may include
-                                    // slots that only left ANOTHER bucket's
-                                    // window (if this entry references
-                                    // multiple names) — only remove ones
-                                    // absent from the entry's own bucket(s)'
-                                    // LIVE ground-truth bitmap.
-                                    match Self::own_bucket_live_bitmap(&bucket_names, tb_guard.as_deref()) {
-                                        Some(own_live) => {
-                                            applied_bucket_diff = entry.apply_bucket_diff(
-                                                candidates,
-                                                &own_live,
-                                                new_cutoff,
-                                            );
+                        if entry.uses_bucket() {
+                            match bucket_diff_state {
+                                BucketDiffState::Apply(ref candidates, new_cutoff, oldest_cutoff) => {
+                                    if entry.bucket_cutoff() < new_cutoff {
+                                        if entry.bucket_cutoff() >= oldest_cutoff {
+                                            // Scope removal to THIS entry's own
+                                            // bucket(s): `candidates` may include
+                                            // slots that only left ANOTHER bucket's
+                                            // window (if this entry references
+                                            // multiple names) — only remove ones
+                                            // absent from the entry's own bucket(s)'
+                                            // LIVE ground-truth bitmap.
+                                            match Self::own_bucket_live_bitmap(&bucket_names, tb_guard.as_deref()) {
+                                                Some(own_live) => {
+                                                    applied_bucket_diff = entry.apply_bucket_diff(
+                                                        candidates,
+                                                        &own_live,
+                                                        new_cutoff,
+                                                    );
+                                                }
+                                                None => entry.mark_for_rebuild(),
+                                            }
+                                        } else {
+                                            entry.mark_for_rebuild();
                                         }
-                                        None => entry.mark_for_rebuild(),
                                     }
-                                } else {
-                                    entry.mark_for_rebuild();
                                 }
+                                // Can't safely verify this entry's bucket-diff
+                                // state (multi-bucket-name entry, or a
+                                // referenced bucket name no longer resolves) —
+                                // must rebuild, not silently serve as-is.
+                                BucketDiffState::Rebuild => entry.mark_for_rebuild(),
+                                // Bucket exists but hasn't pushed a diff yet —
+                                // nothing to apply, nothing wrong either.
+                                BucketDiffState::Noop => {}
                             }
                         }
                         let bm = Arc::clone(entry.bitmap());
@@ -5700,8 +5762,8 @@ impl ConcurrentEngine {
                 // See the non-traced execute_query's identical comment.
                 let bucket_names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
                 let bucket_diff_state = self.resolve_bucket_diff_state(&bucket_names);
-                let cache_data = {
-                    if let Some((candidates, new_cutoff, oldest_cutoff)) = bucket_diff_state {
+                let cache_data = match bucket_diff_state {
+                    BucketDiffState::Apply(candidates, new_cutoff, oldest_cutoff) => {
                         // Bucket diff may need to mutate the entry (apply or
                         // mark-for-rebuild). Take the write lock so we can
                         // call `lookup()` which returns `&mut UnifiedEntry`.
@@ -5748,7 +5810,30 @@ impl ConcurrentEngine {
                             ));
                         }
                         r
-                    } else {
+                    }
+                    BucketDiffState::Rebuild => {
+                        // Can't safely verify this entry's bucket-diff state
+                        // (multi-bucket-name entry, or a referenced bucket
+                        // name no longer resolves) — must rebuild, not
+                        // silently serve as-is. mark_for_rebuild is `&self`
+                        // (atomic), so the cheap read-only lookup suffices.
+                        self.unified_cache.lookup_for_read(&ukey).map(|entry_ref| {
+                            let entry = entry_ref.value();
+                            if entry.uses_bucket() {
+                                entry.mark_for_rebuild();
+                            }
+                            let bm = Arc::clone(entry.bitmap());
+                            let has_more = entry.has_more();
+                            let min_val = entry.min_tracked_value();
+                            let cap = entry.capacity();
+                            let total = entry.total_matched();
+                            let radix = entry.radix().cloned();
+                            let direction = entry.direction();
+                            let sorted_keys = entry.sorted_keys().map(Arc::clone);
+                            (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
+                        })
+                    }
+                    BucketDiffState::Noop => {
                         // Hot fast path: no bucket diff to apply. `lookup_for_read`
                         // returns a DashMap Ref — concurrent reads on the same
                         // shard proceed in parallel; writers on other shards
@@ -6162,8 +6247,15 @@ impl ConcurrentEngine {
                 // (see `seed_bucket_cutoff` doc comment) — wall-clock `now()`
                 // permanently defeats the read-path window-slide diff.
                 let names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
-                if let Some((_, new_cutoff, _)) = self.resolve_bucket_diff_state(&names) {
-                    new_entry.set_bucket_cutoff(new_cutoff);
+                match self.resolve_bucket_diff_state(&names) {
+                    BucketDiffState::Apply(_, new_cutoff, _) => {
+                        new_entry.set_bucket_cutoff(new_cutoff);
+                    }
+                    // Can't safely verify (multi-bucket-name entry) — mark
+                    // for rebuild immediately; `new_entry` isn't inserted
+                    // yet so this is a plain local mutation.
+                    BucketDiffState::Rebuild => new_entry.mark_for_rebuild(),
+                    BucketDiffState::Noop => {}
                 }
             }
             // Brief lock 2: insert prebuilt entry + grab sorted_keys for
