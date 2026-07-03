@@ -32,8 +32,29 @@ poll_interval_secs = 2
 # Max outbox rows per poll cycle (default: 5000)
 outbox_batch_limit = 5000
 
-# ClickHouse metrics poll interval in seconds (default: 60)
-metrics_poll_interval_secs = 60
+# --- ClickHouse metrics poller ---
+# Reconcile cadence in seconds (default: 30). Each tick re-scans the trailing
+# window below, so there's no benefit to a very small value.
+metrics_poll_interval_secs = 30
+
+# ClickHouse table scanned to discover images with recent metric activity.
+# MUST be the complete real-time CDC stream, not a partial legacy feed.
+# (default: "entityMetricEvents_month"). Repoint here — no rebuild — if it moves.
+# metrics_table = "entityMetricEvents_month"
+# All-time cumulative totals source (default: "entityMetricDailyAgg_v2").
+# metrics_totals_table = "entityMetricDailyAgg_v2"
+# entityType filtered in both queries (default: "Image").
+# metrics_entity_type = "Image"
+
+# Steady-state trailing discovery window width, seconds (default: 1200 = 20min).
+# Must exceed worst-case CH batch-ingestion lag (minutes on watcher rebalances)
+# AND the totals settle lag (~2.5min) so late/unsettled events are re-read on a
+# later overlapping cycle. Env override: BITDEX_METRICS_RECONCILE_WINDOW_SECS.
+# metrics_reconcile_window_secs = 1200
+# Forward chunk width while catching up after downtime (default: 3600 = 1h).
+# Env override: BITDEX_METRICS_BACKFILL_CHUNK_SECS.
+# metrics_backfill_chunk_secs = 3600
+# One-shot wide backfill: set BITDEX_METRICS_SINCE=<epoch> + DELETE the cursor.
 
 # Replica identifier for cursor tracking (default: "default")
 # In K8s, override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name)

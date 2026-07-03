@@ -7,5 +7,21 @@ pg_pool_size = 10
 batch_size = 100000
 poll_interval_ms = 250
 outbox_batch_limit = 50000
-metrics_poll_interval_secs = 5
 sync_config_path = "/etc/sync-v2/sync-config-civitai.yaml"
+
+# --- ClickHouse metrics poller (reaction/comment/collected sort fields) ---
+# Reconcile cadence. Each tick re-scans the trailing window below, so 30s is
+# plenty — no benefit to going lower.
+metrics_poll_interval_secs = 30
+# Complete real-time CDC event stream (NOT the sparse legacy `entityMetricEvents`).
+metrics_table = "entityMetricEvents_month"
+# All-time cumulative totals source (argMax daily-agg view).
+metrics_totals_table = "entityMetricDailyAgg_v2"
+metrics_entity_type = "Image"
+# Steady trailing discovery window. Must exceed worst-case CH batch-ingestion lag
+# (minutes on watcher rebalances) AND the totals settle lag (~2.5min). 20min.
+metrics_reconcile_window_secs = 1200
+# Forward chunk width while catching up after downtime / a wide backfill anchor.
+metrics_backfill_chunk_secs = 3600
+# One-shot backfill anchor: set BITDEX_METRICS_SINCE=<epoch> as a pod env var and
+# DELETE /cursors/metrics-poller-civitai to force a wide catch-up on next boot.

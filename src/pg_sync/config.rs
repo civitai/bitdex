@@ -44,9 +44,34 @@ pub struct PgSyncConfig {
     /// Outbox batch limit per poll.
     #[serde(default = "default_outbox_batch_limit")]
     pub outbox_batch_limit: i64,
-    /// ClickHouse metrics poll interval in seconds.
+    /// ClickHouse metrics poll (reconcile) interval in seconds.
     #[serde(default = "default_metrics_poll_interval_secs")]
     pub metrics_poll_interval_secs: u64,
+    /// ClickHouse table the metrics poller scans to discover images with recent
+    /// metric activity. MUST be the complete real-time CDC stream, not a partial
+    /// legacy feed. Repoint here (no rebuild) when the upstream table moves.
+    #[serde(default = "default_metrics_table")]
+    pub metrics_table: String,
+    /// ClickHouse table/view the poller reads all-time cumulative totals from
+    /// (argMax daily-agg). Repoint here (no rebuild) if the totals source moves.
+    #[serde(default = "default_metrics_totals_table")]
+    pub metrics_totals_table: String,
+    /// `entityType` value filtered in both discovery and totals queries.
+    #[serde(default = "default_metrics_entity_type")]
+    pub metrics_entity_type: String,
+    /// Steady-state trailing discovery window width, in seconds. Each reconcile
+    /// scans `createdAt >= now - this`. Must be comfortably larger than both the
+    /// worst-case ClickHouse batch-ingestion lag (spikes to minutes on watcher
+    /// rebalances) AND the totals settle lag (~2.5min), so a batch-flushed or
+    /// not-yet-settled event is still re-read on a later overlapping cycle.
+    #[serde(default = "default_metrics_reconcile_window_secs")]
+    pub metrics_reconcile_window_secs: u64,
+    /// Forward chunk width, in seconds, used only while catching up (cursor far
+    /// behind — cold start with a backfill anchor, or long downtime). Historical
+    /// event partitions are immutable, so backfill walks forward in bounded
+    /// non-overlapping chunks; this caps a single query's window width.
+    #[serde(default = "default_metrics_backfill_chunk_secs")]
+    pub metrics_backfill_chunk_secs: u64,
     /// Replica identifier for cursor tracking.
     /// Defaults to "default". Override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name).
     #[serde(default = "default_replica_id")]
@@ -97,7 +122,22 @@ fn default_outbox_batch_limit() -> i64 {
     5000
 }
 fn default_metrics_poll_interval_secs() -> u64 {
-    60
+    30
+}
+fn default_metrics_table() -> String {
+    "entityMetricEvents_month".to_string()
+}
+fn default_metrics_totals_table() -> String {
+    "entityMetricDailyAgg_v2".to_string()
+}
+fn default_metrics_entity_type() -> String {
+    "Image".to_string()
+}
+fn default_metrics_reconcile_window_secs() -> u64 {
+    1200
+}
+fn default_metrics_backfill_chunk_secs() -> u64 {
+    3600
 }
 fn default_replica_id() -> String {
     "default".to_string()
@@ -114,6 +154,18 @@ impl PgSyncConfig {
     pub fn poll_interval(&self) -> std::time::Duration {
         let ms = self.poll_interval_ms.unwrap_or(self.poll_interval_secs * 1000);
         std::time::Duration::from_millis(ms)
+    }
+
+    /// Build the `MetricsPollerConfig` from the resolved sync config.
+    pub fn metrics_poller_config(&self) -> crate::pg_sync::metrics_poller::MetricsPollerConfig {
+        crate::pg_sync::metrics_poller::MetricsPollerConfig {
+            table: self.metrics_table.clone(),
+            totals_table: self.metrics_totals_table.clone(),
+            entity_type: self.metrics_entity_type.clone(),
+            poll_interval_secs: self.metrics_poll_interval_secs,
+            reconcile_window_secs: self.metrics_reconcile_window_secs,
+            backfill_chunk_secs: self.metrics_backfill_chunk_secs,
+        }
     }
 
     /// Load a `PgSyncConfig` from a TOML file on disk.
@@ -146,6 +198,32 @@ impl PgSyncConfig {
         }
         if let Ok(replica) = std::env::var("BITDEX_REPLICA_ID") {
             config.replica_id = replica;
+        }
+        if let Ok(table) = std::env::var("BITDEX_METRICS_TABLE") {
+            config.metrics_table = table;
+        }
+        if let Ok(table) = std::env::var("BITDEX_METRICS_TOTALS_TABLE") {
+            config.metrics_totals_table = table;
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_RECONCILE_WINDOW_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => config.metrics_reconcile_window_secs = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_RECONCILE_WINDOW_SECS={v:?} is not a valid u64 ({e})"
+                    ));
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_BACKFILL_CHUNK_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => config.metrics_backfill_chunk_secs = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_BACKFILL_CHUNK_SECS={v:?} is not a valid u64 ({e})"
+                    ));
+                }
+            }
         }
 
         Ok(config)

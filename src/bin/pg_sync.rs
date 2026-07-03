@@ -212,10 +212,11 @@ async fn main() {
                         username: sync_config.clickhouse_username.clone(),
                         password: sync_config.clickhouse_password.clone(),
                     };
+                    let metrics_cfg = sync_config.metrics_poller_config();
                     let metrics_fut = metrics_poller::run_metrics_poller(
                         &ch_config,
                         &bitdex_client,
-                        sync_config.metrics_poll_interval_secs,
+                        &metrics_cfg,
                     );
 
                     eprintln!("Starting ops poller + metrics poller (bitdex={bitdex_url})...");
@@ -238,8 +239,9 @@ async fn main() {
                     password: sync_config.clickhouse_password.clone(),
                 };
                 eprintln!("Starting metrics poller only (ops disabled)...");
+                let metrics_cfg = sync_config.metrics_poller_config();
                 if let Err(e) = metrics_poller::run_metrics_poller(
-                    &ch_config, &bitdex_client, sync_config.metrics_poll_interval_secs,
+                    &ch_config, &bitdex_client, &metrics_cfg,
                 ).await {
                     eprintln!("Metrics poller error: {e}");
                 }
@@ -809,10 +811,11 @@ async fn run_sync_ch(
     };
 
     eprintln!("Starting ClickHouse metrics poller...");
+    let metrics_cfg = sync_config.metrics_poller_config();
     if let Err(e) = metrics_poller::run_metrics_poller(
         &ch_config,
         bitdex_client,
-        sync_config.metrics_poll_interval_secs,
+        &metrics_cfg,
     ).await {
         eprintln!("Metrics poller error: {e}");
         std::process::exit(1);
