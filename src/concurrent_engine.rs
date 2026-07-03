@@ -827,6 +827,19 @@ impl ConcurrentEngine {
                 let sort_field_name = time_buckets.as_ref()
                     .map(|tb_arc| tb_arc.load().sort_field_name().to_string());
                 let sort_field = sort_field_name.as_deref().and_then(|n| sorts.get_field(n));
+                // Buckets whose boot-diff gap exceeded their own duration —
+                // the persisted diff history is too stale to trust, so the
+                // second phase below must NOT advance `last_cutoff` for
+                // them. Leaving `last_cutoff` at its old (stale) value lets
+                // the flush thread's first incremental refresh naturally
+                // cover the full stale range in one shot (old_cutoff far
+                // enough in the past that every truly-expired slot falls in
+                // `[old_cutoff, new_cutoff)` — a de facto full rebuild, no
+                // separate code path needed). Advancing `last_cutoff` here
+                // instead would silently skip that range forever: ground
+                // truth keeps slots that expired inside the gap, with the
+                // flush thread believing it's already caught up.
+                let mut gap_skipped: HashSet<String> = HashSet::default();
                 for bucket_config in &tb_config.range_buckets {
                     let bucket_name = &bucket_config.name;
                     let mut pending = crate::bucket_diff_log::PendingBucketDiffs::new(max_diffs);
@@ -874,6 +887,7 @@ impl ConcurrentEngine {
                                 if gap_secs > bucket_config.duration_secs {
                                     eprintln!("Boot diff: gap {}s exceeds bucket duration {}s for '{}' — skipping (full rebuild on first refresh)",
                                         gap_secs, bucket_config.duration_secs, bucket_name);
+                                    gap_skipped.insert(bucket_name.clone());
                                 } else {
                                     let bucket_bm = bucket.bitmap();
                                     let old_cutoff_u32 = persisted_cutoff as u32;
@@ -924,6 +938,15 @@ impl ConcurrentEngine {
                     let mut tb = (*tb_arc.load_full()).clone();
                     let mut changed = false;
                     for bucket_config in &tb_config.range_buckets {
+                        if gap_skipped.contains(&bucket_config.name) {
+                            // Boot diff was skipped (gap > duration) — do NOT
+                            // advance last_cutoff here. See the gap_skipped
+                            // doc comment above: leaving it stale lets the
+                            // flush thread's first refresh cover the whole
+                            // gap in one incremental diff instead of quietly
+                            // treating the ungapped range as already handled.
+                            continue;
+                        }
                         if let Some(cell) = map.get(&bucket_config.name) {
                             let pending = cell.load();
                             if pending.current_cutoff() > 0 {
@@ -4941,19 +4964,27 @@ impl ConcurrentEngine {
     /// `PendingBucketDiffs` is keyed per bucket NAME (24h/7d/30d/1y are
     /// independent windows with unrelated cutoff scales — see
     /// `pending_bucket_diffs`'s doc comment). An entry normally references
-    /// exactly one bucket name; the rare multi-name case (a compound clause
-    /// combining two bucket ranges) is handled conservatively: `candidates`
-    /// is the union of every referenced bucket's `merged_expired()`,
-    /// `new_cutoff` is the MIN of their `current_cutoff()`s (only claim
-    /// "caught up" once the slowest-refreshing bucket has too), and
-    /// `oldest_cutoff` is the MAX of their `oldest_cutoff()`s (the entry's
-    /// `bucket_cutoff` must be within EVERY referenced bucket's retained
-    /// diff history for a partial-history application to be safe).
+    /// exactly one bucket name.
     ///
-    /// Returns `None` if `bucket_names` is empty, references an unconfigured
-    /// bucket, or none of the referenced buckets have pushed a diff yet
-    /// (`current_cutoff() == 0`) — callers should seed/leave `bucket_cutoff`
-    /// at its zero default rather than guess.
+    /// The multi-name case (a compound clause combining two bucket ranges on
+    /// the same field, e.g. `Gte(sortAtUnix, X) AND Gte(sortAtUnix, Y)`) is
+    /// syntactically reachable — nothing in the query parser rejects two
+    /// range clauses on the same bucket field — but no known Civitai client
+    /// query pattern constructs one (it's a redundant/degenerate shape: an
+    /// AND of two bucket windows just narrows to the tighter one; an OR
+    /// widens to the looser one; either way a sane query builder would just
+    /// emit the single resulting clause). Rather than trusting a guess at
+    /// AND vs. OR semantics from the flattened clause list — a union-based
+    /// live-bitmap would UNDER-remove for AND (a slot that fell out of only
+    /// one of the two ANDed bucket windows should be dropped, but survives
+    /// in the union) — this bails to `None` for >1 distinct name, which
+    /// forces the caller's `mark_for_rebuild()` fallback: always correct,
+    /// just costs a rebuild for a shape that shouldn't occur in practice.
+    ///
+    /// Returns `None` if `bucket_names` is empty or has >1 distinct name,
+    /// references an unconfigured bucket, or the referenced bucket hasn't
+    /// pushed a diff yet (`current_cutoff() == 0`) — callers should
+    /// seed/leave `bucket_cutoff` at its zero default rather than guess.
     fn resolve_bucket_diff_state(&self, bucket_names: &[String]) -> Option<(RoaringBitmap, u64, u64)> {
         Self::resolve_bucket_diff_state_for(&self.pending_bucket_diffs, bucket_names)
     }
@@ -4964,7 +4995,7 @@ impl ConcurrentEngine {
         pending_bucket_diffs: &HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>,
         bucket_names: &[String],
     ) -> Option<(RoaringBitmap, u64, u64)> {
-        if bucket_names.is_empty() {
+        if bucket_names.is_empty() || bucket_names.len() > 1 {
             return None;
         }
         let mut candidates = RoaringBitmap::new();
@@ -5018,6 +5049,13 @@ impl ConcurrentEngine {
     /// intersect-then-validate instead of trusting a diff pool blindly
     /// (mirrors #273's ADD-side fix, which re-resolves against live state
     /// instead of a frozen capture).
+    ///
+    /// In practice `bucket_names` never has more than one element here:
+    /// both call sites only reach this after `resolve_bucket_diff_state`
+    /// already bailed on >1 distinct name (see its doc comment for why a
+    /// union isn't safe to trust for a hypothetical AND-of-two-bucket-clauses
+    /// entry). The union is kept anyway as the natural identity for the
+    /// single-name case, not as multi-name support.
     ///
     /// Returns `None` (caller should `mark_for_rebuild` instead of guessing)
     /// if `tb` is unavailable, `bucket_names` is empty, or any referenced
