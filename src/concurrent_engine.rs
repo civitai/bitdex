@@ -3017,6 +3017,7 @@ impl ConcurrentEngine {
             let merge_dirty_shards = docstore.read().dirty_shards_arc();
             let merge_prefilter_registry = Arc::clone(&prefilter_registry);
             let merge_warm_registry = Arc::clone(&warm_registry);
+            let merge_tombstones_cleaned = Arc::clone(&boundstore_tombstones_cleaned);
 
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
@@ -3316,6 +3317,12 @@ impl ConcurrentEngine {
                             if !all_cleaned.is_empty() {
                                 let uc = &merge_unified_cache;
                                 uc.finalize_shard_write(&all_cleaned);
+                                // Record cleaned tombstones so the
+                                // bitdex_boundstore_tombstones_cleaned_total metric
+                                // reflects actual shard-rewrite cleanup (previously
+                                // never incremented — the counter read a flat 0).
+                                merge_tombstones_cleaned
+                                    .fetch_add(all_cleaned.len() as u64, Ordering::Relaxed);
                             }
                             did_persist_data = true;
                         }
