@@ -241,9 +241,20 @@ pub struct ConcurrentEngine {
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
-    /// Pending bucket diffs for lazy application on cache reads.
-    /// Flush thread stores new snapshots; query threads load for diff application.
-    pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
+    /// Pending bucket diffs for lazy application on cache reads, keyed by
+    /// bucket NAME (24h/7d/30d/1y are independent windows on the same
+    /// field). Must be per-bucket, not a single shared cutoff: a wide
+    /// bucket's (7d) `current_cutoff` and a narrow bucket's (24h) are
+    /// unrelated numbers (`snap(now - duration, interval)` for different
+    /// `duration`s) — merging them into one scalar made `current_cutoff`
+    /// regress every time the narrower bucket refreshed after the wider one
+    /// in the same flush cycle, and made a single `merged_expired` bitmap a
+    /// cross-bucket union unsafe to apply blindly (see
+    /// `ConcurrentEngine::own_bucket_live_bitmap`). The key set is fixed at
+    /// boot from `config.time_buckets.range_buckets` — only the per-bucket
+    /// `ArcSwap` cells are mutated at runtime, so the outer `HashMap` never
+    /// needs to be swapped or cloned.
+    pending_bucket_diffs: Arc<HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>>,
     /// Fields not yet loaded from disk (lazy loading on first query).
     pending_filter_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
     pending_sort_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -395,6 +406,28 @@ pub struct ConcurrentEngine {
     prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
     /// Warm registry: tracks popular query shapes for auto-warming on boot.
     warm_registry: Arc<crate::warm_registry::WarmRegistry>,
+}
+
+/// Outcome of resolving a cache entry's bucket-diff state
+/// (`ConcurrentEngine::resolve_bucket_diff_state[_for]`). Distinguishes two
+/// DIFFERENT reasons a caller might not get a usable diff to apply — they
+/// require opposite handling, which a single `Option::None` can't express
+/// (an earlier version conflated them and silently under-served the
+/// `Rebuild` case as a no-op — see the multi-bucket-clause review note on
+/// `resolve_bucket_diff_state_for`):
+/// - `Rebuild`: correctness can't be verified (multi-bucket-name entry, or a
+///   referenced bucket name no longer resolves) — caller MUST call
+///   `mark_for_rebuild()`. Silently skipping here would serve a
+///   potentially-stale entry forever (until TTL, if any).
+/// - `Noop`: nothing to apply YET, but nothing is wrong either (the entry's
+///   single bucket exists but hasn't pushed a diff since boot) — caller
+///   should just skip, not rebuild (rebuilding on every read until the
+///   first refresh cycle would be wasteful and pointless).
+#[derive(Debug)]
+enum BucketDiffState {
+    Apply(RoaringBitmap, u64, u64),
+    Rebuild,
+    Noop,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -800,67 +833,84 @@ impl ConcurrentEngine {
             }
             Arc::new(ArcSwap::new(Arc::new(tb)))
         });
-        // Initialize pending bucket diffs (load from append-only log on disk + compute boot diff)
-        let pending_bucket_diffs = {
+        // Initialize pending bucket diffs (load from append-only log on disk + compute
+        // boot diff), one independent `PendingBucketDiffs` per bucket NAME — see the
+        // field's doc comment for why this must not be a single shared struct.
+        let pending_bucket_diffs: Arc<HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>> = {
             let max_diffs = 100; // ~8 hours at 300s intervals
-            let mut pending = crate::bucket_diff_log::PendingBucketDiffs::new(max_diffs);
-            let diff_log_path = config.storage.bitmap_path.as_ref()
-                .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
-            // Step 1: Load persisted diffs from append-only log
-            if let Some(ref log_path) = diff_log_path {
-                if log_path.exists() {
-                    let log = crate::bucket_diff_log::BucketDiffLog::new(
-                        log_path.clone(), max_diffs, 0.3,
-                    );
-                    match log.read_retained() {
-                        Ok(diffs) if !diffs.is_empty() => {
-                            let count = diffs.len();
-                            pending = crate::bucket_diff_log::PendingBucketDiffs::from_diffs(diffs, max_diffs);
-                            eprintln!("Loaded {count} bucket diffs from disk (coverage: cutoff {} to {})",
-                                pending.oldest_cutoff(), pending.current_cutoff());
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Warning: failed to load bucket diffs: {e}"),
-                    }
-                }
-            }
-            // Step 2: Compute boot diff to cover the gap between persisted diffs and now.
-            // The sort field for time buckets was eagerly loaded above, so it's available in `sorts`.
+            let mut map: HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>> = HashMap::default();
             if let Some(ref tb_config) = config.time_buckets {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                if let Some(ref tb_arc) = time_buckets {
-                    let tb = tb_arc.load();
-                    let sort_field_name = tb.sort_field_name().to_string();
-                    drop(tb);
-                    if let Some(sort_field) = sorts.get_field(&sort_field_name) {
+                // The sort field for time buckets was eagerly loaded above, so it's
+                // available in `sorts`. One sort field is shared by every bucket name.
+                let sort_field_name = time_buckets.as_ref()
+                    .map(|tb_arc| tb_arc.load().sort_field_name().to_string());
+                let sort_field = sort_field_name.as_deref().and_then(|n| sorts.get_field(n));
+                // Buckets whose boot-diff gap exceeded their own duration —
+                // the persisted diff history is too stale to trust, so the
+                // second phase below must NOT advance `last_cutoff` for
+                // them. Leaving `last_cutoff` at its old (stale) value lets
+                // the flush thread's first incremental refresh naturally
+                // cover the full stale range in one shot (old_cutoff far
+                // enough in the past that every truly-expired slot falls in
+                // `[old_cutoff, new_cutoff)` — a de facto full rebuild, no
+                // separate code path needed). Advancing `last_cutoff` here
+                // instead would silently skip that range forever: ground
+                // truth keeps slots that expired inside the gap, with the
+                // flush thread believing it's already caught up.
+                let mut gap_skipped: HashSet<String> = HashSet::default();
+                for bucket_config in &tb_config.range_buckets {
+                    let bucket_name = &bucket_config.name;
+                    let mut pending = crate::bucket_diff_log::PendingBucketDiffs::new(max_diffs);
+                    let diff_log_path = config.storage.bitmap_path.as_ref()
+                        .map(|bp| std::path::Path::new(bp).join(format!("bucket_diffs__{bucket_name}.log")));
+                    // Step 1: Load persisted diffs from THIS bucket's own append-only log.
+                    if let Some(ref log_path) = diff_log_path {
+                        if log_path.exists() {
+                            let log = crate::bucket_diff_log::BucketDiffLog::new(
+                                log_path.clone(), max_diffs, 0.3,
+                            );
+                            match log.read_retained() {
+                                Ok(diffs) if !diffs.is_empty() => {
+                                    let count = diffs.len();
+                                    pending = crate::bucket_diff_log::PendingBucketDiffs::from_diffs(diffs, max_diffs);
+                                    eprintln!("Loaded {count} bucket diffs from disk for '{}' (coverage: cutoff {} to {})",
+                                        bucket_name, pending.oldest_cutoff(), pending.current_cutoff());
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("Warning: failed to load bucket diffs for '{}': {e}", bucket_name),
+                            }
+                        }
+                    }
+                    // Step 2: Compute boot diff to cover the gap between persisted diffs
+                    // and now, scoped to THIS bucket's own bitmap and cutoff.
+                    if let (Some(ref tb_arc), Some(sort_field)) = (time_buckets.as_ref(), sort_field) {
                         let tb = tb_arc.load();
-                        for bucket_config in &tb_config.range_buckets {
-                            let bucket_name = &bucket_config.name;
-                            if let Some(bucket) = tb.get_bucket(bucket_name) {
-                                let current_cutoff = crate::bucket_diff_log::snap_cutoff(
-                                    now_secs.saturating_sub(bucket_config.duration_secs),
-                                    bucket_config.refresh_interval_secs,
-                                );
-                                // Determine where persisted diffs leave off
-                                let persisted_cutoff = if pending.current_cutoff() > 0 {
-                                    pending.current_cutoff()
+                        if let Some(bucket) = tb.get_bucket(bucket_name) {
+                            let current_cutoff = crate::bucket_diff_log::snap_cutoff(
+                                now_secs.saturating_sub(bucket_config.duration_secs),
+                                bucket_config.refresh_interval_secs,
+                            );
+                            // Determine where persisted diffs leave off
+                            let persisted_cutoff = if pending.current_cutoff() > 0 {
+                                pending.current_cutoff()
+                            } else {
+                                bucket.last_cutoff()
+                            };
+                            if current_cutoff > persisted_cutoff && persisted_cutoff > 0 {
+                                // Gap exists — compute boot diff by scanning bucket bitmap
+                                let gap_secs = current_cutoff - persisted_cutoff;
+                                // Safety check: if gap > bucket duration, the persisted bitmap
+                                // is meaningless. The flush thread will do a full rebuild on
+                                // the first refresh cycle. Don't compute a boot diff.
+                                if gap_secs > bucket_config.duration_secs {
+                                    eprintln!("Boot diff: gap {}s exceeds bucket duration {}s for '{}' — skipping (full rebuild on first refresh)",
+                                        gap_secs, bucket_config.duration_secs, bucket_name);
+                                    gap_skipped.insert(bucket_name.clone());
                                 } else {
-                                    bucket.last_cutoff()
-                                };
-                                if current_cutoff > persisted_cutoff && persisted_cutoff > 0 {
-                                    // Gap exists — compute boot diff by scanning bucket bitmap
-                                    let gap_secs = current_cutoff - persisted_cutoff;
-                                    // Safety check: if gap > bucket duration, the persisted bitmap
-                                    // is meaningless. The flush thread will do a full rebuild on
-                                    // the first refresh cycle. Don't compute a boot diff.
-                                    if gap_secs > bucket_config.duration_secs {
-                                        eprintln!("Boot diff: gap {}s exceeds bucket duration {}s for '{}' — skipping (full rebuild on first refresh)",
-                                            gap_secs, bucket_config.duration_secs, bucket_name);
-                                        continue;
-                                    }
                                     let bucket_bm = bucket.bitmap();
                                     let old_cutoff_u32 = persisted_cutoff as u32;
                                     let new_cutoff_u32 = current_cutoff as u32;
@@ -882,29 +932,46 @@ impl ConcurrentEngine {
                                             cutoff_after: current_cutoff,
                                             expired: std::sync::Arc::new(expired),
                                         };
-                                        // Append boot diff to on-disk log
+                                        // Append boot diff to THIS bucket's own on-disk log
                                         if let Some(ref log_path) = diff_log_path {
                                             let log = crate::bucket_diff_log::BucketDiffLog::new(
                                                 log_path.clone(), max_diffs, 0.3,
                                             );
                                             if let Err(e) = log.append(&diff) {
-                                                eprintln!("Warning: failed to append boot diff to log: {e}");
+                                                eprintln!("Warning: failed to append boot diff to log for '{}': {e}", bucket_name);
                                             }
                                         }
                                         pending.push(diff);
                                     }
-                                } else if persisted_cutoff == 0 {
-                                    eprintln!("Boot diff: no persisted cutoff for '{}' — first boot, full rebuild on first refresh", bucket_name);
-                                } else {
-                                    eprintln!("Boot diff: '{}' already current (persisted={}, current={})", bucket_name, persisted_cutoff, current_cutoff);
                                 }
+                            } else if persisted_cutoff == 0 {
+                                eprintln!("Boot diff: no persisted cutoff for '{}' — first boot, full rebuild on first refresh", bucket_name);
+                            } else {
+                                eprintln!("Boot diff: '{}' already current (persisted={}, current={})", bucket_name, persisted_cutoff, current_cutoff);
                             }
                         }
-                        drop(tb);
-                        // Also apply boot diffs to the bucket bitmaps themselves
-                        if pending.current_cutoff() > 0 {
-                            let mut tb = (*tb_arc.load_full()).clone();
-                            for bucket_config in &tb_config.range_buckets {
+                    }
+                    map.insert(bucket_name.clone(), Arc::new(ArcSwap::new(Arc::new(pending))));
+                }
+                // Apply each bucket's OWN boot diff to its OWN ground-truth bitmap —
+                // never a cross-bucket merged set (that would wrongly strip a wide
+                // bucket's bitmap using a narrow bucket's expiry, and vice versa).
+                if let Some(ref tb_arc) = time_buckets {
+                    let mut tb = (*tb_arc.load_full()).clone();
+                    let mut changed = false;
+                    for bucket_config in &tb_config.range_buckets {
+                        if gap_skipped.contains(&bucket_config.name) {
+                            // Boot diff was skipped (gap > duration) — do NOT
+                            // advance last_cutoff here. See the gap_skipped
+                            // doc comment above: leaving it stale lets the
+                            // flush thread's first refresh cover the whole
+                            // gap in one incremental diff instead of quietly
+                            // treating the ungapped range as already handled.
+                            continue;
+                        }
+                        if let Some(cell) = map.get(&bucket_config.name) {
+                            let pending = cell.load();
+                            if pending.current_cutoff() > 0 {
                                 if let Some(bucket) = tb.get_bucket_mut(&bucket_config.name) {
                                     let new_cutoff = crate::bucket_diff_log::snap_cutoff(
                                         now_secs.saturating_sub(bucket_config.duration_secs),
@@ -912,17 +979,20 @@ impl ConcurrentEngine {
                                     );
                                     if new_cutoff > bucket.last_cutoff() {
                                         bucket.subtract_expired(pending.merged_expired(), new_cutoff);
+                                        changed = true;
                                         eprintln!("Applied boot diff to '{}' bucket bitmap (cutoff → {})",
                                             bucket_config.name, new_cutoff);
                                     }
                                 }
                             }
-                            tb_arc.store(Arc::new(tb));
                         }
+                    }
+                    if changed {
+                        tb_arc.store(Arc::new(tb));
                     }
                 }
             }
-            Arc::new(ArcSwap::new(Arc::new(pending)))
+            Arc::new(map)
         };
         let inner_engine = InnerEngine {
             slots,
@@ -1190,8 +1260,10 @@ impl ConcurrentEngine {
             let flush_metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> =
                 Arc::clone(&metrics_bridge);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
-            let flush_diff_log_path = config.storage.bitmap_path.as_ref()
-                .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
+            // Base dir for per-bucket-name diff logs (`bucket_diffs__{name}.log`) —
+            // see `pending_bucket_diffs`'s doc comment for why these are per-bucket.
+            let flush_diff_log_dir = config.storage.bitmap_path.as_ref()
+                .map(|bp| std::path::PathBuf::from(bp));
             let flush_pub_count = Arc::clone(&flush_publish_count);
             let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
@@ -2821,28 +2893,35 @@ impl ConcurrentEngine {
                                             cutoff_after: new_cutoff,
                                             expired: Arc::new(expired),
                                         };
-                                        // Append to on-disk log
-                                        if let Some(ref log_path) = flush_diff_log_path {
+                                        // Append to THIS bucket's own on-disk log — each
+                                        // bucket name gets an independent diff history (see
+                                        // `pending_bucket_diffs`'s doc comment).
+                                        if let Some(ref dir) = flush_diff_log_dir {
+                                            let log_path = dir.join(format!("bucket_diffs__{bucket_name}.log"));
                                             let log = crate::bucket_diff_log::BucketDiffLog::new(
-                                                log_path.clone(), 100, 0.3,
+                                                log_path, 100, 0.3,
                                             );
                                             if let Err(e) = log.append(&diff) {
-                                                eprintln!("Warning: failed to append bucket diff to log: {e}");
+                                                eprintln!("Warning: failed to append bucket diff to log for '{}': {e}", bucket_name);
                                             }
                                             // Periodic compaction
                                             if let Err(e) = log.compact_if_needed() {
-                                                eprintln!("Warning: bucket diff log compaction failed: {e}");
+                                                eprintln!("Warning: bucket diff log compaction failed for '{}': {e}", bucket_name);
                                             }
                                         }
-                                        // Update in-memory pending diffs (ArcSwap store)
-                                        {
-                                            let old_pending = flush_pending_diffs.load();
+                                        // Update THIS bucket's own in-memory pending diffs
+                                        // (ArcSwap store on its own cell — other buckets'
+                                        // cells are untouched, no cross-bucket clone cascade).
+                                        if let Some(cell) = flush_pending_diffs.get(bucket_name.as_str()) {
+                                            let old_pending = cell.load();
                                             let mut new_pending = crate::bucket_diff_log::PendingBucketDiffs::from_diffs(
                                                 old_pending.diffs().to_vec(),
                                                 100,
                                             );
                                             new_pending.push(diff);
-                                            flush_pending_diffs.store(Arc::new(new_pending));
+                                            cell.store(Arc::new(new_pending));
+                                        } else {
+                                            eprintln!("Warning: no pending-diffs cell for bucket '{}' — config changed at runtime?", bucket_name);
                                         }
                                         eprintln!("Time bucket '{}' incremental refresh: expired={} cutoff {}→{} in {:?}",
                                             bucket_name, expired_count, old_cutoff, new_cutoff, start.elapsed());
@@ -4886,6 +4965,163 @@ impl ConcurrentEngine {
             FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => {}
         }
     }
+    /// Bucket names (excluding the `__prefilter` sentinel) referenced by a
+    /// canonical clause list — i.e. `ukey.filter_clauses`. Top-level `And` is
+    /// already flattened by `cache::canonicalize`, so a real time-bucket
+    /// clause shows up as its own flat `CanonicalClause { op: "bucket",
+    /// value_repr: bucket_name, .. }` entry (see `CanonicalClause::from_filter`).
+    /// A bucket clause nested inside an `Or`/`Not` collapses into a compound
+    /// `op` string and is NOT extracted here — same conservative "can't
+    /// verify, don't guess" stance as `own_bucket_live_bitmap`'s `None`.
+    fn bucket_names_from_canonical(clauses: &[crate::cache::CanonicalClause]) -> Vec<String> {
+        clauses
+            .iter()
+            .filter(|c| crate::unified_cache::is_time_bucket_clause(c))
+            .map(|c| c.value_repr.clone())
+            .collect()
+    }
+    /// Resolve the effective bucket-diff state for an entry that depends on
+    /// one or more bucket names.
+    ///
+    /// `PendingBucketDiffs` is keyed per bucket NAME (24h/7d/30d/1y are
+    /// independent windows with unrelated cutoff scales — see
+    /// `pending_bucket_diffs`'s doc comment). An entry normally references
+    /// exactly one bucket name.
+    ///
+    /// The multi-name case (a compound clause combining two bucket ranges on
+    /// the same field, e.g. `Gte(sortAtUnix, X) AND Gte(sortAtUnix, Y)`) is
+    /// syntactically reachable — nothing in the query parser rejects two
+    /// range clauses on the same bucket field — but no known Civitai client
+    /// query pattern constructs one (it's a redundant/degenerate shape: an
+    /// AND of two bucket windows just narrows to the tighter one; an OR
+    /// widens to the looser one; either way a sane query builder would just
+    /// emit the single resulting clause). Rather than trusting a guess at
+    /// AND vs. OR semantics from the flattened clause list — a union-based
+    /// live-bitmap would UNDER-remove for AND (a slot that fell out of only
+    /// one of the two ANDed bucket windows should be dropped, but survives
+    /// in the union) — this returns `Rebuild` for >1 distinct name (or an
+    /// empty list, which shouldn't happen if the caller only calls this when
+    /// `uses_bucket()`/`is_time_bucket_clause` was true — treated the same
+    /// defensively): always correct, just costs a rebuild for a shape that
+    /// shouldn't occur in practice.
+    ///
+    /// Returns `Noop` if the single referenced bucket exists but hasn't
+    /// pushed a diff yet (`current_cutoff() == 0`) — callers should
+    /// seed/leave `bucket_cutoff` at its zero default rather than guess.
+    fn resolve_bucket_diff_state(&self, bucket_names: &[String]) -> BucketDiffState {
+        Self::resolve_bucket_diff_state_for(&self.pending_bucket_diffs, bucket_names)
+    }
+    /// Free-standing version of `resolve_bucket_diff_state` for callers
+    /// without a `&self` (e.g. `load_shard_background`, a spawned-thread
+    /// static function that only has the `Arc<HashMap<..>>` handle).
+    fn resolve_bucket_diff_state_for(
+        pending_bucket_diffs: &HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>,
+        bucket_names: &[String],
+    ) -> BucketDiffState {
+        // Empty is a defensive default, not the "ambiguous" case: callers
+        // are expected to only call this when the key/entry actually
+        // references a bucket (non-empty `bucket_names`); if one doesn't,
+        // there's nothing to resolve — Noop, not Rebuild. Only >1 distinct
+        // name is the genuinely unresolvable case (see the doc comment
+        // above).
+        if bucket_names.is_empty() {
+            return BucketDiffState::Noop;
+        }
+        if bucket_names.len() > 1 {
+            return BucketDiffState::Rebuild;
+        }
+        let name = &bucket_names[0];
+        let cell = match pending_bucket_diffs.get(name.as_str()) {
+            Some(cell) => cell,
+            // Referenced bucket name doesn't exist in the configured set
+            // (config changed) — can't verify, same as an unresolvable name
+            // during shard restore (`resolve_bucket_clauses` tombstones it).
+            None => return BucketDiffState::Rebuild,
+        };
+        let diffs = cell.load();
+        if diffs.current_cutoff() == 0 {
+            return BucketDiffState::Noop; // this bucket hasn't refreshed yet
+        }
+        BucketDiffState::Apply(
+            RoaringBitmap::clone(diffs.merged_expired().as_ref()),
+            diffs.current_cutoff(),
+            diffs.oldest_cutoff(),
+        )
+    }
+    /// Seed a freshly-created cache entry's `bucket_cutoff` with the live
+    /// per-bucket `PendingBucketDiffs` cutoff instead of wall-clock time.
+    ///
+    /// `bucket_cutoff` must live in the same *snapped* scale as a bucket's
+    /// own `PendingBucketDiffs::current_cutoff()` (`snap(now - duration,
+    /// refresh_interval)` — see `time_buckets.rs::TimeBucket::last_cutoff`).
+    /// `UnifiedCache::form_and_store_with_clauses` has no visibility into
+    /// pending-diffs state, so it leaves `bucket_cutoff` zeroed; this is the
+    /// follow-up every production entry-creation path must call. Stamping
+    /// wall-clock `now()` instead (the old behavior) made the read-path
+    /// diff-apply check structurally false for the entry's entire life,
+    /// since `current_cutoff()` trails `now()` by `duration_secs` — the
+    /// window-slide removal path was silently dead for every freshly formed
+    /// or restored bucket-filtered cache entry.
+    ///
+    /// No-op if the key's filter clauses don't use a time-bucket clause.
+    /// `Noop` (no referenced bucket has pushed a diff yet) leaves
+    /// `bucket_cutoff` at its zero default, which is safe — see
+    /// `resolve_bucket_diff_state`. `Rebuild` (a multi-bucket-name entry —
+    /// see `BucketDiffState`) marks the just-created entry for rebuild
+    /// immediately: it was built fresh from truth so this costs nothing
+    /// correctness-wise, but it's the only way to keep a
+    /// can't-safely-diff entry from silently drifting stale later, since no
+    /// per-bucket incremental diff can ever be trusted to apply to it.
+    fn seed_bucket_cutoff(&self, ukey: &UnifiedKey) {
+        let names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
+        match self.resolve_bucket_diff_state(&names) {
+            BucketDiffState::Apply(_, new_cutoff, _) => {
+                self.unified_cache.set_entry_bucket_cutoff(ukey, new_cutoff);
+            }
+            BucketDiffState::Rebuild => {
+                self.unified_cache.mark_entry_for_rebuild(ukey);
+            }
+            BucketDiffState::Noop => {}
+        }
+    }
+    /// Union of the LIVE ground-truth bitmaps for the given bucket names.
+    ///
+    /// A single `merged_expired()` diff pool is only a candidate set — it
+    /// says a slot left ITS bucket's window, not necessarily the querying
+    /// entry's own bucket(s). This resolves the entry's OWN bucket(s)
+    /// against the live `TimeBucketManager` so the caller can
+    /// intersect-then-validate instead of trusting a diff pool blindly
+    /// (mirrors #273's ADD-side fix, which re-resolves against live state
+    /// instead of a frozen capture).
+    ///
+    /// In practice `bucket_names` never has more than one element here:
+    /// both call sites only reach this after `resolve_bucket_diff_state`
+    /// already bailed on >1 distinct name (see its doc comment for why a
+    /// union isn't safe to trust for a hypothetical AND-of-two-bucket-clauses
+    /// entry). The union is kept anyway as the natural identity for the
+    /// single-name case, not as multi-name support.
+    ///
+    /// Returns `None` (caller should `mark_for_rebuild` instead of guessing)
+    /// if `tb` is unavailable, `bucket_names` is empty, or any referenced
+    /// bucket name no longer resolves (config changed) — the same "can't
+    /// verify" case `resolve_bucket_clauses` tombstones during shard restore.
+    fn own_bucket_live_bitmap(
+        bucket_names: &[String],
+        tb: Option<&TimeBucketManager>,
+    ) -> Option<RoaringBitmap> {
+        let tb = tb?;
+        if bucket_names.is_empty() {
+            return None;
+        }
+        let mut union = RoaringBitmap::new();
+        for name in bucket_names {
+            match tb.get_bucket(name) {
+                Some(b) => union |= b.bitmap().as_ref(),
+                None => return None,
+            }
+        }
+        Some(union)
+    }
     /// Execute a parsed BitdexQuery.
     /// Trigger background loading of a pending cache shard from disk.
     /// Non-blocking: sets loading sentinel and spawns a background thread.
@@ -4912,13 +5148,15 @@ impl ConcurrentEngine {
             let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
             let time_buckets_clone = self.time_buckets.as_ref().map(Arc::clone);
             let prefilter_registry_clone = Arc::clone(&self.prefilter_registry);
+            let pending_bucket_diffs_clone = Arc::clone(&self.pending_bucket_diffs);
             std::thread::Builder::new()
                 .name(format!("shard-load-{}_{:?}", sort_field, direction))
                 .spawn(move || {
                     Self::load_shard_background(
                         &bs, &uc_arc, &inner, &sort_field, direction,
                         &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
-                        time_buckets_clone, prefilter_registry_clone,
+                        time_buckets_clone, prefilter_registry_clone, &pending_bucket_diffs_clone,
+                        // ^ pending_bucket_diffs_clone: Arc<HashMap<..>> derefs to &HashMap<..>.
                     );
                 })
                 .map_err(|e| {
@@ -4940,6 +5178,7 @@ impl ConcurrentEngine {
         boundstore_entries_skipped: &Arc<AtomicU64>,
         time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
         prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
+        pending_bucket_diffs: &HashMap<String, Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>>,
     ) {
             let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
@@ -5040,11 +5279,22 @@ impl ConcurrentEngine {
                         let restored_uses_bucket = key.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
                         entry.set_uses_bucket(restored_uses_bucket);
                         if restored_uses_bucket {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            entry.set_bucket_cutoff(now);
+                            // Must match the entry's own bucket's snapped-cutoff
+                            // scale — see `seed_bucket_cutoff` doc comment.
+                            // Wall-clock now() here permanently defeated the
+                            // read-path window-slide diff for restored shards.
+                            let names = Self::bucket_names_from_canonical(&key.filter_clauses);
+                            match Self::resolve_bucket_diff_state_for(pending_bucket_diffs, &names) {
+                                BucketDiffState::Apply(_, new_cutoff, _) => {
+                                    entry.set_bucket_cutoff(new_cutoff);
+                                }
+                                // Can't safely verify (multi-bucket-name
+                                // entry) — mark for rebuild immediately;
+                                // `entry` isn't inserted yet so this is a
+                                // plain local mutation, not a cache lookup.
+                                BucketDiffState::Rebuild => entry.mark_for_rebuild(),
+                                BucketDiffState::Noop => {}
+                            }
                         }
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
@@ -5160,22 +5410,52 @@ impl ConcurrentEngine {
                     sort_field: sort_clause.field.clone(),
                     direction: sort_clause.direction,
                 };
+                // Bucket names this query's OWN clauses reference, and the
+                // resolved per-bucket diff state (candidates ∪, min
+                // current_cutoff, max oldest_cutoff) — see
+                // `resolve_bucket_diff_state`'s doc comment for why this must
+                // be per-bucket-name, not a single shared cutoff.
+                let bucket_names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
+                let bucket_diff_state = self.resolve_bucket_diff_state(&bucket_names);
                 let cache_data = {
-                    let pending = self.pending_bucket_diffs.load();
                     let mut applied_bucket_diff = false;
                     let result = self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
                         let entry = entry_ref.value_mut();
-                        if pending.current_cutoff() > 0
-                            && entry.uses_bucket()
-                            && entry.bucket_cutoff() < pending.current_cutoff()
-                        {
-                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                applied_bucket_diff = entry.apply_bucket_diff(
-                                    pending.merged_expired(),
-                                    pending.current_cutoff(),
-                                );
-                            } else {
-                                entry.mark_for_rebuild();
+                        if entry.uses_bucket() {
+                            match bucket_diff_state {
+                                BucketDiffState::Apply(ref candidates, new_cutoff, oldest_cutoff) => {
+                                    if entry.bucket_cutoff() < new_cutoff {
+                                        if entry.bucket_cutoff() >= oldest_cutoff {
+                                            // Scope removal to THIS entry's own
+                                            // bucket(s): `candidates` may include
+                                            // slots that only left ANOTHER bucket's
+                                            // window (if this entry references
+                                            // multiple names) — only remove ones
+                                            // absent from the entry's own bucket(s)'
+                                            // LIVE ground-truth bitmap.
+                                            match Self::own_bucket_live_bitmap(&bucket_names, tb_guard.as_deref()) {
+                                                Some(own_live) => {
+                                                    applied_bucket_diff = entry.apply_bucket_diff(
+                                                        candidates,
+                                                        &own_live,
+                                                        new_cutoff,
+                                                    );
+                                                }
+                                                None => entry.mark_for_rebuild(),
+                                            }
+                                        } else {
+                                            entry.mark_for_rebuild();
+                                        }
+                                    }
+                                }
+                                // Can't safely verify this entry's bucket-diff
+                                // state (multi-bucket-name entry, or a
+                                // referenced bucket name no longer resolves) —
+                                // must rebuild, not silently serve as-is.
+                                BucketDiffState::Rebuild => entry.mark_for_rebuild(),
+                                // Bucket exists but hasn't pushed a diff yet —
+                                // nothing to apply, nothing wrong either.
+                                BucketDiffState::Noop => {}
                             }
                         }
                         let bm = Arc::clone(entry.bitmap());
@@ -5479,10 +5759,11 @@ impl ConcurrentEngine {
                     sort_field: sort_clause.field.clone(),
                     direction: sort_clause.direction,
                 };
-                let cache_data = {
-                    let pending = self.pending_bucket_diffs.load();
-                    let needs_diff = pending.current_cutoff() > 0;
-                    if needs_diff {
+                // See the non-traced execute_query's identical comment.
+                let bucket_names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
+                let bucket_diff_state = self.resolve_bucket_diff_state(&bucket_names);
+                let cache_data = match bucket_diff_state {
+                    BucketDiffState::Apply(candidates, new_cutoff, oldest_cutoff) => {
                         // Bucket diff may need to mutate the entry (apply or
                         // mark-for-rebuild). Take the write lock so we can
                         // call `lookup()` which returns `&mut UnifiedEntry`.
@@ -5496,14 +5777,18 @@ impl ConcurrentEngine {
                         let mut applied_bucket_diff = false;
                         let r = self.unified_cache.lookup(&ukey).map(|mut entry_ref| {
                             let entry = entry_ref.value_mut();
-                            if entry.uses_bucket()
-                                && entry.bucket_cutoff() < pending.current_cutoff()
-                            {
-                                if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                    applied_bucket_diff = entry.apply_bucket_diff(
-                                        pending.merged_expired(),
-                                        pending.current_cutoff(),
-                                    );
+                            if entry.uses_bucket() && entry.bucket_cutoff() < new_cutoff {
+                                if entry.bucket_cutoff() >= oldest_cutoff {
+                                    match Self::own_bucket_live_bitmap(&bucket_names, tb_guard.as_deref()) {
+                                        Some(own_live) => {
+                                            applied_bucket_diff = entry.apply_bucket_diff(
+                                                &candidates,
+                                                &own_live,
+                                                new_cutoff,
+                                            );
+                                        }
+                                        None => entry.mark_for_rebuild(),
+                                    }
                                 } else {
                                     entry.mark_for_rebuild();
                                 }
@@ -5525,7 +5810,30 @@ impl ConcurrentEngine {
                             ));
                         }
                         r
-                    } else {
+                    }
+                    BucketDiffState::Rebuild => {
+                        // Can't safely verify this entry's bucket-diff state
+                        // (multi-bucket-name entry, or a referenced bucket
+                        // name no longer resolves) — must rebuild, not
+                        // silently serve as-is. mark_for_rebuild is `&self`
+                        // (atomic), so the cheap read-only lookup suffices.
+                        self.unified_cache.lookup_for_read(&ukey).map(|entry_ref| {
+                            let entry = entry_ref.value();
+                            if entry.uses_bucket() {
+                                entry.mark_for_rebuild();
+                            }
+                            let bm = Arc::clone(entry.bitmap());
+                            let has_more = entry.has_more();
+                            let min_val = entry.min_tracked_value();
+                            let cap = entry.capacity();
+                            let total = entry.total_matched();
+                            let radix = entry.radix().cloned();
+                            let direction = entry.direction();
+                            let sorted_keys = entry.sorted_keys().map(Arc::clone);
+                            (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
+                        })
+                    }
+                    BucketDiffState::Noop => {
                         // Hot fast path: no bucket diff to apply. `lookup_for_read`
                         // returns a DashMap Ref — concurrent reads on the same
                         // shard proceed in parallel; writers on other shards
@@ -5870,6 +6178,7 @@ impl ConcurrentEngine {
             }
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
+                let ukey_for_seed = ukey.clone();
                 self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
@@ -5878,6 +6187,7 @@ impl ConcurrentEngine {
                     Arc::clone(&original_clauses),
                     value_fn,
                 );
+                self.seed_bucket_cutoff(&ukey_for_seed);
                 let mut result = QueryResult {
                     ids: vec![],
                     total_matched: full_total_matched,
@@ -5933,11 +6243,20 @@ impl ConcurrentEngine {
             );
             new_entry.set_uses_bucket(uses_bucket);
             if uses_bucket {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                new_entry.set_bucket_cutoff(now);
+                // Must match the entry's own bucket's snapped-cutoff scale
+                // (see `seed_bucket_cutoff` doc comment) — wall-clock `now()`
+                // permanently defeats the read-path window-slide diff.
+                let names = Self::bucket_names_from_canonical(&ukey.filter_clauses);
+                match self.resolve_bucket_diff_state(&names) {
+                    BucketDiffState::Apply(_, new_cutoff, _) => {
+                        new_entry.set_bucket_cutoff(new_cutoff);
+                    }
+                    // Can't safely verify (multi-bucket-name entry) — mark
+                    // for rebuild immediately; `new_entry` isn't inserted
+                    // yet so this is a plain local mutation.
+                    BucketDiffState::Rebuild => new_entry.mark_for_rebuild(),
+                    BucketDiffState::Noop => {}
+                }
             }
             // Brief lock 2: insert prebuilt entry + grab sorted_keys for
             // the immediate read.
@@ -6249,6 +6568,7 @@ impl ConcurrentEngine {
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };
+                let ukey_for_seed = ukey.clone();
                 self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
@@ -6257,6 +6577,7 @@ impl ConcurrentEngine {
                     Arc::clone(&original_clauses),
                     value_fn,
                 );
+                self.seed_bucket_cutoff(&ukey_for_seed);
                 let result = QueryResult {
                     ids: vec![],
                     total_matched: full_total_matched,
@@ -6297,6 +6618,7 @@ impl ConcurrentEngine {
                 Arc::clone(&original_clauses),
                 value_fn,
             );
+            self.seed_bucket_cutoff(&ukey);
             let cache_elapsed = t0.elapsed();
             tracing::debug!(
                 "  slow_path: cache_form={:.1}ms, total_slow={:.1}ms",

@@ -507,33 +507,50 @@ impl UnifiedEntry {
     pub fn original_filter_clauses(&self) -> &Arc<Vec<FilterClause>> {
         &self.original_filter_clauses
     }
-    /// Apply pending bucket diffs: subtract expired slots from the bitmap
-    /// and update the bucket_cutoff to current.
+    /// Apply pending bucket diffs: remove slots that actually left THIS
+    /// entry's own bucket window, and update `bucket_cutoff` to current.
+    ///
+    /// `candidates` is `PendingBucketDiffs::merged_expired()` — a cheap
+    /// cross-bucket UNION shared by every configured bucket (24h/7d/30d/1y
+    /// all push into the same global diff log), so it is only a candidate
+    /// set, not a ground truth for this entry. `own_bucket_live` is the
+    /// caller-resolved LIVE bitmap for THIS entry's own bucket(s) (see
+    /// `ConcurrentEngine::own_bucket_live_bitmap`). Only candidates that are
+    /// actually in this entry's bitmap AND absent from `own_bucket_live` are
+    /// removed — this is what stops a narrower bucket's expiry (e.g. 24h)
+    /// from wrongly evicting slots still valid in a wider bucket's window
+    /// (e.g. 7d) just because they share one global diff log.
     ///
     /// Sets `persist_dirty` and invalidates `sorted_keys` whenever the
     /// bitmap shrinks — without these, the merge thread skips the entry
     /// (no on-disk update) and the binary-search pagination path can still
-    /// return slots that were just expired. The caller is responsible for
+    /// return slots that were just removed. The caller is responsible for
     /// marking the entry's shard dirty in the cache-level `shard_dirty` set.
     ///
-    /// Returns `true` iff the bitmap actually shrunk (i.e. the entry's
-    /// cached bitmap intersected with `expired`). Callers should only mark
-    /// the cache-level `shard_dirty` set when this returns true — otherwise
-    /// the merge thread would rewrite an unchanged shard.
-    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) -> bool {
+    /// Returns `true` iff the bitmap actually shrunk. Callers should only
+    /// mark the cache-level `shard_dirty` set when this returns true —
+    /// otherwise the merge thread would rewrite an unchanged shard.
+    pub fn apply_bucket_diff(
+        &mut self,
+        candidates: &RoaringBitmap,
+        own_bucket_live: &RoaringBitmap,
+        new_cutoff: u64,
+    ) -> bool {
         let mut shrunk = false;
-        if !expired.is_empty() {
-            let old_len = self.bitmap.len();
-            let bm = Arc::make_mut(&mut self.bitmap);
-            *bm -= expired;
-            // Also remove from radix if expanded
-            if let Some(ref mut radix) = self.radix {
-                let r = Arc::make_mut(radix);
-                for slot in expired.iter() {
-                    r.remove_blind(slot);
+        if !candidates.is_empty() {
+            let mut to_remove = (*self.bitmap).clone();
+            to_remove &= candidates;
+            to_remove -= own_bucket_live;
+            if !to_remove.is_empty() {
+                let bm = Arc::make_mut(&mut self.bitmap);
+                *bm -= &to_remove;
+                // Also remove from radix if expanded
+                if let Some(ref mut radix) = self.radix {
+                    let r = Arc::make_mut(radix);
+                    for slot in to_remove.iter() {
+                        r.remove_blind(slot);
+                    }
                 }
-            }
-            if self.bitmap.len() < old_len {
                 self.persist_dirty.store(true, Ordering::Relaxed);
                 self.sorted_keys = None;
                 shrunk = true;
@@ -1049,6 +1066,36 @@ impl UnifiedCache {
             }
         }
     }
+    /// Seed `bucket_cutoff` on a just-created entry, bypassing hit/miss
+    /// counters and the `needs_rebuild`/TTL gates in `lookup` — this is
+    /// entry-creation follow-up, not a real cache access. No-op if the entry
+    /// is gone (evicted between creation and seeding).
+    ///
+    /// Monotonic (`max(existing, cutoff)`): a concurrent single-flight
+    /// create→seed race (two callers racing `form_and_store_with_clauses` +
+    /// `seed_bucket_cutoff` for the same key) must never let a later,
+    /// smaller/stale seed regress an already-newer cutoff backward — that
+    /// would re-expose the entry to diffs it was already validated against.
+    pub fn set_entry_bucket_cutoff(&self, key: &UnifiedKey, cutoff: u64) {
+        if let Some(mut entry) = self.entries.get_mut(key) {
+            let e = entry.value_mut();
+            if cutoff > e.bucket_cutoff() {
+                e.set_bucket_cutoff(cutoff);
+            }
+        }
+    }
+    /// Mark a just-created entry for rebuild, bypassing hit/miss counters —
+    /// used at entry-creation time when the entry's bucket-diff state can't
+    /// be safely determined (e.g. a multi-bucket-name entry — see
+    /// `BucketDiffState::Rebuild` in `concurrent_engine.rs`) so it can never
+    /// silently drift stale via incremental diffs it was never validated
+    /// against. No-op if the entry is gone (evicted between creation and
+    /// seeding).
+    pub fn mark_entry_for_rebuild(&self, key: &UnifiedKey) {
+        if let Some(entry) = self.entries.get(key) {
+            entry.value().mark_for_rebuild();
+        }
+    }
     /// Look up a cache entry for read-only access. Returns `None` on miss.
     /// Increments hit/miss counters and refreshes LRU via atomics — no mutation
     /// of the entry itself, so the per-shard read lock is taken (concurrent
@@ -1239,13 +1286,17 @@ impl UnifiedCache {
             value_fn,
         );
         entry.set_uses_bucket(uses_bucket);
-        if uses_bucket {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            entry.set_bucket_cutoff(now);
-        }
+        // `bucket_cutoff` must live in the same *snapped* scale as
+        // `PendingBucketDiffs::current_cutoff()` (`snap(now - duration,
+        // refresh_interval)` — see `time_buckets.rs::TimeBucket::last_cutoff`),
+        // not raw wall-clock time. `UnifiedCache` has no visibility into the
+        // live pending-diffs cutoff, so it leaves `bucket_cutoff` at its
+        // zeroed default here; the caller (which does have that state) is
+        // responsible for seeding the real value via `set_bucket_cutoff`
+        // right after this call returns. Stamping wall-clock `now()` here
+        // used to make the read-path diff-apply check
+        // (`entry.bucket_cutoff() < pending.current_cutoff()`) structurally
+        // false for the entry's entire life — see bucket_window_slide leak.
         self.store(key, entry)
     }
 
@@ -5888,8 +5939,11 @@ mod tests {
         expired.insert(20);
         expired.insert(40);
 
+        // Empty own-bucket-live: nothing in `expired` is still a valid
+        // member of the entry's own bucket, so both candidates are removed.
+        let own_bucket_live = roaring::RoaringBitmap::new();
         let shrunk = if let Some(mut r) = cache.entries.get_mut(&key) {
-            r.value_mut().apply_bucket_diff(&expired, 12345)
+            r.value_mut().apply_bucket_diff(&expired, &own_bucket_live, 12345)
         } else {
             panic!("entry vanished");
         };
