@@ -44,9 +44,53 @@ pub struct PgSyncConfig {
     /// Outbox batch limit per poll.
     #[serde(default = "default_outbox_batch_limit")]
     pub outbox_batch_limit: i64,
-    /// ClickHouse metrics poll interval in seconds.
+    /// ClickHouse metrics poll (reconcile) interval in seconds.
     #[serde(default = "default_metrics_poll_interval_secs")]
     pub metrics_poll_interval_secs: u64,
+    /// ClickHouse table the metrics poller scans to discover images with recent
+    /// metric activity. MUST be the complete real-time CDC stream, not a partial
+    /// legacy feed. Repoint here (no rebuild) when the upstream table moves.
+    #[serde(default = "default_metrics_table")]
+    pub metrics_table: String,
+    /// ClickHouse table/view the poller reads all-time cumulative totals from
+    /// (argMax daily-agg). Repoint here (no rebuild) if the totals source moves.
+    #[serde(default = "default_metrics_totals_table")]
+    pub metrics_totals_table: String,
+    /// `entityType` value filtered in both discovery and totals queries.
+    #[serde(default = "default_metrics_entity_type")]
+    pub metrics_entity_type: String,
+    /// Persisted cursor name (BitDex `/cursors` key) for the metrics high-water
+    /// mark. Config-driven so a second index/deployment can run its own poller.
+    #[serde(default = "default_metrics_cursor_name")]
+    pub metrics_cursor_name: String,
+    /// ClickHouse `metricType` values summed into `reactionCount`. Config-driven
+    /// so an upstream vocab rename (e.g. `ReactionLike`→`Like`) is a config edit,
+    /// not a rebuild.
+    #[serde(default = "default_metrics_reaction_types")]
+    pub metrics_reaction_types: Vec<String>,
+    /// `metricType` values summed into `commentCount`.
+    #[serde(default = "default_metrics_comment_types")]
+    pub metrics_comment_types: Vec<String>,
+    /// `metricType` values summed into `collectedCount`.
+    #[serde(default = "default_metrics_collected_types")]
+    pub metrics_collected_types: Vec<String>,
+    /// Hard cap on suppression-cache entries (memory safety valve). On overflow
+    /// the cache is cleared (a one-time re-emit, collapsed again next cycle).
+    #[serde(default = "default_metrics_suppression_max_entries")]
+    pub metrics_suppression_max_entries: usize,
+    /// Steady-state trailing discovery window width, in seconds. Each reconcile
+    /// scans `createdAt >= now - this`. Must be comfortably larger than both the
+    /// worst-case ClickHouse batch-ingestion lag (spikes to minutes on watcher
+    /// rebalances) AND the totals settle lag (~2.5min), so a batch-flushed or
+    /// not-yet-settled event is still re-read on a later overlapping cycle.
+    #[serde(default = "default_metrics_reconcile_window_secs")]
+    pub metrics_reconcile_window_secs: u64,
+    /// Forward chunk width, in seconds, used only while catching up (cursor far
+    /// behind — cold start with a backfill anchor, or long downtime). Historical
+    /// event partitions are immutable, so backfill walks forward in bounded
+    /// non-overlapping chunks; this caps a single query's window width.
+    #[serde(default = "default_metrics_backfill_chunk_secs")]
+    pub metrics_backfill_chunk_secs: u64,
     /// Replica identifier for cursor tracking.
     /// Defaults to "default". Override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name).
     #[serde(default = "default_replica_id")]
@@ -97,7 +141,40 @@ fn default_outbox_batch_limit() -> i64 {
     5000
 }
 fn default_metrics_poll_interval_secs() -> u64 {
-    60
+    30
+}
+fn default_metrics_table() -> String {
+    "entityMetricEvents_month".to_string()
+}
+fn default_metrics_totals_table() -> String {
+    "entityMetricDailyAgg_v2".to_string()
+}
+fn default_metrics_entity_type() -> String {
+    "Image".to_string()
+}
+fn default_metrics_cursor_name() -> String {
+    "metrics-poller-civitai".to_string()
+}
+fn default_metrics_reaction_types() -> Vec<String> {
+    ["Like", "Heart", "Laugh", "Cry"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_metrics_comment_types() -> Vec<String> {
+    vec!["commentCount".to_string()]
+}
+fn default_metrics_collected_types() -> Vec<String> {
+    vec!["Collection".to_string()]
+}
+fn default_metrics_suppression_max_entries() -> usize {
+    5_000_000
+}
+fn default_metrics_reconcile_window_secs() -> u64 {
+    1200
+}
+fn default_metrics_backfill_chunk_secs() -> u64 {
+    3600
 }
 fn default_replica_id() -> String {
     "default".to_string()
@@ -114,6 +191,23 @@ impl PgSyncConfig {
     pub fn poll_interval(&self) -> std::time::Duration {
         let ms = self.poll_interval_ms.unwrap_or(self.poll_interval_secs * 1000);
         std::time::Duration::from_millis(ms)
+    }
+
+    /// Build the `MetricsPollerConfig` from the resolved sync config.
+    pub fn metrics_poller_config(&self) -> crate::pg_sync::metrics_poller::MetricsPollerConfig {
+        crate::pg_sync::metrics_poller::MetricsPollerConfig {
+            table: self.metrics_table.clone(),
+            totals_table: self.metrics_totals_table.clone(),
+            entity_type: self.metrics_entity_type.clone(),
+            cursor_name: self.metrics_cursor_name.clone(),
+            poll_interval_secs: self.metrics_poll_interval_secs,
+            reconcile_window_secs: self.metrics_reconcile_window_secs,
+            backfill_chunk_secs: self.metrics_backfill_chunk_secs,
+            reaction_types: self.metrics_reaction_types.clone(),
+            comment_types: self.metrics_comment_types.clone(),
+            collected_types: self.metrics_collected_types.clone(),
+            suppression_max_entries: self.metrics_suppression_max_entries,
+        }
     }
 
     /// Load a `PgSyncConfig` from a TOML file on disk.
@@ -146,6 +240,79 @@ impl PgSyncConfig {
         }
         if let Ok(replica) = std::env::var("BITDEX_REPLICA_ID") {
             config.replica_id = replica;
+        }
+        if let Ok(table) = std::env::var("BITDEX_METRICS_TABLE") {
+            config.metrics_table = table;
+        }
+        if let Ok(table) = std::env::var("BITDEX_METRICS_TOTALS_TABLE") {
+            config.metrics_totals_table = table;
+        }
+        if let Ok(t) = std::env::var("BITDEX_METRICS_ENTITY_TYPE") {
+            config.metrics_entity_type = t;
+        }
+        if let Ok(name) = std::env::var("BITDEX_METRICS_CURSOR_NAME") {
+            config.metrics_cursor_name = name;
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_SUPPRESSION_MAX_ENTRIES") {
+            match v.trim().parse::<usize>() {
+                Ok(n) => config.metrics_suppression_max_entries = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_SUPPRESSION_MAX_ENTRIES={v:?} is not a valid usize ({e})"
+                    ));
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_POLL_INTERVAL_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => config.metrics_poll_interval_secs = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_POLL_INTERVAL_SECS={v:?} is not a valid u64 ({e})"
+                    ));
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_RECONCILE_WINDOW_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => config.metrics_reconcile_window_secs = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_RECONCILE_WINDOW_SECS={v:?} is not a valid u64 ({e})"
+                    ));
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("BITDEX_METRICS_BACKFILL_CHUNK_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => config.metrics_backfill_chunk_secs = n,
+                Err(e) => {
+                    return Err(format!(
+                        "BITDEX_METRICS_BACKFILL_CHUNK_SECS={v:?} is not a valid u64 ({e})"
+                    ));
+                }
+            }
+        }
+
+        // Fail closed on out-of-range timing knobs. A zero window/interval/chunk
+        // would make every reconcile window empty (`upper <= since`) and silently
+        // stall the poller; an absurd value would overflow the `u64 as i64` cast
+        // in the window math. Bound to (0, 10 years] — turn misconfig into a
+        // startup error.
+        const MAX_METRICS_SECS: u64 = 10 * 365 * 24 * 3600;
+        for (name, val) in [
+            ("metrics_poll_interval_secs", config.metrics_poll_interval_secs),
+            ("metrics_reconcile_window_secs", config.metrics_reconcile_window_secs),
+            ("metrics_backfill_chunk_secs", config.metrics_backfill_chunk_secs),
+        ] {
+            if val == 0 || val > MAX_METRICS_SECS {
+                return Err(format!(
+                    "{name}={val} out of range — must be in (0, {MAX_METRICS_SECS}] seconds"
+                ));
+            }
+        }
+        if config.metrics_suppression_max_entries == 0 {
+            return Err("metrics_suppression_max_entries must be > 0".to_string());
         }
 
         Ok(config)

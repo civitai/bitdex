@@ -32,8 +32,47 @@ poll_interval_secs = 2
 # Max outbox rows per poll cycle (default: 5000)
 outbox_batch_limit = 5000
 
-# ClickHouse metrics poll interval in seconds (default: 60)
-metrics_poll_interval_secs = 60
+# --- ClickHouse metrics poller ---
+# Every knob below is also overridable via a BITDEX_METRICS_* env var (handy for
+# pinning values in a K8s deployment without editing the mounted config).
+# Reconcile cadence in seconds (default: 30). Each tick re-scans the trailing
+# window below, so there's no benefit to a very small value.
+# Env override: BITDEX_METRICS_POLL_INTERVAL_SECS.
+metrics_poll_interval_secs = 30
+
+# ClickHouse table scanned to discover images with recent metric activity.
+# MUST be the complete real-time CDC stream, not a partial legacy feed.
+# (default: "entityMetricEvents_month"). Repoint here — no rebuild — if it moves.
+# metrics_table = "entityMetricEvents_month"
+# All-time cumulative totals source (default: "entityMetricDailyAgg_v2").
+# metrics_totals_table = "entityMetricDailyAgg_v2"
+# entityType filtered in both queries (default: "Image").
+# metrics_entity_type = "Image"
+
+# Steady-state trailing discovery window width, seconds (default: 1200 = 20min).
+# Must exceed worst-case CH batch-ingestion lag (minutes on watcher rebalances)
+# AND the totals settle lag (~2.5min) so late/unsettled events are re-read on a
+# later overlapping cycle. Env override: BITDEX_METRICS_RECONCILE_WINDOW_SECS.
+# metrics_reconcile_window_secs = 1200
+# Forward chunk width while catching up after downtime (default: 3600 = 1h).
+# Env override: BITDEX_METRICS_BACKFILL_CHUNK_SECS.
+# metrics_backfill_chunk_secs = 3600
+
+# metricType groups summed into each sort field. Config-driven so an upstream
+# vocab rename (e.g. ReactionLike -> Like) is a config edit, not a rebuild.
+# metrics_reaction_types = ["Like", "Heart", "Laugh", "Cry"]
+# metrics_comment_types = ["commentCount"]
+# metrics_collected_types = ["Collection"]
+
+# Persisted cursor key (default: "metrics-poller-civitai").
+# Env override: BITDEX_METRICS_CURSOR_NAME.
+# metrics_cursor_name = "metrics-poller-civitai"
+# Suppression-cache memory cap in entries (default: 5000000).
+# metrics_suppression_max_entries = 5000000
+
+# Recovery / one-shot wide backfill: either PUT the cursor to an older epoch and
+# bounce the sidecar (backfill mode drains it), or on a fresh cold start set
+# BITDEX_METRICS_SINCE=<epoch>.
 
 # Replica identifier for cursor tracking (default: "default")
 # In K8s, override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name)

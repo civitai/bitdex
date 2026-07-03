@@ -24,10 +24,103 @@ pub struct ClickHouseConfig {
 }
 
 /// Aggregate metric counts for a single image from ClickHouse.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct MetricInfo {
     reaction_count: i64,
     comment_count: i64,
     collected_count: i64,
+}
+
+/// Runtime configuration for the metrics poller. All fields are sourced from
+/// `PgSyncConfig` (TOML + env) so the table, cadence, and window widths are
+/// tunable without a rebuild — see `docs/design/metrics-poller-overlap-window.md`.
+pub struct MetricsPollerConfig {
+    /// ClickHouse table scanned for recent metric activity (the complete CDC
+    /// stream, e.g. `entityMetricEvents_month`).
+    pub table: String,
+    /// ClickHouse table/view read for all-time cumulative totals (argMax daily
+    /// agg, e.g. `entityMetricDailyAgg_v2`).
+    pub totals_table: String,
+    /// `entityType` filtered in discovery + totals.
+    pub entity_type: String,
+    /// Persisted cursor name (BitDex `/cursors` key).
+    pub cursor_name: String,
+    /// Reconcile cadence in seconds.
+    pub poll_interval_secs: u64,
+    /// Steady-state trailing discovery window width in seconds.
+    pub reconcile_window_secs: u64,
+    /// Bounded forward chunk width in seconds used while catching up.
+    pub backfill_chunk_secs: u64,
+    /// `metricType` values summed into `reactionCount` / `commentCount` /
+    /// `collectedCount`. Config-driven so an upstream vocab rename is a config
+    /// edit, not a rebuild.
+    pub reaction_types: Vec<String>,
+    pub comment_types: Vec<String>,
+    pub collected_types: Vec<String>,
+    /// Hard cap on suppression-cache entries (memory safety valve).
+    pub suppression_max_entries: usize,
+}
+
+/// Bounded per-id suppression cache. Holds the last-emitted `(reaction, comment,
+/// collected)` tuple per entityId so a reconcile only pushes ops for ids whose
+/// totals actually changed. Entries not re-seen within `retain_cycles` reconcile
+/// cycles are swept, bounding memory to roughly the active working set.
+///
+/// Because the steady trailing window (>> settle lag) re-discovers each active id
+/// every cycle, a not-yet-settled total is never permanently silenced: the id is
+/// re-read on later cycles and emitted once its settled value differs.
+struct SuppressionCache {
+    map: HashMap<i64, (MetricInfo, u64)>,
+    retain_cycles: u64,
+    max_entries: usize,
+}
+
+impl SuppressionCache {
+    fn new(retain_cycles: u64, max_entries: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            retain_cycles: retain_cycles.max(1),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// Whether emitting `id` with `info` would change what was last sent (or it
+    /// is newly seen). Pure read — does NOT mutate. The tuple is only committed
+    /// via `record` after the ops POST succeeds, so a failed POST leaves the
+    /// cache untouched and the update is re-sent next cycle.
+    fn peek_changed(&self, id: i64, info: MetricInfo) -> bool {
+        match self.map.get(&id) {
+            Some((prev, _)) => *prev != info,
+            None => true,
+        }
+    }
+
+    /// Commit the last-sent tuple + last-seen cycle for `id`. Called for every
+    /// discovered id (changed or not) after a successful POST, so unchanged
+    /// in-window ids keep their last-seen fresh and survive the sweep.
+    fn record(&mut self, id: i64, info: MetricInfo, cycle: u64) {
+        self.map.insert(id, (info, cycle));
+    }
+
+    /// Drop entries not seen in the last `retain_cycles` cycles, then enforce the
+    /// hard cap as a last-resort memory valve (clear on overflow — a one-time
+    /// re-emit that suppression collapses again next cycle).
+    fn sweep(&mut self, cycle: u64) {
+        let cutoff = cycle.saturating_sub(self.retain_cycles);
+        self.map.retain(|_, (_, seen)| *seen >= cutoff);
+        if self.map.len() > self.max_entries {
+            eprintln!(
+                "Metrics: suppression cache exceeded {} entries — clearing (one-time re-emit)",
+                self.max_entries
+            );
+            self.map.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// Run the ClickHouse metrics poller loop. Runs forever until cancelled.
@@ -35,11 +128,10 @@ struct MetricInfo {
 /// V2 pipeline: fetches aggregate counts from ClickHouse, converts them to
 /// `Op::Set` ops for sort fields, and POSTs via the `/ops` endpoint.
 /// No PG round-trip needed — metrics are self-contained sort-field updates.
-/// Cursor name used to persist the metrics poller's high-water-mark on the
-/// BitDex side via the `/cursors` API. The value is the unix-epoch upper
-/// bound of the most recently *fully successful* poll cycle.
-const METRICS_CURSOR_NAME: &str = "metrics-poller-civitai";
-
+/// The cursor name (BitDex `/cursors` key) is config-driven — see
+/// `MetricsPollerConfig::cursor_name`. Its value is the unix-epoch upper bound
+/// of the most recently *fully successful* reconcile cycle.
+///
 /// Optional env-var override read once at startup, ONLY honored on cold start
 /// (no persisted cursor exists). If set to a unix-epoch integer, the poller
 /// seeds the cold-start cursor from this value. Restarts after the first
@@ -51,40 +143,85 @@ const METRICS_CURSOR_NAME: &str = "metrics-poller-civitai";
 /// API. The env var is intentionally narrow.
 const METRICS_SINCE_ENV: &str = "BITDEX_METRICS_SINCE";
 
-/// Safety lag (seconds) subtracted from `now()` when computing the upper
-/// bound of each poll window. Absorbs ClickHouse ingestion latency: events
-/// generated at wall-clock T might not be visible in `entityMetricEvents`
-/// until T+lag. Without this, an event generated immediately before
-/// `cycle_upper_ts = now()` would be missed and never picked up by a future
-/// cycle (because future cycles use `createdAt > upper_ts`).
+/// Decide the `(since, upper]` createdAt window for a reconcile cycle
+/// (half-open lower, inclusive upper — see the query in `build_reconcile_query`).
 ///
-/// 60s is conservative for our CH ingestion path. Tune via observation if
-/// the gap proves too large or too small.
-const INGESTION_SAFETY_LAG_SECS: i64 = 60;
+/// - **Backfill** (cursor more than one reconcile window behind — fresh boot with
+///   an old `BITDEX_METRICS_SINCE`, or long downtime): walk forward in a bounded,
+///   non-overlapping chunk. Historical event partitions are immutable, so there is
+///   no batch-flush jitter to guard against and no overlap is needed.
+/// - **Steady** (caught up): an overlapping trailing window of width
+///   `reconcile_window`. The overlap absorbs bursty batch-ingestion lag and the
+///   totals settle interval.
+///
+/// Backfill advances the cursor until it lands within the trailing window, so the
+/// final backfill chunk and the first steady window overlap — no seam gap.
+///
+/// Saturating arithmetic throughout so a corrupt/absurd persisted cursor can't
+/// overflow (which would panic in debug and wrap in release).
+fn compute_window(
+    cursor: i64,
+    now: i64,
+    reconcile_window_secs: i64,
+    backfill_chunk_secs: i64,
+) -> (i64, i64) {
+    if now.saturating_sub(cursor) > reconcile_window_secs {
+        (cursor, cursor.saturating_add(backfill_chunk_secs).min(now))
+    } else {
+        (now.saturating_sub(reconcile_window_secs), now)
+    }
+}
 
 pub async fn run_metrics_poller(
     ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
-    poll_interval_secs: u64,
+    cfg: &MetricsPollerConfig,
 ) -> Result<(), String> {
-    let mut ticker = interval(Duration::from_secs(poll_interval_secs));
+    let mut ticker = interval(Duration::from_secs(cfg.poll_interval_secs.max(1)));
     let http = Client::new();
 
-    // Resolve starting `since_ts` from persisted cursor (with optional env
-    // override on cold start). Fails CLOSED on transient API errors so a
-    // restart during a BitDex outage doesn't silently skip the backlog.
-    let mut last_poll_ts = match resolve_initial_since(bitdex_client, poll_interval_secs).await {
-        Ok(ts) => ts,
-        Err(e) => return Err(format!("Metrics: refusing to start: {e}")),
-    };
+    // Resolve the starting cursor from the persisted cursor (with optional env
+    // override on cold start). Fails CLOSED on transient API errors so a restart
+    // during a BitDex outage doesn't silently skip the backlog.
+    let mut cursor =
+        match resolve_initial_since(bitdex_client, &cfg.cursor_name, cfg.reconcile_window_secs)
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => return Err(format!("Metrics: refusing to start: {e}")),
+        };
+
+    // Retain suppression state for an id ~2 reconcile windows past its last
+    // sighting — comfortably longer than the window that keeps re-discovering it.
+    let retain_cycles =
+        (cfg.reconcile_window_secs / cfg.poll_interval_secs.max(1)).saturating_mul(2) + 4;
+    let mut suppression = SuppressionCache::new(retain_cycles, cfg.suppression_max_entries);
+    let mut cycle_num: u64 = 0;
 
     let mut bitdex_was_down = false;
 
     eprintln!(
-        "Metrics poller started (ClickHouse={}, interval={poll_interval_secs}s, \
-         since_ts={last_poll_ts}, ingestion_lag={INGESTION_SAFETY_LAG_SECS}s)",
-        ch_config.url
+        "Metrics poller started (ClickHouse={}, table={}, entity_type={}, interval={}s, \
+         reconcile_window={}s, backfill_chunk={}s, cursor={cursor})",
+        ch_config.url,
+        cfg.table,
+        cfg.entity_type,
+        cfg.poll_interval_secs,
+        cfg.reconcile_window_secs,
+        cfg.backfill_chunk_secs,
     );
+
+    // Surface a large catch-up up front so it's never a silent mystery.
+    let behind = current_epoch_secs() - cursor;
+    if behind > cfg.reconcile_window_secs as i64 {
+        let chunks = (behind as u64).div_ceil(cfg.backfill_chunk_secs.max(1));
+        let est_wall_secs = chunks.saturating_mul(cfg.poll_interval_secs);
+        eprintln!(
+            "Metrics: cursor is {behind}s behind — backfilling in ~{chunks} chunk(s) of {}s, \
+             est. ~{est_wall_secs}s wall time before steady state",
+            cfg.backfill_chunk_secs,
+        );
+    }
 
     loop {
         ticker.tick().await;
@@ -102,84 +239,127 @@ pub async fn run_metrics_poller(
             bitdex_was_down = false;
         }
 
-        // Pin the upper bound of this cycle's window AT THE START minus a
-        // safety lag for CH ingestion delay. The query uses a half-open
-        // interval (since_ts, cycle_upper_ts], guaranteeing no gap and no
-        // overlap between consecutive cycles. Events landing in CH after
-        // `cycle_upper_ts` are the next cycle's responsibility.
-        let cycle_upper_ts = current_epoch_secs() - INGESTION_SAFETY_LAG_SECS;
+        let now = current_epoch_secs();
 
-        // Monotonic guard: never process a cycle whose upper bound is at or
-        // below the current cursor. Protects against system clock regressions
-        // (NTP corrections, container clock skew) which would otherwise cause
-        // the cursor to walk backwards and trigger huge replay churn.
-        if cycle_upper_ts <= last_poll_ts {
+        // Clock-regression guard: if wall-clock stepped back below the cursor
+        // (NTP correction / container skew), don't let the cursor walk backwards
+        // and churn. Wait for the clock to catch up rather than re-scan.
+        if now < cursor {
             eprintln!(
-                "Metrics: skipping cycle — upper_ts={cycle_upper_ts} is not ahead of \
-                 last_poll_ts={last_poll_ts} (clock skew or interval shorter than lag?)"
+                "Metrics: clock regression (now={now} < cursor={cursor}); waiting for catch-up"
             );
             continue;
         }
+
+        let (since, upper) = compute_window(
+            cursor,
+            now,
+            cfg.reconcile_window_secs as i64,
+            cfg.backfill_chunk_secs as i64,
+        );
+
+        // Nothing to scan (e.g. zero-width window from a boundary) — just wait.
+        if upper <= since {
+            continue;
+        }
+
+        cycle_num = cycle_num.wrapping_add(1);
+        let backfilling = now - cursor > cfg.reconcile_window_secs as i64;
 
         let cycle_start = Instant::now();
         match poll_metrics_and_push(
             &http,
             ch_config,
+            cfg,
             bitdex_client,
-            last_poll_ts,
-            cycle_upper_ts,
+            since,
+            upper,
+            &mut suppression,
+            cycle_num,
         )
         .await
         {
-            Ok(count) => {
+            Ok(Reconcile { discovered, emitted }) => {
                 let cycle_secs = cycle_start.elapsed().as_secs_f64();
-                // Report timing to BitDex for `bitdex_pgsync_cycle_seconds`
-                // histogram. Reused with `replica="clickhouse-metrics"` label so
-                // the existing `pgsync_cycle_seconds` metric covers both the
-                // ops poller (replica="default") and this CH metrics poller.
+                // Report timing + work to BitDex. `rows_fetched` = ops actually
+                // emitted (post-suppression), so the Grafana rate reflects real
+                // update throughput. Reuses `replica="clickhouse-metrics"`.
                 bitdex_client
                     .report_pgsync_metrics(
                         "clickhouse-metrics",
                         cycle_secs,
-                        count as u64,
-                        cycle_upper_ts,
+                        emitted as u64,
+                        upper,
                     )
                     .await;
-                if count > 0 {
+                if discovered > 0 {
                     eprintln!(
-                        "Metrics: pushed {count} ops batches in {:.1}ms (window {}..{}]",
+                        "Metrics: {} — discovered {discovered}, emitted {emitted} in {:.1}ms \
+                         (window {since}..{upper}]",
+                        if backfilling { "backfill" } else { "reconcile" },
                         cycle_secs * 1000.0,
-                        last_poll_ts,
-                        cycle_upper_ts
                     );
                 }
-                // Persist BEFORE advancing in-memory state. If persist fails
-                // we keep the old `last_poll_ts` and re-poll the same window
-                // next cycle (Set ops are idempotent — no double-counting).
+                // Persist BEFORE advancing in-memory state. If persist fails we
+                // keep the old cursor and re-scan next cycle (Set ops are
+                // idempotent, and suppression collapses the repeat to a no-op).
                 if let Err(e) = bitdex_client
-                    .set_cursor(METRICS_CURSOR_NAME, &cycle_upper_ts.to_string())
+                    .set_cursor(&cfg.cursor_name, &upper.to_string())
                     .await
                 {
-                    eprintln!("Metrics: cursor persist failed ({e}); will retry same window next cycle");
+                    eprintln!("Metrics: cursor persist failed ({e}); will retry next cycle");
                     continue;
                 }
-                last_poll_ts = cycle_upper_ts;
+                cursor = upper;
+                suppression.sweep(cycle_num);
             }
             Err(e) => {
                 let cycle_secs = cycle_start.elapsed().as_secs_f64();
                 bitdex_client
-                    .report_pgsync_metrics(
-                        "clickhouse-metrics",
-                        cycle_secs,
-                        0,
-                        cycle_upper_ts,
-                    )
+                    .report_pgsync_metrics("clickhouse-metrics", cycle_secs, 0, upper)
                     .await;
                 eprintln!("Metrics poll error after {:.1}ms: {e}", cycle_secs * 1000.0);
-                // Don't advance — retry same window next cycle.
+                // Don't advance — retry the same window next cycle.
             }
         }
     }
+}
+
+/// Earliest plausible cursor: 2020-01-01Z. Anything older is treated as
+/// corrupt (a real anchor is always recent). Guards against a 0/garbage cursor
+/// making the backfill walk forward from ~1970 for months.
+const MIN_SANE_ANCHOR_EPOCH: i64 = 1_577_836_800;
+/// Tolerance for a cursor slightly ahead of `now` (minor clock skew is fine).
+const MAX_ANCHOR_FUTURE_SKEW_SECS: i64 = 300;
+
+/// Validate a starting anchor (persisted cursor or `BITDEX_METRICS_SINCE`) is a
+/// sane unix-epoch **seconds** value. Fails closed so an operator mistake surfaces
+/// as a startup error instead of a silent no-op or a months-long empty backfill.
+///
+/// - A future cursor would make `compute_window` treat the poller as caught-up
+///   and silently discard the requested backfill — and the classic slip is
+///   PUTting milliseconds (`1_782_864_000_000`) instead of seconds.
+/// - A pre-2020 cursor is almost certainly corrupt.
+fn validate_anchor(ts: i64, now: i64, source: &str) -> Result<(), String> {
+    if ts > now + MAX_ANCHOR_FUTURE_SKEW_SECS {
+        let ms_hint = if ts > 100_000_000_000 {
+            " — this looks like MILLISECONDS; use unix-epoch SECONDS"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "{source}={ts} is in the future (now={now}){ms_hint}. A future anchor would \
+             silently cancel the backfill. Refusing to start."
+        ));
+    }
+    if ts < MIN_SANE_ANCHOR_EPOCH {
+        return Err(format!(
+            "{source}={ts} is older than 2020-01-01 ({MIN_SANE_ANCHOR_EPOCH}) — almost \
+             certainly corrupt. A real anchor is recent; refusing to start rather than \
+             backfill forward from the distant past."
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the starting `since_ts` for the poller loop.
@@ -189,25 +369,29 @@ pub async fn run_metrics_poller(
 /// - If no cursor exists (true cold start) and `BITDEX_METRICS_SINCE` is set,
 ///   use the env value. (Lets operators bootstrap with a custom backfill
 ///   horizon without an extra `/cursors` PUT.)
-/// - If no cursor and no env, fall back to `now - poll_interval`.
+/// - If no cursor and no env, fall back to `now - reconcile_window` so the first
+///   cycle runs as an ordinary steady trailing window.
 /// - On any *transient* API error fetching the cursor, returns Err so the
 ///   caller can fail closed instead of silently skipping the backlog.
 /// - On *unparseable* persisted cursor, returns Err for the same reason —
 ///   silent fallback would convert state corruption into permanent data loss.
 async fn resolve_initial_since(
     bitdex_client: &BitdexClient,
-    poll_interval_secs: u64,
+    cursor_name: &str,
+    reconcile_window_secs: u64,
 ) -> Result<i64, String> {
+    let now = current_epoch_secs();
     // Try persisted cursor first (must distinguish 404 → None from transient error → Err).
-    match bitdex_client.get_cursor(METRICS_CURSOR_NAME).await? {
+    match bitdex_client.get_cursor(cursor_name).await? {
         Some(s) => match s.trim().parse::<i64>() {
             Ok(ts) if ts > 0 => {
+                validate_anchor(ts, now, &format!("persisted cursor {cursor_name}"))?;
                 eprintln!("Metrics: resumed from persisted cursor (since_ts={ts})");
                 Ok(ts)
             }
             _ => Err(format!(
-                "persisted cursor {METRICS_CURSOR_NAME}={s:?} is unparseable. \
-                 Recovery: PUT a valid unix-epoch integer to /cursors/{METRICS_CURSOR_NAME} \
+                "persisted cursor {cursor_name}={s:?} is unparseable. \
+                 Recovery: PUT a valid unix-epoch integer to /cursors/{cursor_name} \
                  (or DELETE it to force a cold start). Refusing to silently restart \
                  from now-interval — that would discard the backlog."
             )),
@@ -229,19 +413,14 @@ async fn resolve_initial_since(
                         "{METRICS_SINCE_ENV}={ts} must be > 0. Either fix or unset the env var."
                     ));
                 }
+                validate_anchor(ts, now, METRICS_SINCE_ENV)?;
                 eprintln!("Metrics: cold start, {METRICS_SINCE_ENV}={ts} override active");
                 return Ok(ts);
             }
-            // Cold start fallback: subtract BOTH the poll interval AND the
-            // ingestion safety lag so the first cycle's `cycle_upper_ts`
-            // (which is `now - lag`) is strictly greater than `last_poll_ts`,
-            // and the first window covers any events in the lag tail. Without
-            // this, when `lag > poll_interval` the monotonic guard would
-            // skip cycles until `last_poll_ts` was overtaken — and the first
-            // real window would silently exclude lag-delayed events.
-            let ts = current_epoch_secs()
-                - poll_interval_secs as i64
-                - INGESTION_SAFETY_LAG_SECS;
+            // Cold start fallback: seed the cursor one reconcile window back so
+            // the first cycle runs as a normal steady trailing window rather than
+            // triggering a spurious backfill.
+            let ts = current_epoch_secs() - reconcile_window_secs as i64;
             eprintln!("Metrics: cold start, no env override (since_ts={ts})");
             Ok(ts)
         }
@@ -259,88 +438,166 @@ fn current_epoch_secs() -> i64 {
 /// Keeps request bodies reasonable and avoids timeouts.
 const OPS_BATCH_SIZE: usize = 5_000;
 
-/// Single poll + push cycle. Fetches CH metrics, converts to V2 ops, POSTs to BitDex.
+/// Outcome of one reconcile cycle.
+struct Reconcile {
+    /// Distinct entityIds discovered in the window.
+    discovered: usize,
+    /// Entity ops actually emitted after suppression (changed totals only).
+    emitted: usize,
+}
+
+/// Single reconcile cycle. Discovers ids with metric activity in `(since_ts,
+/// upper_ts]`, fetches their all-time totals, and POSTs `Op::Set` ops for the
+/// ids whose totals changed since last emission (per `suppression`).
 ///
-/// Uses a half-open window `(since_ts, upper_ts]` so consecutive cycles cover
-/// the time line exactly once each. The upper bound is fixed at the start of
-/// the cycle by the caller — events landing in CH after that timestamp are
-/// the next cycle's responsibility.
+/// The window overlaps the previous cycle's (steady mode), so an id discovered
+/// here may have been emitted before — suppression collapses that to a no-op.
+///
+/// Suppression is committed ONLY after the POSTs succeed: `peek_changed` (pure)
+/// selects the emit set, and `record` runs afterwards. So a failed POST leaves
+/// the cache untouched — the caller keeps the old cursor and the same window is
+/// re-scanned and re-sent next cycle (no silently-dropped update).
 async fn poll_metrics_and_push(
     http: &Client,
     ch_config: &ClickHouseConfig,
+    cfg: &MetricsPollerConfig,
     bitdex_client: &BitdexClient,
     since_ts: i64,
     upper_ts: i64,
-) -> Result<usize, String> {
-    let metrics = fetch_metrics_from_clickhouse(http, ch_config, since_ts, upper_ts).await?;
+    suppression: &mut SuppressionCache,
+    cycle: u64,
+) -> Result<Reconcile, String> {
+    let metrics = fetch_metrics_from_clickhouse(http, ch_config, cfg, since_ts, upper_ts).await?;
 
-    if metrics.is_empty() {
-        return Ok(0);
+    let discovered = metrics.len();
+    if discovered == 0 {
+        return Ok(Reconcile { discovered: 0, emitted: 0 });
     }
 
-    let entity_ops = metrics_to_entity_ops(metrics);
+    // Select ids whose totals changed since last emission — pure peek, no commit.
+    let changed: Vec<(i64, MetricInfo)> = metrics
+        .iter()
+        .filter(|(id, info)| suppression.peek_changed(**id, **info))
+        .map(|(id, info)| (*id, *info))
+        .collect();
 
-    let total = entity_ops.len();
+    let emitted = changed.len();
 
-    // Send in batches to keep request sizes manageable.
-    for chunk in entity_ops.chunks(OPS_BATCH_SIZE) {
-        let batch = OpsBatch {
-            ops: chunk.to_vec(),
-            meta: Some(SyncMeta {
-                source: "clickhouse-metrics".into(),
-                cursor: None,
-                max_id: None,
-                lag_rows: None,
-            }),
-        };
-        bitdex_client.post_ops(&batch).await?;
+    if emitted > 0 {
+        let entity_ops = metrics_to_entity_ops(changed.iter().copied());
+        // Send in batches to keep request sizes manageable. A failure here
+        // returns Err BEFORE any `record` below, so nothing is suppressed.
+        for chunk in entity_ops.chunks(OPS_BATCH_SIZE) {
+            let batch = OpsBatch {
+                ops: chunk.to_vec(),
+                meta: Some(SyncMeta {
+                    source: "clickhouse-metrics".into(),
+                    cursor: None,
+                    max_id: None,
+                    lag_rows: None,
+                }),
+            };
+            bitdex_client.post_ops(&batch).await?;
+        }
     }
 
-    Ok(total)
+    // Commit only now that the POSTs (if any) succeeded. Record EVERY discovered
+    // id — including unchanged ones — so their last-seen cycle stays fresh and
+    // they survive the sweep while still in the trailing window.
+    for (id, info) in &metrics {
+        suppression.record(*id, *info, cycle);
+    }
+
+    Ok(Reconcile { discovered, emitted })
 }
 
-/// Query ClickHouse HTTP interface for aggregate metrics.
+/// Validate a config-supplied SQL identifier or string-literal value (table,
+/// entityType, metricType). These come from operator config, not user input, but
+/// a strict allowlist keeps a typo'd config from producing a malformed query and
+/// blocks quote/paren/semicolon injection into the interpolated SQL. A single `.`
+/// is allowed so `db.table`-qualified names work.
+fn validate_ident(kind: &str, s: &str) -> Result<(), String> {
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "invalid metrics {kind} {s:?}: must be non-empty ASCII alphanumeric/underscore/dot"
+        ));
+    }
+    Ok(())
+}
+
+/// Build a `metricType IN ('a','b',...)` predicate from a config-supplied set of
+/// metric-type values, validating each so nothing breaks out of the quotes.
+fn metric_type_in_clause(kind: &str, types: &[String]) -> Result<String, String> {
+    if types.is_empty() {
+        return Err(format!("metrics {kind} must list at least one metricType"));
+    }
+    let mut quoted = Vec::with_capacity(types.len());
+    for t in types {
+        validate_ident(kind, t)?;
+        quoted.push(format!("'{t}'"));
+    }
+    Ok(format!("metricType IN ({})", quoted.join(",")))
+}
+
+/// Build the two-phase reconcile query.
 ///
-/// Two-phase approach:
-/// 1. Discovery: `entityMetricEvents` — find image IDs with recent activity
-///    (has `createdAt` for precise recency, unlike daily aggregates)
-/// 2. Totals: `entityMetricDailyAgg` — fetch ALL-TIME cumulative counts
-///    for those IDs so the search index stays correct.
+/// 1. Discovery: `{table}` (the complete CDC event stream) — distinct entityIds
+///    with `createdAt` in `(since_ts, upper_ts]` (half-open lower, inclusive upper).
+/// 2. Totals: `{totals_table}` (argMax daily-agg view) — ALL-TIME cumulative
+///    counts for those ids, so the emitted values are absolute (idempotent Set),
+///    which is what makes overlapping windows and re-scans safe.
 ///
-/// Metric types for Image: ReactionLike, ReactionHeart, ReactionLaugh,
-///                          ReactionCry, Comment, Collection, Buzz
-async fn fetch_metrics_from_clickhouse(
-    http: &Client,
-    ch_config: &ClickHouseConfig,
+/// The `metricType` groups (which CH types sum into reaction/comment/collected)
+/// are config-driven, so an upstream vocab rename is a config edit, not a rebuild.
+/// Discovery does NOT filter by metricType.
+fn build_reconcile_query(
+    cfg: &MetricsPollerConfig,
     since_ts: i64,
     upper_ts: i64,
-) -> Result<HashMap<i64, MetricInfo>, String> {
-    // Phase 1: discover IDs with metric events in the closed window
-    //          (since_ts, upper_ts] — half-open lower, inclusive upper.
-    // Phase 2: get their all-time totals from the daily aggregate table.
-    //
-    // The bounded upper interval is the key correctness property: any event
-    // landing in entityMetricEvents AFTER upper_ts is left for the next cycle,
-    // whose `since_ts` will equal this cycle's `upper_ts`. No gap, no overlap.
-    let query = format!(
+) -> Result<String, String> {
+    validate_ident("table", &cfg.table)?;
+    validate_ident("totals_table", &cfg.totals_table)?;
+    validate_ident("entity_type", &cfg.entity_type)?;
+    let reaction_in = metric_type_in_clause("reaction_types", &cfg.reaction_types)?;
+    let comment_in = metric_type_in_clause("comment_types", &cfg.comment_types)?;
+    let collected_in = metric_type_in_clause("collected_types", &cfg.collected_types)?;
+    Ok(format!(
         r#"SELECT
             entityId as id,
-            sumIf(total, metricType IN ('Like','Heart','Laugh','Cry')) as reactionCount,
-            sumIf(total, metricType = 'commentCount') as commentCount,
-            sumIf(total, metricType = 'Collection') as collectedCount
-        FROM entityMetricDailyAgg_v2
-        WHERE entityType = 'Image'
+            sumIf(total, {reaction_in}) as reactionCount,
+            sumIf(total, {comment_in}) as commentCount,
+            sumIf(total, {collected_in}) as collectedCount
+        FROM {totals}
+        WHERE entityType = '{etype}'
           AND entityId IN (
             SELECT DISTINCT entityId
-            FROM entityMetricEvents
-            WHERE entityType = 'Image'
-              AND entityId IS NOT NULL
+            FROM {table}
+            WHERE entityType = '{etype}'
               AND createdAt >  fromUnixTimestamp({since_ts})
               AND createdAt <= fromUnixTimestamp({upper_ts})
           )
         GROUP BY entityId
         FORMAT JSONEachRow"#,
-    );
+        totals = cfg.totals_table,
+        etype = cfg.entity_type,
+        table = cfg.table,
+    ))
+}
+
+/// Query ClickHouse HTTP interface for aggregate metrics for ids active in the
+/// given window. See `build_reconcile_query` for the two-phase shape.
+async fn fetch_metrics_from_clickhouse(
+    http: &Client,
+    ch_config: &ClickHouseConfig,
+    cfg: &MetricsPollerConfig,
+    since_ts: i64,
+    upper_ts: i64,
+) -> Result<HashMap<i64, MetricInfo>, String> {
+    let query = build_reconcile_query(cfg, since_ts, upper_ts)?;
 
     let mut req = http.post(&ch_config.url).body(query);
 
@@ -405,7 +662,9 @@ async fn fetch_metrics_from_clickhouse(
 /// Each image gets three `Op::Set` ops (reactionCount, commentCount, collectedCount).
 /// `creates_slot` is false because these are sort-only field updates — they should
 /// never create new alive slots.
-fn metrics_to_entity_ops(metrics: HashMap<i64, MetricInfo>) -> Vec<EntityOps> {
+fn metrics_to_entity_ops(
+    metrics: impl IntoIterator<Item = (i64, MetricInfo)>,
+) -> Vec<EntityOps> {
     metrics
         .into_iter()
         .map(|(image_id, info)| {
@@ -582,5 +841,186 @@ mod tests {
                 assert_eq!(value, &json!(0));
             }
         }
+    }
+
+    fn test_cfg() -> MetricsPollerConfig {
+        MetricsPollerConfig {
+            table: "entityMetricEvents_month".into(),
+            totals_table: "entityMetricDailyAgg_v2".into(),
+            entity_type: "Image".into(),
+            cursor_name: "metrics-poller-civitai".into(),
+            poll_interval_secs: 30,
+            reconcile_window_secs: 1200,
+            backfill_chunk_secs: 3600,
+            reaction_types: ["Like", "Heart", "Laugh", "Cry"].iter().map(|s| s.to_string()).collect(),
+            comment_types: vec!["commentCount".into()],
+            collected_types: vec!["Collection".into()],
+            suppression_max_entries: 5_000_000,
+        }
+    }
+
+    fn info(r: i64, c: i64, col: i64) -> MetricInfo {
+        MetricInfo { reaction_count: r, comment_count: c, collected_count: col }
+    }
+
+    #[test]
+    fn window_steady_when_caught_up() {
+        // Cursor within the reconcile window -> trailing overlapping window.
+        let now = 1_000_000;
+        let (since, upper) = compute_window(now - 100, now, 1200, 3600);
+        assert_eq!(upper, now);
+        assert_eq!(since, now - 1200, "steady window trails a full reconcile width");
+        // Overlaps prior cursor (now-100) -> no gap.
+        assert!(since < now - 100);
+    }
+
+    #[test]
+    fn window_backfill_walks_forward_in_bounded_chunks() {
+        // Cursor far behind (2 days) -> forward chunk of backfill_chunk width.
+        let now = 1_000_000;
+        let cursor = now - 2 * 24 * 3600;
+        let (since, upper) = compute_window(cursor, now, 1200, 3600);
+        assert_eq!(since, cursor, "backfill resumes exactly at the cursor");
+        assert_eq!(upper, cursor + 3600, "backfill advances one chunk, not to now");
+    }
+
+    #[test]
+    fn window_backfill_final_chunk_clamps_to_now_and_overlaps_steady() {
+        let now = 1_000_000;
+        // Cursor 1.5x window behind: still backfill, but chunk clamps to now.
+        let cursor = now - 1800;
+        let (since, upper) = compute_window(cursor, now, 1200, 3600);
+        assert_eq!(since, cursor);
+        assert_eq!(upper, now, "final catch-up chunk clamps to now");
+        // Next cycle cursor == now -> steady window starts at now-1200 <= cursor,
+        // so the handoff overlaps (no seam gap).
+        let (next_since, _) = compute_window(now, now + 30, 1200, 3600);
+        assert!(next_since <= upper, "steady window overlaps last backfill chunk");
+    }
+
+    #[test]
+    fn suppression_emits_on_change_skips_on_repeat() {
+        let mut s = SuppressionCache::new(4, 1000);
+        // First sighting -> emit; commit it.
+        assert!(s.peek_changed(1, info(10, 0, 0)));
+        s.record(1, info(10, 0, 0), 1);
+        // Same total next cycle -> suppressed.
+        assert!(!s.peek_changed(1, info(10, 0, 0)));
+        // Total changes (e.g. settled value) -> emit again.
+        assert!(s.peek_changed(1, info(11, 0, 0)));
+        // New id always emits.
+        assert!(s.peek_changed(2, info(0, 0, 0)));
+    }
+
+    #[test]
+    fn suppression_peek_is_pure_until_recorded() {
+        // BLOCKER regression: peek must NOT commit, so a failed POST (no record)
+        // leaves the id re-emittable next cycle.
+        let mut s = SuppressionCache::new(4, 1000);
+        assert!(s.peek_changed(1, info(10, 0, 0)));
+        assert!(s.peek_changed(1, info(10, 0, 0)), "peek alone must not suppress");
+        // Only after record does it suppress.
+        s.record(1, info(10, 0, 0), 1);
+        assert!(!s.peek_changed(1, info(10, 0, 0)));
+    }
+
+    #[test]
+    fn suppression_does_not_silence_unsettled_value() {
+        // Discover with pre-settle total, emit; later the settled value differs
+        // and must still be emitted (the settle-lag trap).
+        let mut s = SuppressionCache::new(100, 1000);
+        assert!(s.peek_changed(7, info(5, 0, 0))); // pre-settle
+        s.record(7, info(5, 0, 0), 1);
+        assert!(!s.peek_changed(7, info(5, 0, 0))); // unchanged re-read
+        assert!(s.peek_changed(7, info(5, 3, 0))); // comment count settled -> emit
+    }
+
+    #[test]
+    fn suppression_sweep_evicts_stale_ids() {
+        let mut s = SuppressionCache::new(2, 1000);
+        s.record(1, info(1, 0, 0), 1);
+        s.record(2, info(1, 0, 0), 5);
+        // Sweep at cycle 5 with retain=2 -> cutoff 3; id 1 (seen@1) evicted.
+        s.sweep(5);
+        assert_eq!(s.len(), 1);
+        // Evicted id re-emits when seen again.
+        assert!(s.peek_changed(1, info(1, 0, 0)));
+    }
+
+    #[test]
+    fn suppression_hard_cap_clears_on_overflow() {
+        let mut s = SuppressionCache::new(1_000_000, 3);
+        for id in 0..10 {
+            s.record(id, info(id, 0, 0), 1);
+        }
+        // retain is huge so the cycle-sweep keeps all 10; the hard cap (3) trips.
+        s.sweep(1);
+        assert_eq!(s.len(), 0, "cache cleared once it blew past max_entries");
+    }
+
+    #[test]
+    fn reconcile_query_uses_config_tables_and_no_notnull() {
+        let q = build_reconcile_query(&test_cfg(), 100, 200).unwrap();
+        assert!(q.contains("FROM entityMetricDailyAgg_v2"), "totals table from config");
+        assert!(q.contains("FROM entityMetricEvents_month"), "discovery table from config");
+        assert!(q.contains("entityType = 'Image'"));
+        assert!(q.contains("fromUnixTimestamp(100)"));
+        assert!(q.contains("fromUnixTimestamp(200)"));
+        assert!(!q.contains("IS NOT NULL"), "_month.entityId is non-nullable");
+    }
+
+    #[test]
+    fn reconcile_query_rejects_bad_identifiers() {
+        let mut cfg = test_cfg();
+        cfg.table = "events; DROP TABLE x".into();
+        assert!(build_reconcile_query(&cfg, 0, 1).is_err());
+        let mut cfg2 = test_cfg();
+        cfg2.entity_type = "".into();
+        assert!(build_reconcile_query(&cfg2, 0, 1).is_err());
+        // Injection attempt in a metricType value is rejected (would break quotes).
+        let mut cfg3 = test_cfg();
+        cfg3.reaction_types = vec!["Like') OR 1=1 --".into()];
+        assert!(build_reconcile_query(&cfg3, 0, 1).is_err());
+        // Empty metricType group is rejected.
+        let mut cfg4 = test_cfg();
+        cfg4.comment_types = vec![];
+        assert!(build_reconcile_query(&cfg4, 0, 1).is_err());
+    }
+
+    #[test]
+    fn reconcile_query_uses_config_vocab() {
+        // A vocab rename is a config edit, not a rebuild.
+        let mut cfg = test_cfg();
+        cfg.reaction_types = vec!["ReactionLike".into(), "ReactionHeart".into()];
+        let q = build_reconcile_query(&cfg, 0, 1).unwrap();
+        assert!(q.contains("metricType IN ('ReactionLike','ReactionHeart')"));
+        assert!(q.contains("metricType IN ('commentCount')"), "comment group still one value");
+    }
+
+    #[test]
+    fn anchor_validation_accepts_sane_and_rejects_bad() {
+        let now = 1_783_040_000; // ~2026-07-03
+        // Legit recovery anchor (~2 days old) — accepted.
+        assert!(validate_anchor(1_782_864_000, now, "test").is_ok());
+        // Recent cursor — accepted.
+        assert!(validate_anchor(now - 100, now, "test").is_ok());
+        // Slight future within skew — accepted.
+        assert!(validate_anchor(now + 100, now, "test").is_ok());
+        // Future beyond skew — rejected.
+        assert!(validate_anchor(now + 10_000, now, "test").is_err());
+        // Milliseconds fat-finger — rejected, and the message calls it out.
+        let e = validate_anchor(1_782_864_000_000, now, "test").unwrap_err();
+        assert!(e.contains("MILLISECONDS"), "got: {e}");
+        // Zero / pre-2020 corrupt — rejected.
+        assert!(validate_anchor(0, now, "test").is_err());
+        assert!(validate_anchor(1_000_000_000, now, "test").is_err());
+    }
+
+    #[test]
+    fn db_qualified_table_name_is_allowed() {
+        let mut cfg = test_cfg();
+        cfg.table = "default.entityMetricEvents_month".into();
+        let q = build_reconcile_query(&cfg, 0, 1).unwrap();
+        assert!(q.contains("FROM default.entityMetricEvents_month"));
     }
 }
