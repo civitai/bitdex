@@ -620,4 +620,47 @@ mod tests {
         assert!(!mgr.get_bucket("7d").unwrap().bitmap().contains(42),
             "slot must drop from 7d once new ts is out of window");
     }
+
+    /// Confirms the production leak and that a full rebuild is the cure.
+    ///
+    /// Steady-state maintenance is incremental: `subtract_expired` only removes
+    /// slots whose current sort value lands in the thin `[old_cutoff, new_cutoff)`
+    /// band swept by one refresh step. A slot that enters the 24h bucket with a
+    /// recent value and then has its value regress *past* that band without a
+    /// re-flush is never in the band, so incremental expiry misses it and it
+    /// stays stuck — surfacing as "old data in the 24h bucket". A full rebuild
+    /// from truth evicts it. This is exactly what the periodic full-rebuild
+    /// fallback does.
+    #[test]
+    fn test_full_rebuild_evicts_slot_missed_by_incremental_band() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+
+        // Slot 7 enters the 24h bucket with a recent sort value.
+        mgr.insert_slot(7, now - 100, now);
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(7));
+
+        // One incremental refresh step, 300s later. Its expiry band is
+        // [old_cutoff, new_cutoff) = [now-86400, now+300-86400). Slot 7's true
+        // value has since regressed to now-200000 — far BELOW old_cutoff, so it
+        // is not in the band. Incremental expiry (empty band set) can't touch it.
+        let now2 = now + 300;
+        let new_cutoff = now2.saturating_sub(86400);
+        let empty_band = RoaringBitmap::new();
+        mgr.get_bucket_mut("24h")
+            .unwrap()
+            .subtract_expired(&empty_band, new_cutoff);
+        assert!(
+            mgr.get_bucket("24h").unwrap().bitmap().contains(7),
+            "leak reproduced: incremental band-based expiry misses the regressed slot"
+        );
+
+        // Full rebuild from truth (slot 7's real value is old) drops it.
+        let truth: Vec<(u32, u64)> = vec![(7, now2 - 200000)];
+        mgr.rebuild_bucket("24h", truth.into_iter(), now2);
+        assert!(
+            !mgr.get_bucket("24h").unwrap().bitmap().contains(7),
+            "full rebuild evicts the stale member — the fallback's cure"
+        );
+    }
 }

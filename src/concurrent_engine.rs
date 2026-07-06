@@ -1260,6 +1260,13 @@ impl ConcurrentEngine {
             let flush_metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> =
                 Arc::clone(&metrics_bridge);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
+            // Interval (secs) for the periodic FULL time-bucket rebuild fallback.
+            // 0 disables it. See `TimeBucketFieldConfig::full_rebuild_interval_secs`.
+            let flush_bucket_full_rebuild_interval: u64 = config
+                .time_buckets
+                .as_ref()
+                .map(|tb| tb.full_rebuild_interval_secs)
+                .unwrap_or(0);
             // Base dir for per-bucket-name diff logs (`bucket_diffs__{name}.log`) —
             // see `pending_bucket_diffs`'s doc comment for why these are per-bucket.
             let flush_diff_log_dir = config.storage.bitmap_path.as_ref()
@@ -1340,6 +1347,11 @@ impl ConcurrentEngine {
                 // unload windows.
                 let mut pending_bucket_retries: HashSet<u32> = HashSet::new();
                 const PENDING_BUCKET_RETRY_CAP: usize = 1_000_000;
+                // Wall-clock (unix secs) of the last periodic full time-bucket
+                // rebuild. 0 = not yet baselined; the first flush cycle seeds it
+                // to "now" so boot's own rebuild counts as the baseline and the
+                // first fallback fires one interval later.
+                let mut last_full_bucket_rebuild: u64 = 0;
                 let mut heartbeat_counter: u64 = 0;
                 let mut max_bitmap_count_seen: usize = 0;
                 let mut nonzero_iters: u64 = 0;
@@ -2931,6 +2943,61 @@ impl ConcurrentEngine {
                                     flush_dirty_flag.store(true, Ordering::Release);
                                 } else {
                                     eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: periodic FULL time-bucket rebuild. The incremental
+                    // refresh above only evicts slots whose current sort value
+                    // lands in the narrow [old_cutoff, new_cutoff) band each cycle;
+                    // a slot whose sort value jumped past that band without a
+                    // re-flush (e.g. a deferred-publish sortAt regression) is never
+                    // caught and lingers in the bucket until restart. This rebuilds
+                    // every bucket bitmap from truth on a fixed interval — the
+                    // time-bucket analog of the unified cache's TTL backstop. It
+                    // runs on the flush thread via an allocation-light single
+                    // alive-scan and a lock-free ArcSwap swap, so it never blocks
+                    // the query hot path.
+                    //
+                    // No explicit cache invalidation: a cache MISS reads the (now
+                    // fresh) bucket bitmap directly, and cache HITS self-heal via
+                    // `cache.bucket_entry_ttl_secs` — an entry older than the TTL
+                    // is re-derived from the corrected bucket bitmap. That TTL is
+                    // the natural, non-stampeding propagation path (prod = 300s);
+                    // pushing removal diffs here would only duplicate it. If the
+                    // TTL is 0 (disabled), cache HITs pick up the correction on the
+                    // next incremental reconcile that advances the bucket cutoff.
+                    if !is_loading && flush_bucket_full_rebuild_interval > 0 {
+                        if let Some(ref tb_arc) = flush_time_buckets {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            if last_full_bucket_rebuild == 0 {
+                                // Seed the baseline from boot's own rebuild; the
+                                // first fallback fires one full interval later.
+                                last_full_bucket_rebuild = now_secs;
+                            } else if now_secs.saturating_sub(last_full_bucket_rebuild)
+                                >= flush_bucket_full_rebuild_interval
+                            {
+                                let start = std::time::Instant::now();
+                                match Self::rebuild_time_buckets_streaming(&staging, tb_arc) {
+                                    Ok(scanned) => {
+                                        // Mark dirty so the merge thread persists the
+                                        // rebuilt bucket bitmaps.
+                                        flush_dirty_flag.store(true, Ordering::Release);
+                                        last_full_bucket_rebuild = now_secs;
+                                        eprintln!(
+                                            "Time bucket FULL rebuild fallback: scanned {} slots in {:?} (cache HITs self-heal via bucket_entry_ttl_secs)",
+                                            scanned, start.elapsed()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Sort field not loaded yet — retry next
+                                        // interval rather than spinning every cycle.
+                                        eprintln!("Time bucket full rebuild fallback skipped: {e}");
+                                        last_full_bucket_rebuild = now_secs;
+                                    }
                                 }
                             }
                         }
@@ -7694,6 +7761,60 @@ impl ConcurrentEngine {
         Ok((bucket_count, slot_count))
     }
 
+    /// Streaming variant of `rebuild_time_buckets_from_snapshot`: rebuilds every
+    /// bucket's membership from the alive set + sort layer in a single scan,
+    /// writing directly into fresh per-bucket bitmaps instead of materializing a
+    /// `Vec<(slot, value)>`. The intermediate Vec is ~O(alive)·12 bytes (~1.3 GB
+    /// at 107M) — a spike large enough to risk OOM on the flush thread, so the
+    /// periodic full-rebuild fallback uses this allocation-light path.
+    ///
+    /// Returns the number of alive slots scanned. Errors if the bucket sort
+    /// field is not currently loaded (caller should retry on a later cycle).
+    pub(crate) fn rebuild_time_buckets_streaming(
+        snap: &InnerEngine,
+        tb_arc: &Arc<ArcSwap<TimeBucketManager>>,
+    ) -> crate::error::Result<u64> {
+        let sort_field_name = tb_arc.load().sort_field_name().to_string();
+        let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
+            crate::error::BitdexError::Config(format!(
+                "time bucket sort field '{}' not loaded", sort_field_name
+            ))
+        })?;
+        let alive = snap.slots.alive_bitmap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tb = (*tb_arc.load_full()).clone();
+        // (name, cutoff, fresh bitmap) — one empty bitmap per bucket, filled in
+        // a single alive scan. A slot qualifies for a bucket when its sort value
+        // is in [now - duration, now], matching `rebuild_bucket`'s contract.
+        let mut builds: Vec<(String, u64, RoaringBitmap)> = tb
+            .bucket_names()
+            .into_iter()
+            .map(|name| {
+                let duration = tb.get_bucket(&name).map(|b| b.duration_secs).unwrap_or(0);
+                (name, now_secs.saturating_sub(duration), RoaringBitmap::new())
+            })
+            .collect();
+        for slot in alive.iter() {
+            let val = sort_field.reconstruct_value(slot) as u64;
+            if val > now_secs {
+                continue;
+            }
+            for (_, cutoff, bm) in builds.iter_mut() {
+                if val >= *cutoff {
+                    bm.insert(slot);
+                }
+            }
+        }
+        for (name, _, bm) in builds {
+            tb.rebuild_bucket_from_bitmap(&name, bm, now_secs);
+        }
+        tb_arc.store(Arc::new(tb));
+        Ok(alive.len())
+    }
+
     /// Get per-bucket statistics (name, slot count, cutoff).
     pub fn time_bucket_stats(&self) -> serde_json::Value {
         if let Some(ref tb_arc) = self.time_buckets {
@@ -11453,6 +11574,7 @@ mod tests {
                         refresh_interval_secs: 60,
                     },
                 ],
+                full_rebuild_interval_secs: 3600,
             }),
             max_page_size: 100,
             flush_interval_us: 50,

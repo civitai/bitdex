@@ -97,6 +97,7 @@ fn build_engine() -> ConcurrentEngine {
                 BucketConfig { name: "20s".to_string(), duration_secs: 20, refresh_interval_secs: 1 },
                 BucketConfig { name: "100s".to_string(), duration_secs: 100, refresh_interval_secs: 1 },
             ],
+            full_rebuild_interval_secs: 0,
         }),
         cache: CacheConfig {
             bucket_entry_ttl_secs: 0, // TTL backstop OFF — isolate the mark_for_rebuild path
