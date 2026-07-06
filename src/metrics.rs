@@ -84,8 +84,10 @@ pub struct Metrics {
     pub time_bucket_full_rebuild_duration_seconds: HistogramVec,
     pub time_bucket_full_rebuild_total: IntCounterVec,
     pub time_bucket_pruned_total: IntCounterVec,
+    pub time_bucket_backfilled_total: IntCounterVec,
     pub time_bucket_stale: IntGaugeVec,
     pub time_bucket_missing: IntGaugeVec,
+    pub time_bucket_reconcile_apply_seconds: HistogramVec,
     pub flush_compact_nanos: IntGaugeVec,
     pub flush_opslog_nanos: IntGaugeVec,
     pub flush_sort_promote_nanos: IntGaugeVec,
@@ -618,6 +620,14 @@ impl Metrics {
             &["index", "bucket"],
         )
         .unwrap();
+        let time_bucket_backfilled_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_time_bucket_backfilled_total",
+                "Cumulative missing members backfilled into each time bucket by the periodic reconcile (post re-validation: alive + in window + absent). Symmetric counterpart to time_bucket_pruned_total.",
+            ),
+            &["index", "bucket"],
+        )
+        .unwrap();
         let time_bucket_stale = IntGaugeVec::new(
             Opts::new(
                 "bitdex_time_bucket_stale",
@@ -629,9 +639,18 @@ impl Metrics {
         let time_bucket_missing = IntGaugeVec::new(
             Opts::new(
                 "bitdex_time_bucket_missing",
-                "Members missing from each time bucket at the last full rebuild (in window per the snapshot, but not in the bucket). Non-zero indicates a live-insert gap the prune fallback does NOT fix.",
+                "Members missing from each time bucket at the last full rebuild (in window per the snapshot, but not in the bucket). Backfilled by the reconcile (see time_bucket_backfilled_total); a persistent non-zero indicates the live-insert source drops faster than the rebuild interval.",
             ),
             &["index", "bucket"],
+        )
+        .unwrap();
+        let time_bucket_reconcile_apply_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_time_bucket_reconcile_apply_seconds",
+                "Wall time of the on-flush-thread reconcile apply (re-validate candidates + prune/backfill mutate), in seconds. Distinct from the off-thread scan; bounds the flush-thread blocking cost.",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
+            &["index"],
         )
         .unwrap();
         let flush_compact_nanos = IntGaugeVec::new(
@@ -1300,8 +1319,10 @@ impl Metrics {
         registry.register(Box::new(time_bucket_full_rebuild_duration_seconds.clone())).unwrap();
         registry.register(Box::new(time_bucket_full_rebuild_total.clone())).unwrap();
         registry.register(Box::new(time_bucket_pruned_total.clone())).unwrap();
+        registry.register(Box::new(time_bucket_backfilled_total.clone())).unwrap();
         registry.register(Box::new(time_bucket_stale.clone())).unwrap();
         registry.register(Box::new(time_bucket_missing.clone())).unwrap();
+        registry.register(Box::new(time_bucket_reconcile_apply_seconds.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
         registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
         registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
@@ -1457,8 +1478,10 @@ impl Metrics {
             time_bucket_full_rebuild_duration_seconds,
             time_bucket_full_rebuild_total,
             time_bucket_pruned_total,
+            time_bucket_backfilled_total,
             time_bucket_stale,
             time_bucket_missing,
+            time_bucket_reconcile_apply_seconds,
             flush_compact_nanos,
             flush_opslog_nanos,
             flush_sort_promote_nanos,

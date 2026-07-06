@@ -332,6 +332,108 @@ impl TimeBucketManager {
     pub fn sort_field_name(&self) -> &str {
         &self.sort_field_name
     }
+
+    /// Apply a periodic-rebuild reconcile: re-validate the worker's candidate
+    /// sets against CURRENT sort values and mutate the manager in place, pruning
+    /// stale members and backfilling missing ones. Mirror-symmetric re-validation
+    /// on both boundaries — the backfill counterpart to the prune.
+    ///
+    /// The worker computes candidates over a minutes-old snapshot; by apply time
+    /// a slot may have been deleted or had its sort value move. So each candidate
+    /// is re-checked against `sort_field` + `alive` (which MUST come from the
+    /// CURRENT staging engine, not the snapshot):
+    ///   - a STALE candidate is pruned iff it is still out of window
+    ///     (`val < cutoff || val > now`), and
+    ///   - a MISSING candidate is backfilled iff it is still alive AND in window
+    ///     (`cutoff <= val <= now`) AND not already present in the bucket
+    ///     (live maintenance may have added it since the snapshot).
+    ///
+    /// Cutoff is NOT advanced: `subtract_expired` is called with the bucket's
+    /// existing `last_cutoff`, and `insert_slot` doesn't touch it — the
+    /// incremental band path owns cutoff advancement. Iterates each bucket once,
+    /// computing both deltas before mutating, and zips candidates by bucket NAME
+    /// (never assumes the two slices share order).
+    ///
+    /// Returns one `(bucket_name, pruned, backfilled)` per bucket that changed —
+    /// the caller sums for logging and emits per-bucket metrics.
+    pub(crate) fn reconcile_apply(
+        &mut self,
+        sort_field: &crate::sort::SortField,
+        alive: &RoaringBitmap,
+        now_secs: u64,
+        stale_candidates: &[(String, RoaringBitmap)],
+        missing_candidates: &[(String, RoaringBitmap)],
+    ) -> Vec<(String, u64, u64)> {
+        // Zip by bucket NAME — the two candidate slices are independent.
+        let mut stale_by: HashMap<&str, &RoaringBitmap> = HashMap::new();
+        for (name, bm) in stale_candidates {
+            stale_by.insert(name.as_str(), bm);
+        }
+        let mut missing_by: HashMap<&str, &RoaringBitmap> = HashMap::new();
+        for (name, bm) in missing_candidates {
+            missing_by.insert(name.as_str(), bm);
+        }
+
+        let mut per_bucket: Vec<(String, u64, u64)> = Vec::new();
+        for name in self.bucket_names() {
+            // Read-only pass: compute both confirmed deltas for this bucket.
+            let (still, add, last_cut) = {
+                let Some(bucket) = self.get_bucket(&name) else {
+                    continue;
+                };
+                let cutoff = now_secs.saturating_sub(bucket.duration_secs);
+                let last_cut = bucket.last_cutoff();
+
+                // Re-validate stale: keep for pruning only if STILL out of window.
+                let mut still = RoaringBitmap::new();
+                if let Some(candidates) = stale_by.get(name.as_str()) {
+                    for slot in candidates.iter() {
+                        let val = sort_field.reconstruct_value(slot) as u64;
+                        if val < cutoff || val > now_secs {
+                            still.insert(slot);
+                        }
+                    }
+                }
+                // Re-validate missing: backfill only if alive + in window + absent.
+                let mut add = RoaringBitmap::new();
+                if let Some(candidates) = missing_by.get(name.as_str()) {
+                    for slot in candidates.iter() {
+                        if !alive.contains(slot) {
+                            continue;
+                        }
+                        let val = sort_field.reconstruct_value(slot) as u64;
+                        if val >= cutoff
+                            && val <= now_secs
+                            && !bucket.bitmap().contains(slot)
+                        {
+                            add.insert(slot);
+                        }
+                    }
+                }
+                (still, add, last_cut)
+            };
+
+            if still.is_empty() && add.is_empty() {
+                continue;
+            }
+            let pruned = still.len();
+            let backfilled = add.len();
+            if let Some(bucket) = self.get_bucket_mut(&name) {
+                if !still.is_empty() {
+                    // Prune first (does not advance cutoff — pass existing one),
+                    // then backfill. Stale and missing sets are disjoint by
+                    // construction (stale = old − fresh, missing = fresh − old),
+                    // so the two operations never touch the same slot.
+                    bucket.subtract_expired(&still, last_cut);
+                }
+                for slot in &add {
+                    bucket.insert_slot(slot);
+                }
+                per_bucket.push((name, pruned, backfilled));
+            }
+        }
+        per_bucket
+    }
 }
 
 #[cfg(test)]
@@ -662,5 +764,170 @@ mod tests {
             !mgr.get_bucket("24h").unwrap().bitmap().contains(7),
             "full rebuild evicts the stale member — the fallback's cure"
         );
+    }
+
+    // ---- reconcile_apply (symmetric prune + backfill) ----
+
+    /// Build a `SortField` (sortAt, 32-bit linear) with the given (slot, value)
+    /// pairs set. `reconstruct_value` reads base|diff via `fused_contains`, so
+    /// slots inserted here are visible without any merge/flush.
+    fn make_sort_field(values: &[(u32, u64)]) -> crate::sort::SortField {
+        let config = crate::config::SortFieldConfig {
+            name: "sortAt".to_string(),
+            source_type: "uint32".to_string(),
+            encoding: "linear".to_string(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        };
+        let mut field = crate::sort::SortField::new(config);
+        for (slot, val) in values {
+            field.insert(*slot, *val as u32);
+        }
+        field
+    }
+
+    fn cand(name: &str, slots: &[u32]) -> Vec<(String, RoaringBitmap)> {
+        let mut bm = RoaringBitmap::new();
+        for s in slots {
+            bm.insert(*s);
+        }
+        vec![(name.to_string(), bm)]
+    }
+
+    /// (a) A stale candidate still out of window is pruned.
+    /// (b) A stale candidate whose sort value moved back in-window since the
+    ///     snapshot is NOT pruned (re-validation).
+    #[test]
+    fn reconcile_prunes_still_stale_but_keeps_moved_back_in_window() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+
+        // Both slots currently sit in the 24h bucket (per the snapshot they were
+        // flagged stale). Slot 1's CURRENT value is old (still stale); slot 2's
+        // CURRENT value moved back in-window since the scan.
+        mgr.insert_slot(1, now - 100, now); // membership only; value comes from sort_field
+        mgr.insert_slot(2, now - 100, now);
+        let sort_field = make_sort_field(&[(1, now - 200_000), (2, now - 50)]);
+        let alive = {
+            let mut a = RoaringBitmap::new();
+            a.insert(1);
+            a.insert(2);
+            a
+        };
+
+        let stale = cand("24h", &[1, 2]);
+        let missing: Vec<(String, RoaringBitmap)> = Vec::new();
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &stale, &missing);
+
+        assert_eq!(report, vec![("24h".to_string(), 1, 0)]);
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(1), "still-stale pruned");
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(2), "moved-back-in-window kept");
+    }
+
+    /// (c) A missing candidate that is alive + in-window is backfilled.
+    #[test]
+    fn reconcile_backfills_alive_in_window_missing() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+
+        // Bucket is empty (slot 5 was dropped by the live path). Its CURRENT
+        // value is in-window and it is alive → must be backfilled.
+        let sort_field = make_sort_field(&[(5, now - 100)]);
+        let alive = {
+            let mut a = RoaringBitmap::new();
+            a.insert(5);
+            a
+        };
+
+        let stale: Vec<(String, RoaringBitmap)> = Vec::new();
+        let missing = cand("24h", &[5]);
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &stale, &missing);
+
+        assert_eq!(report, vec![("24h".to_string(), 0, 1)]);
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(5), "in-window missing backfilled");
+    }
+
+    /// (d) A missing candidate deleted since the snapshot (not in `alive`) is
+    ///     NOT inserted.
+    #[test]
+    fn reconcile_skips_missing_deleted_since_snapshot() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+        let sort_field = make_sort_field(&[(6, now - 100)]);
+        let alive = RoaringBitmap::new(); // slot 6 no longer alive
+
+        let missing = cand("24h", &[6]);
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &[], &missing);
+
+        assert!(report.is_empty(), "no change");
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(6), "dead candidate not inserted");
+    }
+
+    /// (e) A missing candidate whose sort value moved out of window since the
+    ///     snapshot is NOT inserted.
+    #[test]
+    fn reconcile_skips_missing_moved_out_of_window() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+        let sort_field = make_sort_field(&[(8, now - 200_000)]); // out of 24h window now
+        let alive = {
+            let mut a = RoaringBitmap::new();
+            a.insert(8);
+            a
+        };
+
+        let missing = cand("24h", &[8]);
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &[], &missing);
+
+        assert!(report.is_empty(), "no change");
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(8), "out-of-window candidate not inserted");
+    }
+
+    /// (f) A missing candidate already present in the bucket is a no-op (no
+    ///     double count).
+    #[test]
+    fn reconcile_skips_missing_already_present() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+        mgr.insert_slot(9, now - 100, now); // already in bucket
+        let sort_field = make_sort_field(&[(9, now - 100)]);
+        let alive = {
+            let mut a = RoaringBitmap::new();
+            a.insert(9);
+            a
+        };
+
+        let missing = cand("24h", &[9]);
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &[], &missing);
+
+        assert!(report.is_empty(), "already-present is a no-op");
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(9));
+    }
+
+    /// (g) A single bucket with both a stale and a missing slot: one apply removes
+    ///     one and adds the other, reporting counts (1 pruned, 1 backfilled).
+    #[test]
+    fn reconcile_prunes_and_backfills_same_bucket_in_one_pass() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        let now: u64 = 1_700_000_000;
+
+        // Slot 1 is in the bucket but stale now; slot 2 is missing but in-window.
+        mgr.insert_slot(1, now - 100, now);
+        let sort_field = make_sort_field(&[(1, now - 200_000), (2, now - 100)]);
+        let alive = {
+            let mut a = RoaringBitmap::new();
+            a.insert(1);
+            a.insert(2);
+            a
+        };
+
+        let stale = cand("24h", &[1]);
+        let missing = cand("24h", &[2]);
+        let report = mgr.reconcile_apply(&sort_field, &alive, now, &stale, &missing);
+
+        assert_eq!(report, vec![("24h".to_string(), 1, 1)]);
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(1), "stale removed");
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(2), "missing added");
     }
 }

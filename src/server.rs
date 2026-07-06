@@ -1844,8 +1844,13 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
                 .clone(),
             time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
             time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+            time_bucket_backfilled_total: state.metrics.time_bucket_backfilled_total.clone(),
             time_bucket_stale: state.metrics.time_bucket_stale.clone(),
             time_bucket_missing: state.metrics.time_bucket_missing.clone(),
+            time_bucket_reconcile_apply_seconds: state
+                .metrics
+                .time_bucket_reconcile_apply_seconds
+                .clone(),
             index_name: def.name.clone(),
         });
         // Install the cache-worker cycle-time histogram so the worker can
@@ -2191,8 +2196,10 @@ async fn handle_create_index(
         time_bucket_full_rebuild_duration_seconds: state.metrics.time_bucket_full_rebuild_duration_seconds.clone(),
         time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
         time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+        time_bucket_backfilled_total: state.metrics.time_bucket_backfilled_total.clone(),
         time_bucket_stale: state.metrics.time_bucket_stale.clone(),
         time_bucket_missing: state.metrics.time_bucket_missing.clone(),
+        time_bucket_reconcile_apply_seconds: state.metrics.time_bucket_reconcile_apply_seconds.clone(),
         index_name: definition.name.clone(),
     });
 
