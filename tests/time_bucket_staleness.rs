@@ -419,7 +419,7 @@ fn audit_reports_accurate_membership_and_window_boundaries() {
     }
     wait_for_alive(&engine, 15, 2000);
 
-    let audit = engine.time_bucket_audit().expect("audit should succeed");
+    let audit = engine.time_bucket_audit(0).expect("audit should succeed");
     let get = |bucket: &str, field: &str| -> u64 {
         audit["buckets"][bucket][field].as_u64().unwrap_or(u64::MAX)
     };
@@ -435,4 +435,43 @@ fn audit_reports_accurate_membership_and_window_boundaries() {
     assert_eq!(get("7d", "fresh_in_window"), 15, "all 15 are within the 7d window");
     assert_eq!(get("7d", "stale"), 0, "healthy 7d bucket has no stale members");
     assert_eq!(get("7d", "missing"), 0, "live path populated the 7d bucket fully");
+}
+
+/// `sample=0` omits the sample arrays; `sample>0` adds `missing_sample` and
+/// `stale_sample` (arrays of `{slot, sortAt}`) to every bucket. A healthy bucket
+/// has empty samples. Guards the diagnostic wiring the prod source-fix hunt uses.
+#[test]
+fn audit_sample_param_emits_slot_sortat_arrays() {
+    let (engine, now) = build_engine();
+    for slot in 1..=10u32 {
+        engine
+            .put(
+                slot,
+                &make_doc(vec![
+                    ("sortAt", FieldValue::Single(Value::Integer((now - 3600) as i64))),
+                    ("category", FieldValue::Single(Value::Integer(1))),
+                ]),
+            )
+            .unwrap();
+    }
+    wait_for_alive(&engine, 10, 2000);
+
+    // sample=0 → counts only, no sample keys.
+    let plain = engine.time_bucket_audit(0).expect("audit ok");
+    assert!(
+        plain["buckets"]["24h"].get("missing_sample").is_none(),
+        "sample=0 must not emit missing_sample"
+    );
+
+    // sample>0 → sample keys present as arrays; healthy bucket → empty.
+    let sampled = engine.time_bucket_audit(5).expect("audit ok");
+    let b24 = &sampled["buckets"]["24h"];
+    let missing_sample = b24["missing_sample"]
+        .as_array()
+        .expect("missing_sample is an array");
+    let stale_sample = b24["stale_sample"]
+        .as_array()
+        .expect("stale_sample is an array");
+    assert!(missing_sample.is_empty(), "healthy 24h bucket has no missing slots");
+    assert!(stale_sample.is_empty(), "healthy 24h bucket has no stale slots");
 }
