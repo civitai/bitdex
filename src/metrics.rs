@@ -80,6 +80,12 @@ pub struct Metrics {
     pub timebucket_dropped_no_sort_field_total: IntCounterVec,
     pub timebucket_dropped_capacity_exceeded_total: IntCounterVec,
     pub timebucket_anomalous_ts_total: IntCounterVec,
+    // Periodic full time-bucket rebuild (prune) fallback observability.
+    pub time_bucket_full_rebuild_duration_seconds: HistogramVec,
+    pub time_bucket_full_rebuild_total: IntCounterVec,
+    pub time_bucket_pruned_total: IntCounterVec,
+    pub time_bucket_stale: IntGaugeVec,
+    pub time_bucket_missing: IntGaugeVec,
     pub flush_compact_nanos: IntGaugeVec,
     pub flush_opslog_nanos: IntGaugeVec,
     pub flush_sort_promote_nanos: IntGaugeVec,
@@ -585,6 +591,47 @@ impl Metrics {
                 "Slot timestamps reconstructed during time-bucket flush that look anomalous. kind=zero (uninitialized), future (clock skew), wrapped (u32 ms-as-secs wraparound suspected).",
             ),
             &["index", "field", "kind"],
+        )
+        .unwrap();
+        let time_bucket_full_rebuild_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_time_bucket_full_rebuild_duration_seconds",
+                "Wall time of the periodic full time-bucket rebuild background scan, in seconds.",
+            )
+            .buckets(vec![1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0]),
+            &["index"],
+        )
+        .unwrap();
+        let time_bucket_full_rebuild_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_time_bucket_full_rebuild_total",
+                "Count of completed periodic full time-bucket rebuilds (background scan applied).",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let time_bucket_pruned_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_time_bucket_pruned_total",
+                "Cumulative stale members pruned from each time bucket by the periodic full rebuild (post re-validation against current sort values).",
+            ),
+            &["index", "bucket"],
+        )
+        .unwrap();
+        let time_bucket_stale = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_time_bucket_stale",
+                "Stale candidate members found in each time bucket at the last full rebuild (in bucket, no longer in window per the snapshot).",
+            ),
+            &["index", "bucket"],
+        )
+        .unwrap();
+        let time_bucket_missing = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_time_bucket_missing",
+                "Members missing from each time bucket at the last full rebuild (in window per the snapshot, but not in the bucket). Non-zero indicates a live-insert gap the prune fallback does NOT fix.",
+            ),
+            &["index", "bucket"],
         )
         .unwrap();
         let flush_compact_nanos = IntGaugeVec::new(
@@ -1250,6 +1297,11 @@ impl Metrics {
         registry.register(Box::new(timebucket_dropped_no_sort_field_total.clone())).unwrap();
         registry.register(Box::new(timebucket_dropped_capacity_exceeded_total.clone())).unwrap();
         registry.register(Box::new(timebucket_anomalous_ts_total.clone())).unwrap();
+        registry.register(Box::new(time_bucket_full_rebuild_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(time_bucket_full_rebuild_total.clone())).unwrap();
+        registry.register(Box::new(time_bucket_pruned_total.clone())).unwrap();
+        registry.register(Box::new(time_bucket_stale.clone())).unwrap();
+        registry.register(Box::new(time_bucket_missing.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
         registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
         registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
@@ -1402,6 +1454,11 @@ impl Metrics {
             timebucket_dropped_no_sort_field_total,
             timebucket_dropped_capacity_exceeded_total,
             timebucket_anomalous_ts_total,
+            time_bucket_full_rebuild_duration_seconds,
+            time_bucket_full_rebuild_total,
+            time_bucket_pruned_total,
+            time_bucket_stale,
+            time_bucket_missing,
             flush_compact_nanos,
             flush_opslog_nanos,
             flush_sort_promote_nanos,

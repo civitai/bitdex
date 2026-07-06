@@ -67,6 +67,13 @@ pub struct MetricsBridge {
     /// `timebucket_dropped_no_sort_field_total` which counts slots that were
     /// successfully deferred and will replay later. Labels: index, field.
     pub timebucket_dropped_capacity_exceeded_total: prometheus::IntCounterVec,
+    /// Periodic full time-bucket rebuild (prune) fallback observability.
+    /// `index`-labeled; the per-bucket ones also carry a `bucket` label.
+    pub time_bucket_full_rebuild_duration_seconds: prometheus::HistogramVec,
+    pub time_bucket_full_rebuild_total: prometheus::IntCounterVec,
+    pub time_bucket_pruned_total: prometheus::IntCounterVec,
+    pub time_bucket_stale: prometheus::IntGaugeVec,
+    pub time_bucket_missing: prometheus::IntGaugeVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -1355,13 +1362,16 @@ impl ConcurrentEngine {
                 // to wall-clock jumps); `None` = not yet baselined, seeded to
                 // "now" on the first cycle so boot's own rebuild is the baseline
                 // and the first fallback fires one interval later.
-                // `None` payload = sort field not loaded (retry); `Some(removals)`
-                // = per-bucket stale sets to prune. The JoinHandle lets the flush
+                // `None` payload = sort field not loaded (retry); `Some((dur,
+                // removals))` = scan duration + per-bucket (name, stale set,
+                // missing count) to prune/observe. The JoinHandle lets the flush
                 // thread detect a worker that ended without sending (panicked) —
                 // the persistent sender keeps the channel open so try_recv never
                 // reports Disconnected.
-                let (bucket_rebuild_tx, bucket_rebuild_rx) =
-                    std::sync::mpsc::channel::<Option<Vec<(String, RoaringBitmap)>>>();
+                #[allow(clippy::type_complexity)]
+                let (bucket_rebuild_tx, bucket_rebuild_rx) = std::sync::mpsc::channel::<
+                    Option<(std::time::Duration, Vec<(String, RoaringBitmap, u64)>)>,
+                >();
                 let mut last_full_bucket_rebuild: Option<std::time::Instant> = None;
                 let mut bucket_rebuild_in_flight = false;
                 let mut bucket_rebuild_handle: Option<std::thread::JoinHandle<()>> = None;
@@ -3016,8 +3026,35 @@ impl ConcurrentEngine {
                                                 .unwrap_or_else(std::time::Instant::now),
                                         );
                                     }
-                                    Some(removals) => {
+                                    Some((scan_dur, removals)) => {
                                         last_full_bucket_rebuild = Some(std::time::Instant::now());
+                                        // `scan_dur` feeds the server-only metrics below.
+                                        let _ = &scan_dur;
+                                        // Observability: scan duration, rebuild count, and
+                                        // per-bucket stale/missing gauges (from the
+                                        // snapshot the worker scanned). `missing` > 0
+                                        // signals a live-insert gap the prune won't fix.
+                                        #[cfg(feature = "server")]
+                                        {
+                                            let bg = flush_metrics_bridge.load();
+                                            if let Some(m) = (**bg).as_ref() {
+                                                let idx = m.index_name.as_str();
+                                                m.time_bucket_full_rebuild_duration_seconds
+                                                    .with_label_values(&[idx])
+                                                    .observe(scan_dur.as_secs_f64());
+                                                m.time_bucket_full_rebuild_total
+                                                    .with_label_values(&[idx])
+                                                    .inc();
+                                                for (name, stale, missing) in &removals {
+                                                    m.time_bucket_stale
+                                                        .with_label_values(&[idx, name])
+                                                        .set(stale.len() as i64);
+                                                    m.time_bucket_missing
+                                                        .with_label_values(&[idx, name])
+                                                        .set(*missing as i64);
+                                                }
+                                            }
+                                        }
                                         // The worker's stale sets are CANDIDATES from a
                                         // minutes-old snapshot. Re-validate each against
                                         // the CURRENT sort values (staging) before
@@ -3036,7 +3073,7 @@ impl ConcurrentEngine {
                                             let mut confirmed: Vec<(String, RoaringBitmap, u64)> = Vec::new();
                                             {
                                                 let tb_read = tb_arc.load();
-                                                for (name, candidates) in &removals {
+                                                for (name, candidates, _missing) in &removals {
                                                     if candidates.is_empty() {
                                                         continue;
                                                     }
@@ -3060,10 +3097,18 @@ impl ConcurrentEngine {
                                             // Phase B: prune the confirmed stale members.
                                             if !confirmed.is_empty() {
                                                 let mut tb = (*tb_arc.load_full()).clone();
+                                                #[cfg(feature = "server")]
+                                                let bg = flush_metrics_bridge.load();
                                                 for (name, still, last_cut) in &confirmed {
                                                     if let Some(b) = tb.get_bucket_mut(name) {
                                                         b.subtract_expired(still, *last_cut);
                                                         pruned_total += still.len();
+                                                        #[cfg(feature = "server")]
+                                                        if let Some(m) = (**bg).as_ref() {
+                                                            m.time_bucket_pruned_total
+                                                                .with_label_values(&[m.index_name.as_str(), name])
+                                                                .inc_by(still.len());
+                                                        }
                                                     }
                                                 }
                                                 tb_arc.store(Arc::new(tb));
@@ -3119,23 +3164,27 @@ impl ConcurrentEngine {
                                     .name("bitdex-tbucket-rebuild".to_string())
                                     .spawn(move || {
                                         let start = std::time::Instant::now();
-                                        let removals =
-                                            Self::compute_time_bucket_stale_removals(&snap, &tb_snapshot);
-                                        match &removals {
-                                            Some(r) => {
-                                                let stale: u64 = r.iter().map(|(_, b)| b.len()).sum();
-                                                eprintln!(
-                                                    "Time bucket FULL rebuild (bg): scanned in {:?}, {} stale members found",
-                                                    start.elapsed(), stale
-                                                );
-                                            }
-                                            None => eprintln!(
+                                        let payload = Self::compute_time_bucket_stale_removals(
+                                            &snap, &tb_snapshot,
+                                        )
+                                        .map(|r| {
+                                            let elapsed = start.elapsed();
+                                            let stale: u64 = r.iter().map(|(_, b, _)| b.len()).sum();
+                                            let missing: u64 = r.iter().map(|(_, _, m)| m).sum();
+                                            eprintln!(
+                                                "Time bucket FULL rebuild (bg): scanned in {:?}, {} stale / {} missing",
+                                                elapsed, stale, missing
+                                            );
+                                            (elapsed, r)
+                                        });
+                                        if payload.is_none() {
+                                            eprintln!(
                                                 "Time bucket FULL rebuild (bg): sort field not loaded, will retry"
-                                            ),
+                                            );
                                         }
                                         // Receiver lives for the flush thread's life;
                                         // a send error only means shutdown — ignore.
-                                        let _ = tx.send(removals);
+                                        let _ = tx.send(payload);
                                     });
                                 match spawned {
                                     Ok(h) => {
@@ -7930,12 +7979,15 @@ impl ConcurrentEngine {
     /// handled by live `insert_slot` + incremental `subtract_expired`; this only
     /// closes the regressed-past-band gap.
     ///
-    /// Returns one `(bucket_name, stale_bitmap)` per bucket (bitmap may be
-    /// empty), or `None` if the bucket sort field is not currently loaded.
+    /// Returns one `(bucket_name, stale_bitmap, missing_count)` per bucket —
+    /// `stale_bitmap` is the candidate removal set, `missing_count` is
+    /// `|fresh − current|` (in window per the snapshot, absent from the bucket)
+    /// for observability only (the prune does not add). `None` if the bucket
+    /// sort field is not currently loaded.
     pub(crate) fn compute_time_bucket_stale_removals(
         snap: &InnerEngine,
         tb: &TimeBucketManager,
-    ) -> Option<Vec<(String, RoaringBitmap)>> {
+    ) -> Option<Vec<(String, RoaringBitmap, u64)>> {
         let sort_field = snap.sorts.get_field(tb.sort_field_name())?;
         let alive = snap.slots.alive_bitmap();
         let now_secs = std::time::SystemTime::now()
@@ -7971,9 +8023,11 @@ impl ConcurrentEngine {
             specs
                 .into_iter()
                 .map(|(name, _, fresh, old)| {
-                    let mut stale = old;
-                    stale -= &fresh; // members present but no longer in-window
-                    (name, stale)
+                    let mut stale = old.clone();
+                    stale -= &fresh; // in bucket, no longer in window
+                    let mut missing = fresh;
+                    missing -= &old; // in window, not in bucket (metric only)
+                    (name, stale, missing.len())
                 })
                 .collect(),
         )

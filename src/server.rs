@@ -1838,6 +1838,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
                 .metrics
                 .timebucket_anomalous_ts_total
                 .clone(),
+            time_bucket_full_rebuild_duration_seconds: state
+                .metrics
+                .time_bucket_full_rebuild_duration_seconds
+                .clone(),
+            time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
+            time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+            time_bucket_stale: state.metrics.time_bucket_stale.clone(),
+            time_bucket_missing: state.metrics.time_bucket_missing.clone(),
             index_name: def.name.clone(),
         });
         // Install the cache-worker cycle-time histogram so the worker can
@@ -2180,6 +2188,11 @@ async fn handle_create_index(
             .timebucket_dropped_capacity_exceeded_total
             .clone(),
         timebucket_anomalous_ts_total: state.metrics.timebucket_anomalous_ts_total.clone(),
+        time_bucket_full_rebuild_duration_seconds: state.metrics.time_bucket_full_rebuild_duration_seconds.clone(),
+        time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
+        time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+        time_bucket_stale: state.metrics.time_bucket_stale.clone(),
+        time_bucket_missing: state.metrics.time_bucket_missing.clone(),
         index_name: definition.name.clone(),
     });
 
