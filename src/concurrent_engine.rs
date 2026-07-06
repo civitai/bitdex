@@ -2961,12 +2961,15 @@ impl ConcurrentEngine {
                     //
                     // No explicit cache invalidation: a cache MISS reads the (now
                     // fresh) bucket bitmap directly, and cache HITS self-heal via
-                    // `cache.bucket_entry_ttl_secs` — an entry older than the TTL
-                    // is re-derived from the corrected bucket bitmap. That TTL is
-                    // the natural, non-stampeding propagation path (prod = 300s);
-                    // pushing removal diffs here would only duplicate it. If the
-                    // TTL is 0 (disabled), cache HITs pick up the correction on the
-                    // next incremental reconcile that advances the bucket cutoff.
+                    // `cache.bucket_entry_ttl_secs` — an entry older than the TTL is
+                    // re-derived from the corrected bucket bitmap (prod = 300s). That
+                    // TTL, not a diff, is the propagation path for HITs: staggered
+                    // per entry (non-stampeding) and needs no cutoff advance.
+                    // NOTE: if the TTL is 0 (disabled) this rebuild does NOT reach
+                    // cache HITs — the incremental reconcile can't remove a
+                    // regressed-past-band slot either — so a non-zero
+                    // bucket_entry_ttl_secs is required for the fallback to correct
+                    // cached bucket queries. Cache MISSes are always correct.
                     if !is_loading && flush_bucket_full_rebuild_interval > 0 {
                         if let Some(ref tb_arc) = flush_time_buckets {
                             let now_secs = std::time::SystemTime::now()
@@ -2986,17 +2989,27 @@ impl ConcurrentEngine {
                                         // Mark dirty so the merge thread persists the
                                         // rebuilt bucket bitmaps.
                                         flush_dirty_flag.store(true, Ordering::Release);
-                                        last_full_bucket_rebuild = now_secs;
+                                        // Measure the interval from COMPLETION, not
+                                        // start: a multi-second scan must not schedule
+                                        // the next rebuild early or run back-to-back.
+                                        last_full_bucket_rebuild = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
                                         eprintln!(
                                             "Time bucket FULL rebuild fallback: scanned {} slots in {:?} (cache HITs self-heal via bucket_entry_ttl_secs)",
                                             scanned, start.elapsed()
                                         );
                                     }
                                     Err(e) => {
-                                        // Sort field not loaded yet — retry next
-                                        // interval rather than spinning every cycle.
+                                        // Sort field not loaded yet (transient boot
+                                        // race). Retry in ~60s instead of waiting a
+                                        // full interval, without spinning every cycle.
                                         eprintln!("Time bucket full rebuild fallback skipped: {e}");
-                                        last_full_bucket_rebuild = now_secs;
+                                        let retry_in = 60.min(flush_bucket_full_rebuild_interval);
+                                        last_full_bucket_rebuild = now_secs
+                                            .saturating_sub(flush_bucket_full_rebuild_interval)
+                                            .saturating_add(retry_in);
                                     }
                                 }
                             }
