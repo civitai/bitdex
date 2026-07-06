@@ -50,6 +50,13 @@ pub struct Config {
     /// compaction entirely (no worker thread, no staleness tracking on reads).
     #[serde(default = "default_compact_threshold_pct")]
     pub compact_threshold_pct: u64,
+    /// Doc-store compaction threshold: number of ops accumulated on a doc shard
+    /// before the merge thread compacts it into a fresh snapshot. Default 1000.
+    /// This is an ops-COUNT (not a percentage) and is the value the steady-state
+    /// merge-thread compactor actually consults via `needs_compaction`. Set to 0
+    /// to disable doc auto-compaction (manual `/compact` still works).
+    #[serde(default = "default_doc_compact_threshold")]
+    pub doc_compact_threshold: u32,
     /// Eviction sweep interval: check for idle values every N flush cycles.
     /// Default 1000 (~0.1s at 100μs flush). Lower values make eviction more
     /// responsive (useful for testing).
@@ -133,6 +140,10 @@ fn default_flush_interval_us() -> u64 {
 fn default_compact_threshold_pct() -> u64 {
     30
 }
+
+fn default_doc_compact_threshold() -> u32 {
+    crate::shard_store_doc::DEFAULT_DOC_COMPACT_THRESHOLD
+}
 fn default_eviction_sweep_interval() -> u64 {
     1000
 }
@@ -180,6 +191,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
+            doc_compact_threshold: default_doc_compact_threshold(),
             doc_cache: DocCacheConfigEntry::default(),
             memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,

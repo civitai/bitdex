@@ -887,7 +887,14 @@ where
     /// at runtime via `set_compact_threshold` (wired to PATCH /config
     /// `bitmap_compact_threshold` from the server layer).
     pub fn needs_compaction(&self, key: &Sh::Key) -> io::Result<bool> {
-        self.should_compact(key, self.compact_threshold.load(Ordering::Relaxed))
+        let threshold = self.compact_threshold.load(Ordering::Relaxed);
+        // 0 = auto-compaction disabled. (The explicit `should_compact(key, 0)`
+        // path stays "compact if any ops" — it's what the manual /compact
+        // endpoint uses to force a full compaction.)
+        if threshold == 0 {
+            return Ok(false);
+        }
+        self.should_compact(key, threshold)
     }
 
     /// Set the compaction threshold (ops_count > threshold triggers compaction).

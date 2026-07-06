@@ -78,6 +78,7 @@ These are set once at startup and cannot be changed without restarting the proce
 | `flush_interval_us` | `50` | Background flush thread interval (microseconds) |
 | `merge_interval_ms` | `5000` | Versioned bitmap merge interval |
 | `compact_threshold` | `30` | ShardStore compaction trigger (% stale, 0 = disabled) |
+| `doc_compact_threshold` | `1000` | Doc-shard ops-COUNT before merge-thread compaction (0 = disabled). Propagates to the ShardStore atomic the `needs_compaction` gate reads |
 | `channel_capacity` | `100,000` | Bounded channel for write coalescer |
 | `eviction_sweep_interval` | `1000` | Check idle values every N flush cycles |
 | `max_page_size` | `100` | Hard cap on query `limit` parameter |
