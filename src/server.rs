@@ -4454,9 +4454,17 @@ async fn handle_rebuild_time_buckets(
 
 /// Read-only diagnostic: per-bucket current / fresh_in_window / stale / missing.
 /// Non-mutating; runs a full alive-scan (~minutes at scale) on a blocking task.
+#[derive(serde::Deserialize)]
+struct TimeBucketAuditParams {
+    /// Number of missing/stale slot IDs to sample per bucket (0 = counts only).
+    #[serde(default)]
+    sample: usize,
+}
+
 async fn handle_time_bucket_audit(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
+    AxumQuery(params): AxumQuery<TimeBucketAuditParams>,
 ) -> impl IntoResponse {
     let engine = {
         let guard = state.index.lock();
@@ -4470,7 +4478,9 @@ async fn handle_time_bucket_audit(
             }
         }
     };
-    match tokio::task::spawn_blocking(move || engine.time_bucket_audit()).await {
+    // Cap the sample so a stray ?sample=10000000 can't build a huge JSON payload.
+    let sample = params.sample.min(1000);
+    match tokio::task::spawn_blocking(move || engine.time_bucket_audit(sample)).await {
         Ok(Ok(audit)) => Json(serde_json::json!({"status": "ok", "audit": audit})).into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,

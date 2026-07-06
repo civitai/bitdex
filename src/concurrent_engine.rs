@@ -8061,7 +8061,15 @@ impl ConcurrentEngine {
     /// NOT fix). Non-mutating: no bucket writes, no cache clear. Scans all alive
     /// slots (~minutes at scale), so callers should run it off the request hot
     /// path (spawn_blocking).
-    pub fn time_bucket_audit(&self) -> crate::error::Result<serde_json::Value> {
+    /// Audit time-bucket membership against the sort layer.
+    ///
+    /// `sample` > 0 additionally returns up to `sample` slot IDs (ascending) per
+    /// bucket for the `missing` (in-window per sort layer but absent from the
+    /// bucket bitmap) and `stale` (in bucket but no longer in-window) sets, each
+    /// paired with its reconstructed sort value. Used to diagnose the live
+    /// insert-path gap: are missing slots future-dated-at-insert, recently
+    /// activated, or edited? `sample == 0` preserves the counts-only response.
+    pub fn time_bucket_audit(&self, sample: usize) -> crate::error::Result<serde_json::Value> {
         let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config("no time_buckets configured".into())
         })?;
@@ -8110,15 +8118,34 @@ impl ConcurrentEngine {
             stale -= &fresh;
             let mut missing = fresh.clone();
             missing -= &current;
-            buckets.insert(
-                name,
-                serde_json::json!({
-                    "current": current.len(),
-                    "fresh_in_window": fresh.len(),
-                    "stale": stale.len(),
-                    "missing": missing.len(),
-                }),
-            );
+            // Emit [{slot, sortAt}, ...] for the first `sample` slots (bitmap
+            // iteration is ascending slot-id). sortAt lets the caller test the
+            // future-dated-at-insert hypothesis without a second reconstruct pass.
+            let sample_of = |bm: &RoaringBitmap| -> serde_json::Value {
+                serde_json::Value::Array(
+                    bm.iter()
+                        .take(sample)
+                        .map(|slot| {
+                            serde_json::json!({
+                                "slot": slot,
+                                "sortAt": sort_field.reconstruct_value(slot) as u64,
+                            })
+                        })
+                        .collect(),
+                )
+            };
+            let mut entry = serde_json::json!({
+                "current": current.len(),
+                "fresh_in_window": fresh.len(),
+                "stale": stale.len(),
+                "missing": missing.len(),
+            });
+            if sample > 0 {
+                let obj = entry.as_object_mut().expect("json object");
+                obj.insert("missing_sample".into(), sample_of(&missing));
+                obj.insert("stale_sample".into(), sample_of(&stale));
+            }
+            buckets.insert(name, entry);
         }
         Ok(serde_json::json!({
             "now_unix": now_secs,
