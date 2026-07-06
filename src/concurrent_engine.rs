@@ -1014,10 +1014,10 @@ impl ConcurrentEngine {
         let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
 
         // DocStoreV3 uses ShardStore native compaction — no manual compaction worker needed.
-        // Set threshold for auto-compaction within DocStoreV3.
-        if config.compact_threshold_pct > 0 {
-            docstore.set_compact_threshold(config.compact_threshold_pct as u32);
-        }
+        // `doc_compact_threshold` is an ops-COUNT and propagates to the underlying
+        // ShardStore atomic the merge thread's `needs_compaction` gate reads. A value
+        // of 0 disables doc auto-compaction (manual /compact still works).
+        docstore.set_compact_threshold(config.doc_compact_threshold);
         // par_iter min-task threshold — hot-reloadable via PATCH /config.
         // Default 8: skip rayon dispatch for tiny batches where pool overhead
         // exceeds work. Set huge to disable par_iter entirely (perf experiment).
@@ -3078,6 +3078,8 @@ impl ConcurrentEngine {
                                 dirty.push(*k);
                                 false
                             });
+                            // needs_compaction honors threshold 0 = disabled; when
+                            // disabled this still drains the dirty set (no rewrite).
                             for shard_key in dirty {
                                 if merge_doc_shard_store.needs_compaction(&shard_key).unwrap_or(false) {
                                     if let Err(e) = merge_doc_shard_store.compact_current(&shard_key) {

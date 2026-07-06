@@ -734,6 +734,11 @@ pub type DocShardStore = crate::shard_store::ShardStore<DocSnapshotCodec, DocOpC
 
 use crate::config::DataSchema;
 
+/// Default doc-shard compaction threshold (ops-count). The merge thread compacts
+/// a doc shard once its ops log exceeds this. Kept in sync with the
+/// `doc_compact_threshold` config default.
+pub const DEFAULT_DOC_COMPACT_THRESHOLD: u32 = 1000;
+
 /// High-level document store backed by ShardStore.
 ///
 /// Drop-in replacement for DocStore V2 that provides CRC32 integrity,
@@ -790,6 +795,9 @@ impl DocStoreV3 {
         std::fs::create_dir_all(path.join("meta"))?;
 
         let store = DocShardStore::new(path.to_path_buf(), SlotHexShard)?;
+        // Align the underlying ShardStore atomic with the wrapper default so the
+        // merge-thread compaction gate matches even before config wiring runs.
+        store.set_compact_threshold(DEFAULT_DOC_COMPACT_THRESHOLD);
         let (field_to_idx, idx_to_field) = Self::load_field_dict(path)?;
         let historical_defaults = Self::load_schema_history(path, &field_to_idx);
 
@@ -809,7 +817,7 @@ impl DocStoreV3 {
             field_defaults,
             schema_version,
             historical_defaults,
-            compact_threshold: 1000,
+            compact_threshold: DEFAULT_DOC_COMPACT_THRESHOLD,
             dirty_shards: Arc::new(DashSet::new()),
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -835,6 +843,7 @@ impl DocStoreV3 {
             .join(format!("bitdex-docstore-v3-{}-{}", std::process::id(), ts));
         std::fs::create_dir_all(tmp_dir.join("meta"))?;
         let store = DocShardStore::new(tmp_dir.clone(), SlotHexShard)?;
+        store.set_compact_threshold(DEFAULT_DOC_COMPACT_THRESHOLD);
         Ok(Self {
             store: Arc::new(store),
             root: tmp_dir,
@@ -843,7 +852,7 @@ impl DocStoreV3 {
             field_defaults: HashMap::new(),
             schema_version: 1,
             historical_defaults: HashMap::new(),
-            compact_threshold: 1000,
+            compact_threshold: DEFAULT_DOC_COMPACT_THRESHOLD,
             dirty_shards: Arc::new(DashSet::new()),
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1404,8 +1413,15 @@ impl DocStoreV3 {
     }
 
     /// Set compaction threshold (ops count before triggering compaction).
+    ///
+    /// Propagates to the underlying `ShardStore` atomic as well — the merge
+    /// thread's steady-state doc compactor gates on `store.needs_compaction`,
+    /// which reads that atomic (NOT this wrapper field). Without this
+    /// propagation the merge gate stays pinned at `DEFAULT_COMPACT_THRESHOLD`
+    /// (100k ops/shard) regardless of config, letting doc shards balloon.
     pub fn set_compact_threshold(&mut self, threshold: u32) {
         self.compact_threshold = threshold;
+        self.store.set_compact_threshold(threshold);
     }
 
     /// Prepare a ShardStoreBulkWriter for parallel docstore writes during bulk loading.
@@ -2985,6 +3001,53 @@ mod tests {
         assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0));
         let snap = store.read(&shard_key).unwrap().unwrap();
         assert_eq!(snap.docs[&100][0], (0, PackedValue::I(42)));
+    }
+
+    #[test]
+    fn test_set_compact_threshold_propagates_to_store() {
+        // Regression: the merge-thread doc compactor gates on the underlying
+        // ShardStore atomic (`needs_compaction`), NOT the DocStoreV3 wrapper
+        // field. set_compact_threshold must update both or the merge gate stays
+        // pinned at DEFAULT_COMPACT_THRESHOLD (100k) and doc shards balloon.
+        let mut ds = DocStoreV3::open_temp().unwrap();
+
+        // Default: both wrapper field and store atomic aligned at 1000.
+        assert_eq!(ds.shard_store_arc().compact_threshold(), 1000);
+
+        ds.set_compact_threshold(42);
+        assert_eq!(ds.shard_store_arc().compact_threshold(), 42,
+            "underlying ShardStore atomic must track wrapper threshold");
+
+        // 0 = disabled; store atomic reflects it so the merge gate can skip.
+        ds.set_compact_threshold(0);
+        assert_eq!(ds.shard_store_arc().compact_threshold(), 0);
+    }
+
+    #[test]
+    fn test_merge_gate_triggers_below_default_and_disables_at_zero() {
+        // The merge-thread doc compactor gates on `needs_compaction` (the atomic
+        // variant). Prove config actually changes that gate: 3 ops on a shard
+        // must trigger at threshold 2 (well below the old 100k default) and must
+        // NOT trigger when disabled (0).
+        let ds = DocStoreV3::open_temp().unwrap();
+        let store = ds.shard_store_arc();
+        let shard_key = SlotHexShard::slot_to_shard(7);
+        store.append_op(&shard_key, &DocOp::Create { slot: 7, fields: vec![(0, PackedValue::I(1))] }).unwrap();
+        store.append_op(&shard_key, &DocOp::Set { slot: 7, field: 0, value: PackedValue::I(2) }).unwrap();
+        store.append_op(&shard_key, &DocOp::Set { slot: 7, field: 0, value: PackedValue::I(3) }).unwrap();
+        assert_eq!(store.ops_count(&shard_key).unwrap(), Some(3));
+
+        store.set_compact_threshold(2);
+        assert!(store.needs_compaction(&shard_key).unwrap(),
+            "3 ops must trip the gate at threshold 2 (regression: gate was pinned at 100k)");
+
+        store.set_compact_threshold(0);
+        assert!(!store.needs_compaction(&shard_key).unwrap(),
+            "threshold 0 must disable the auto gate");
+
+        // Explicit should_compact(key, 0) stays 'compact if any ops' — the manual
+        // /compact endpoint relies on this to force a full compaction.
+        assert!(store.should_compact(&shard_key, 0).unwrap());
     }
 }
 
