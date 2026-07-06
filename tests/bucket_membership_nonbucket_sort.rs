@@ -98,6 +98,7 @@ fn build_engine(async_maintenance: bool) -> (ConcurrentEngine, u64) {
                     refresh_interval_secs: 86400,
                 },
             ],
+            full_rebuild_interval_secs: 0,
         }),
         cache: CacheConfig {
             async_maintenance,

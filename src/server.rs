@@ -1540,6 +1540,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/compact", post(handle_compact))
             .route("/api/indexes/{name}/time-buckets/rebuild", post(handle_rebuild_time_buckets))
+            .route("/api/indexes/{name}/time-buckets/audit", get(handle_time_bucket_audit))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/redump", post(handle_redump))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
@@ -1837,6 +1838,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
                 .metrics
                 .timebucket_anomalous_ts_total
                 .clone(),
+            time_bucket_full_rebuild_duration_seconds: state
+                .metrics
+                .time_bucket_full_rebuild_duration_seconds
+                .clone(),
+            time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
+            time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+            time_bucket_stale: state.metrics.time_bucket_stale.clone(),
+            time_bucket_missing: state.metrics.time_bucket_missing.clone(),
             index_name: def.name.clone(),
         });
         // Install the cache-worker cycle-time histogram so the worker can
@@ -2179,6 +2188,11 @@ async fn handle_create_index(
             .timebucket_dropped_capacity_exceeded_total
             .clone(),
         timebucket_anomalous_ts_total: state.metrics.timebucket_anomalous_ts_total.clone(),
+        time_bucket_full_rebuild_duration_seconds: state.metrics.time_bucket_full_rebuild_duration_seconds.clone(),
+        time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
+        time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
+        time_bucket_stale: state.metrics.time_bucket_stale.clone(),
+        time_bucket_missing: state.metrics.time_bucket_missing.clone(),
         index_name: definition.name.clone(),
     });
 
@@ -4435,6 +4449,37 @@ async fn handle_rebuild_time_buckets(
                 Json(serde_json::json!({"error": e.to_string()})),
             ).into_response()
         }
+    }
+}
+
+/// Read-only diagnostic: per-bucket current / fresh_in_window / stale / missing.
+/// Non-mutating; runs a full alive-scan (~minutes at scale) on a blocking task.
+async fn handle_time_bucket_audit(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    match tokio::task::spawn_blocking(move || engine.time_bucket_audit()).await {
+        Ok(Ok(audit)) => Json(serde_json::json!({"status": "ok", "audit": audit})).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("audit task failed: {e}")})),
+        ).into_response(),
     }
 }
 

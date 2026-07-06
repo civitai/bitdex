@@ -82,6 +82,7 @@ fn build_engine() -> (ConcurrentEngine, u64) {
                     refresh_interval_secs: 86400,
                 },
             ],
+            full_rebuild_interval_secs: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -192,6 +193,7 @@ fn engine_reopened_with_unloaded_sort(
                 duration_secs: 86400,
                 refresh_interval_secs: 86400,
             }],
+            full_rebuild_interval_secs: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -296,6 +298,7 @@ fn deferred_inserts_land_in_bucket_after_sort_field_reloads() {
                 duration_secs: 86400,
                 refresh_interval_secs: 86400,
             }],
+            full_rebuild_interval_secs: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -381,4 +384,55 @@ fn current_buggy_behavior_drop_count_matches_inserts_without_sort_field() {
          are silently dropped from all buckets. alive_count=10, 24h_bucket={}",
         count,
     );
+}
+
+/// The read-only time-bucket audit reports accurate per-bucket
+/// current / fresh_in_window / stale / missing, and correctly distinguishes
+/// window boundaries. Healthy live-maintained buckets must show 0 stale and
+/// 0 missing.
+#[test]
+fn audit_reports_accurate_membership_and_window_boundaries() {
+    let (engine, now) = build_engine();
+    // 10 slots 1h ago → in both the 24h and 7d windows.
+    for slot in 1..=10u32 {
+        engine
+            .put(
+                slot,
+                &make_doc(vec![
+                    ("sortAt", FieldValue::Single(Value::Integer((now - 3600) as i64))),
+                    ("category", FieldValue::Single(Value::Integer(1))),
+                ]),
+            )
+            .unwrap();
+    }
+    // 5 slots ~2.3d ago → in the 7d window only (outside 24h).
+    for slot in 11..=15u32 {
+        engine
+            .put(
+                slot,
+                &make_doc(vec![
+                    ("sortAt", FieldValue::Single(Value::Integer((now - 200_000) as i64))),
+                    ("category", FieldValue::Single(Value::Integer(1))),
+                ]),
+            )
+            .unwrap();
+    }
+    wait_for_alive(&engine, 15, 2000);
+
+    let audit = engine.time_bucket_audit().expect("audit should succeed");
+    let get = |bucket: &str, field: &str| -> u64 {
+        audit["buckets"][bucket][field].as_u64().unwrap_or(u64::MAX)
+    };
+
+    // 24h: only the 10 recent slots; healthy → no stale, no missing.
+    assert_eq!(get("24h", "current"), 10, "24h holds the 10 in-window slots");
+    assert_eq!(get("24h", "fresh_in_window"), 10, "10 alive slots are truly in the 24h window");
+    assert_eq!(get("24h", "stale"), 0, "healthy 24h bucket has no stale members");
+    assert_eq!(get("24h", "missing"), 0, "live path populated the 24h bucket fully");
+
+    // 7d: all 15 (200000s ≈ 2.3d < 7d) → validates window discrimination.
+    assert_eq!(get("7d", "current"), 15, "7d holds all 15 slots");
+    assert_eq!(get("7d", "fresh_in_window"), 15, "all 15 are within the 7d window");
+    assert_eq!(get("7d", "stale"), 0, "healthy 7d bucket has no stale members");
+    assert_eq!(get("7d", "missing"), 0, "live path populated the 7d bucket fully");
 }

@@ -305,6 +305,7 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
                     refresh_interval_secs: 1,
                 },
             ],
+            full_rebuild_interval_secs: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,

@@ -48,6 +48,7 @@
     "time_buckets": {
       "filter_field": "sortAtUnix",
       "sort_field": "sortAt",
+      "full_rebuild_interval_secs": 3600,
       "range_buckets": [
         { "name": "24h", "duration_secs": 86400, "refresh_interval_secs": 300 },
         { "name": "7d", "duration_secs": 604800, "refresh_interval_secs": 3600 },

@@ -725,6 +725,20 @@ pub struct TimeBucketFieldConfig {
     pub sort_field: String,
     /// Pre-computed range buckets.
     pub range_buckets: Vec<BucketConfig>,
+    /// Interval, in seconds, for a periodic FULL rebuild of every bucket from
+    /// the alive set + sort layer. Backstop for the incremental refresh, which
+    /// only removes slots whose *current* sort value lands in the narrow
+    /// `[old_cutoff, new_cutoff)` band each cycle: a slot whose sort value
+    /// jumps past that band (e.g. a deferred-publish sortAt regression with no
+    /// re-flush) is never caught and stays in the bucket until restart. This
+    /// full rebuild drops any such stale members. Analogous to the unified
+    /// cache's TTL fallback. `0` disables the fallback (not recommended).
+    /// Default: 3600 (1h).
+    #[serde(default = "default_full_rebuild_interval_secs")]
+    pub full_rebuild_interval_secs: u64,
+}
+fn default_full_rebuild_interval_secs() -> u64 {
+    3600
 }
 /// Configuration for a single sort field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
