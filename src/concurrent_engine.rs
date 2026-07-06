@@ -1347,11 +1347,18 @@ impl ConcurrentEngine {
                 // unload windows.
                 let mut pending_bucket_retries: HashSet<u32> = HashSet::new();
                 const PENDING_BUCKET_RETRY_CAP: usize = 1_000_000;
-                // Wall-clock (unix secs) of the last periodic full time-bucket
-                // rebuild. 0 = not yet baselined; the first flush cycle seeds it
-                // to "now" so boot's own rebuild counts as the baseline and the
-                // first fallback fires one interval later.
-                let mut last_full_bucket_rebuild: u64 = 0;
+                // Periodic full time-bucket rebuild fallback state. The scan is
+                // ~minutes at scale, so it runs on a BACKGROUND thread over an
+                // immutable published snapshot; results return via this channel
+                // and are applied on the flush thread (the sole writer of the
+                // TimeBucketManager). Scheduling uses a monotonic Instant (robust
+                // to wall-clock jumps); `None` = not yet baselined, seeded to
+                // "now" on the first cycle so boot's own rebuild is the baseline
+                // and the first fallback fires one interval later.
+                let (bucket_rebuild_tx, bucket_rebuild_rx) =
+                    std::sync::mpsc::channel::<(u64, Vec<(String, RoaringBitmap)>)>();
+                let mut last_full_bucket_rebuild: Option<std::time::Instant> = None;
+                let mut bucket_rebuild_in_flight = false;
                 let mut heartbeat_counter: u64 = 0;
                 let mut max_bitmap_count_seen: usize = 0;
                 let mut nonzero_iters: u64 = 0;
@@ -2954,10 +2961,16 @@ impl ConcurrentEngine {
                     // re-flush (e.g. a deferred-publish sortAt regression) is never
                     // caught and lingers in the bucket until restart. This rebuilds
                     // every bucket bitmap from truth on a fixed interval — the
-                    // time-bucket analog of the unified cache's TTL backstop. It
-                    // runs on the flush thread via an allocation-light single
-                    // alive-scan and a lock-free ArcSwap swap, so it never blocks
-                    // the query hot path.
+                    // time-bucket analog of the unified cache's TTL backstop.
+                    //
+                    // The scan is O(alive · sort_bits) — ~minutes at 107M — so it
+                    // must NOT run inline on the flush thread (it would stall write
+                    // draining and back-pressure ingest). Instead: compute on a
+                    // background thread over an immutable published snapshot, then
+                    // apply the result here on the flush thread via cheap
+                    // rebuild_bucket_from_bitmap swaps — keeping the flush thread the
+                    // sole writer of the manager. Only one rebuild is in flight at a
+                    // time.
                     //
                     // No explicit cache invalidation: a cache MISS reads the (now
                     // fresh) bucket bitmap directly, and cache HITS self-heal via
@@ -2972,45 +2985,82 @@ impl ConcurrentEngine {
                     // cached bucket queries. Cache MISSes are always correct.
                     if !is_loading && flush_bucket_full_rebuild_interval > 0 {
                         if let Some(ref tb_arc) = flush_time_buckets {
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            if last_full_bucket_rebuild == 0 {
-                                // Seed the baseline from boot's own rebuild; the
-                                // first fallback fires one full interval later.
-                                last_full_bucket_rebuild = now_secs;
-                            } else if now_secs.saturating_sub(last_full_bucket_rebuild)
-                                >= flush_bucket_full_rebuild_interval
-                            {
-                                let start = std::time::Instant::now();
-                                match Self::rebuild_time_buckets_streaming(&staging, tb_arc) {
-                                    Ok(scanned) => {
-                                        // Mark dirty so the merge thread persists the
-                                        // rebuilt bucket bitmaps.
-                                        flush_dirty_flag.store(true, Ordering::Release);
-                                        // Measure the interval from COMPLETION, not
-                                        // start: a multi-second scan must not schedule
-                                        // the next rebuild early or run back-to-back.
-                                        last_full_bucket_rebuild = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        eprintln!(
-                                            "Time bucket FULL rebuild fallback: scanned {} slots in {:?} (cache HITs self-heal via bucket_entry_ttl_secs)",
-                                            scanned, start.elapsed()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // Sort field not loaded yet (transient boot
-                                        // race). Retry in ~60s instead of waiting a
-                                        // full interval, without spinning every cycle.
-                                        eprintln!("Time bucket full rebuild fallback skipped: {e}");
-                                        let retry_in = 60.min(flush_bucket_full_rebuild_interval);
-                                        last_full_bucket_rebuild = now_secs
-                                            .saturating_sub(flush_bucket_full_rebuild_interval)
-                                            .saturating_add(retry_in);
-                                    }
+                            // 1) Apply any completed background rebuild (flush thread
+                            //    is the sole manager writer). Drain to the latest.
+                            let mut applied: Option<usize> = None;
+                            while let Ok((now_used, bitmaps)) = bucket_rebuild_rx.try_recv() {
+                                bucket_rebuild_in_flight = false;
+                                if bitmaps.is_empty() {
+                                    // Sort field wasn't loaded when the scan ran;
+                                    // backdate the baseline so we retry in ~60s
+                                    // instead of after a full interval.
+                                    let retry_in = 60.min(flush_bucket_full_rebuild_interval);
+                                    let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
+                                    last_full_bucket_rebuild = Some(
+                                        std::time::Instant::now()
+                                            .checked_sub(std::time::Duration::from_secs(back))
+                                            .unwrap_or_else(std::time::Instant::now),
+                                    );
+                                    continue;
+                                }
+                                last_full_bucket_rebuild = Some(std::time::Instant::now());
+                                let mut tb = (*tb_arc.load_full()).clone();
+                                for (name, bm) in &bitmaps {
+                                    tb.rebuild_bucket_from_bitmap(name, bm.clone(), now_used);
+                                }
+                                tb_arc.store(Arc::new(tb));
+                                flush_dirty_flag.store(true, Ordering::Release);
+                                applied = Some(bitmaps.len());
+                            }
+                            if let Some(n) = applied {
+                                eprintln!("Time bucket FULL rebuild fallback: applied {n} rebuilt buckets from background scan");
+                            }
+                            // 2) Kick off a new background rebuild when due and none
+                            //    is in flight. Scheduling uses a monotonic Instant.
+                            let due = match last_full_bucket_rebuild {
+                                None => false, // seed baseline below; don't fire at boot
+                                Some(t) => {
+                                    t.elapsed().as_secs() >= flush_bucket_full_rebuild_interval
+                                }
+                            };
+                            if last_full_bucket_rebuild.is_none() {
+                                // Boot's own rebuild is the baseline; first fallback
+                                // fires one interval later.
+                                last_full_bucket_rebuild = Some(std::time::Instant::now());
+                            } else if due && !bucket_rebuild_in_flight {
+                                // Clone the latest published snapshot (cheap Arc) and
+                                // the manager config, then compute off-thread.
+                                let snap = inner.load_full();
+                                let tb_snapshot = (*tb_arc.load_full()).clone();
+                                let tx = bucket_rebuild_tx.clone();
+                                bucket_rebuild_in_flight = true;
+                                let spawned = std::thread::Builder::new()
+                                    .name("bitdex-tbucket-rebuild".to_string())
+                                    .spawn(move || {
+                                        let start = std::time::Instant::now();
+                                        let result = Self::compute_time_bucket_bitmaps(&snap, &tb_snapshot);
+                                        let (now_used, bitmaps) = match result {
+                                            Some((now_used, bitmaps)) => {
+                                                eprintln!(
+                                                    "Time bucket FULL rebuild (bg): computed {} buckets in {:?}",
+                                                    bitmaps.len(), start.elapsed()
+                                                );
+                                                (now_used, bitmaps)
+                                            }
+                                            None => {
+                                                // Sort field not loaded — signal retry
+                                                // with an empty result.
+                                                eprintln!("Time bucket FULL rebuild (bg): sort field not loaded, will retry");
+                                                (0u64, Vec::new())
+                                            }
+                                        };
+                                        // Receiver lives for the flush thread's life;
+                                        // a send error only means shutdown — ignore.
+                                        let _ = tx.send((now_used, bitmaps));
+                                    });
+                                if let Err(e) = spawned {
+                                    eprintln!("Time bucket FULL rebuild: failed to spawn bg thread: {e}");
+                                    bucket_rebuild_in_flight = false;
                                 }
                             }
                         }
@@ -7774,34 +7824,32 @@ impl ConcurrentEngine {
         Ok((bucket_count, slot_count))
     }
 
-    /// Streaming variant of `rebuild_time_buckets_from_snapshot`: rebuilds every
-    /// bucket's membership from the alive set + sort layer in a single scan,
-    /// writing directly into fresh per-bucket bitmaps instead of materializing a
-    /// `Vec<(slot, value)>`. The intermediate Vec is ~O(alive)·12 bytes (~1.3 GB
-    /// at 107M) — a spike large enough to risk OOM on the flush thread, so the
-    /// periodic full-rebuild fallback uses this allocation-light path.
+    /// Compute fresh time-bucket membership bitmaps from a snapshot WITHOUT
+    /// mutating the manager — pure and side-effect free, so it can run OFF the
+    /// flush thread. A single alive-scan fills one fresh bitmap per bucket
+    /// (a slot qualifies when its sort value is in `[now - duration, now]`,
+    /// matching `rebuild_bucket`'s contract); no `Vec<(slot, value)>` is
+    /// materialized (~1.3 GB at 107M avoided).
     ///
-    /// Returns the number of alive slots scanned. Errors if the bucket sort
-    /// field is not currently loaded (caller should retry on a later cycle).
-    pub(crate) fn rebuild_time_buckets_streaming(
+    /// The scan is O(alive · sort_bits) — ~minutes at 107M — which is why the
+    /// periodic full-rebuild fallback runs this on a background thread over an
+    /// immutable published snapshot and hands the result back to the flush
+    /// thread for a cheap `rebuild_bucket_from_bitmap` swap (keeping the flush
+    /// thread the sole writer of the `TimeBucketManager`).
+    ///
+    /// Returns `(now_secs_used, [(bucket_name, bitmap)])`, or `None` if the
+    /// bucket sort field is not currently loaded (caller retries later).
+    pub(crate) fn compute_time_bucket_bitmaps(
         snap: &InnerEngine,
-        tb_arc: &Arc<ArcSwap<TimeBucketManager>>,
-    ) -> crate::error::Result<u64> {
-        let sort_field_name = tb_arc.load().sort_field_name().to_string();
-        let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
-            crate::error::BitdexError::Config(format!(
-                "time bucket sort field '{}' not loaded", sort_field_name
-            ))
-        })?;
+        tb: &TimeBucketManager,
+    ) -> Option<(u64, Vec<(String, RoaringBitmap)>)> {
+        let sort_field = snap.sorts.get_field(tb.sort_field_name())?;
         let alive = snap.slots.alive_bitmap();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut tb = (*tb_arc.load_full()).clone();
-        // (name, cutoff, fresh bitmap) — one empty bitmap per bucket, filled in
-        // a single alive scan. A slot qualifies for a bucket when its sort value
-        // is in [now - duration, now], matching `rebuild_bucket`'s contract.
+        // (name, cutoff, fresh bitmap) — one empty bitmap per bucket.
         let mut builds: Vec<(String, u64, RoaringBitmap)> = tb
             .bucket_names()
             .into_iter()
@@ -7821,11 +7869,10 @@ impl ConcurrentEngine {
                 }
             }
         }
-        for (name, _, bm) in builds {
-            tb.rebuild_bucket_from_bitmap(&name, bm, now_secs);
-        }
-        tb_arc.store(Arc::new(tb));
-        Ok(alive.len())
+        Some((
+            now_secs,
+            builds.into_iter().map(|(name, _, bm)| (name, bm)).collect(),
+        ))
     }
 
     /// Get per-bucket statistics (name, slot count, cutoff).
