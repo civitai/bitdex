@@ -3084,21 +3084,15 @@ impl ConcurrentEngine {
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
                                                 .as_secs();
-                                            // Split candidates into stale + missing slices
-                                            // (reconcile_apply zips them by bucket name).
-                                            let stale_slices: Vec<(String, RoaringBitmap)> = removals
+                                            let has_candidates = removals
                                                 .iter()
-                                                .filter(|(_, s, _)| !s.is_empty())
-                                                .map(|(n, s, _)| (n.clone(), s.clone()))
-                                                .collect();
-                                            let missing_slices: Vec<(String, RoaringBitmap)> = removals
-                                                .iter()
-                                                .filter(|(_, _, mi)| !mi.is_empty())
-                                                .map(|(n, _, mi)| (n.clone(), mi.clone()))
-                                                .collect();
-                                            if !stale_slices.is_empty() || !missing_slices.is_empty() {
+                                                .any(|(_, s, mi)| !s.is_empty() || !mi.is_empty());
+                                            if has_candidates {
                                                 // Single clone-mutate-store: the flush
                                                 // thread stays the sole tb_arc writer.
+                                                // `reconcile_apply` reads the worker's
+                                                // (name, stale, missing) tuples by ref —
+                                                // no split/clone of the candidate bitmaps.
                                                 let apply_start = std::time::Instant::now();
                                                 let alive = staging.slots.alive_bitmap();
                                                 let mut tb = (*tb_arc.load_full()).clone();
@@ -3106,8 +3100,7 @@ impl ConcurrentEngine {
                                                     sort_field,
                                                     alive,
                                                     now_secs,
-                                                    &stale_slices,
-                                                    &missing_slices,
+                                                    &removals,
                                                 );
                                                 let apply_elapsed = apply_start.elapsed();
                                                 let changed = !report.is_empty();
