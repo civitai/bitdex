@@ -3018,22 +3018,57 @@ impl ConcurrentEngine {
                                     }
                                     Some(removals) => {
                                         last_full_bucket_rebuild = Some(std::time::Instant::now());
-                                        if removals.iter().any(|(_, b)| !b.is_empty()) {
-                                            let mut tb = (*tb_arc.load_full()).clone();
-                                            for (name, stale) in &removals {
-                                                if stale.is_empty() {
-                                                    continue;
-                                                }
-                                                if let Some(b) = tb.get_bucket_mut(name) {
-                                                    // Subtract stale; keep the cutoff
-                                                    // (owned by the incremental path).
-                                                    let cutoff = b.last_cutoff();
-                                                    b.subtract_expired(stale, cutoff);
-                                                    pruned_total += stale.len();
+                                        // The worker's stale sets are CANDIDATES from a
+                                        // minutes-old snapshot. Re-validate each against
+                                        // the CURRENT sort values (staging) before
+                                        // pruning: a candidate whose sort value moved
+                                        // back into window since the scan must be kept.
+                                        // Candidate sets are small, so this per-slot
+                                        // reconstruct is cheap on the flush thread.
+                                        let sort_field_name =
+                                            tb_arc.load().sort_field_name().to_string();
+                                        if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                            let now_secs = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            // Phase A: confirm still-out-of-window slots.
+                                            let mut confirmed: Vec<(String, RoaringBitmap, u64)> = Vec::new();
+                                            {
+                                                let tb_read = tb_arc.load();
+                                                for (name, candidates) in &removals {
+                                                    if candidates.is_empty() {
+                                                        continue;
+                                                    }
+                                                    let Some(b) = tb_read.get_bucket(name) else {
+                                                        continue;
+                                                    };
+                                                    let cutoff = now_secs.saturating_sub(b.duration_secs);
+                                                    let last_cut = b.last_cutoff();
+                                                    let mut still = RoaringBitmap::new();
+                                                    for slot in candidates.iter() {
+                                                        let val = sort_field.reconstruct_value(slot) as u64;
+                                                        if val < cutoff || val > now_secs {
+                                                            still.insert(slot);
+                                                        }
+                                                    }
+                                                    if !still.is_empty() {
+                                                        confirmed.push((name.clone(), still, last_cut));
+                                                    }
                                                 }
                                             }
-                                            tb_arc.store(Arc::new(tb));
-                                            flush_dirty_flag.store(true, Ordering::Release);
+                                            // Phase B: prune the confirmed stale members.
+                                            if !confirmed.is_empty() {
+                                                let mut tb = (*tb_arc.load_full()).clone();
+                                                for (name, still, last_cut) in &confirmed {
+                                                    if let Some(b) = tb.get_bucket_mut(name) {
+                                                        b.subtract_expired(still, *last_cut);
+                                                        pruned_total += still.len();
+                                                    }
+                                                }
+                                                tb_arc.store(Arc::new(tb));
+                                                flush_dirty_flag.store(true, Ordering::Release);
+                                            }
                                         }
                                     }
                                 }
@@ -7879,9 +7914,11 @@ impl ConcurrentEngine {
     ///
     /// For each bucket, `stale = current_bucket_bitmap − fresh_in_window`, where
     /// `fresh_in_window` is recomputed by a single alive-scan (a slot qualifies
-    /// when its sort value is in `[now - duration, now]`). These are exactly the
-    /// members the incremental `subtract_expired` band missed — e.g. slots whose
-    /// sort value regressed past the trailing band without a re-flush.
+    /// when its sort value is in `[now - duration, now]`). These are CANDIDATE
+    /// stale members the incremental `subtract_expired` band missed — e.g. slots
+    /// whose sort value regressed past the trailing band without a re-flush. The
+    /// caller re-validates each candidate against current sort values before
+    /// pruning (the snapshot is minutes old by apply time).
     ///
     /// Returning a REMOVAL set (rather than a full replacement bitmap) is what
     /// makes the off-thread design safe: the scan is O(alive · sort_bits)
