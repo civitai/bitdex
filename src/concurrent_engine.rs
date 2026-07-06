@@ -7999,6 +7999,80 @@ impl ConcurrentEngine {
         }
     }
 
+    /// Read-only audit of time-bucket membership vs recomputed truth. For each
+    /// bucket: `current` (live bucket size), `fresh_in_window` (recomputed from
+    /// the sort layer over the alive set), `stale` (`current − fresh` — the
+    /// retention bug this fallback prunes) and `missing` (`fresh − current` —
+    /// slots that SHOULD be in-window but aren't, an add-path gap the prune does
+    /// NOT fix). Non-mutating: no bucket writes, no cache clear. Scans all alive
+    /// slots (~minutes at scale), so callers should run it off the request hot
+    /// path (spawn_blocking).
+    pub fn time_bucket_audit(&self) -> crate::error::Result<serde_json::Value> {
+        let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config("no time_buckets configured".into())
+        })?;
+        let sort_field_name = tb_arc.load().sort_field_name().to_string();
+        self.ensure_fields_loaded(&[], Some(&sort_field_name))?;
+        let snap = self.snapshot();
+        let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
+            crate::error::BitdexError::Config(format!(
+                "time bucket sort field '{}' not loaded", sort_field_name
+            ))
+        })?;
+        let alive = snap.slots.alive_bitmap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tb = tb_arc.load();
+        // (name, cutoff, current bucket bitmap, fresh in-window set)
+        let mut specs: Vec<(String, u64, RoaringBitmap, RoaringBitmap)> = tb
+            .bucket_names()
+            .into_iter()
+            .filter_map(|name| {
+                let b = tb.get_bucket(&name)?;
+                Some((
+                    name,
+                    now_secs.saturating_sub(b.duration_secs),
+                    RoaringBitmap::clone(b.bitmap()),
+                    RoaringBitmap::new(),
+                ))
+            })
+            .collect();
+        for slot in alive.iter() {
+            let val = sort_field.reconstruct_value(slot) as u64;
+            if val > now_secs {
+                continue;
+            }
+            for (_, cutoff, _, fresh) in specs.iter_mut() {
+                if val >= *cutoff {
+                    fresh.insert(slot);
+                }
+            }
+        }
+        let mut buckets = serde_json::Map::new();
+        for (name, _, current, fresh) in specs {
+            let mut stale = current.clone();
+            stale -= &fresh;
+            let mut missing = fresh.clone();
+            missing -= &current;
+            buckets.insert(
+                name,
+                serde_json::json!({
+                    "current": current.len(),
+                    "fresh_in_window": fresh.len(),
+                    "stale": stale.len(),
+                    "missing": missing.len(),
+                }),
+            );
+        }
+        Ok(serde_json::json!({
+            "now_unix": now_secs,
+            "sort_field": sort_field_name,
+            "buckets": serde_json::Value::Object(buckets),
+        }))
+    }
+
     /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
         self.unified_cache.clear();
