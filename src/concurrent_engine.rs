@@ -2686,6 +2686,105 @@ impl ConcurrentEngine {
                                     #[allow(unused_assignments)]
                                     { staging_dirty = true; }
                                 }
+                                // Time-bucket maintenance for mutations drained HERE.
+                                // `coalescer.flush()` applies sort mutations to staging.sorts
+                                // but does NOT touch the time buckets. So a sortAt change
+                                // drained by this force-publish (e.g. an existedAt update in
+                                // the channel when a queryOpSet fan-out barrier fires) lands
+                                // in the sort layer — queries see it — but the slot never
+                                // enters a bucket. That is the missing-adds SOURCE (confirmed
+                                // prod 2026-07-07: #285 counter=0 because it lives in the
+                                // normal-path tb-block, which this handler bypasses).
+                                //
+                                // Route the affected slots through the ONE tb-block instead of
+                                // duplicating it: removes are cleared now; alive-inserts and
+                                // sort-value changes are handed to `pending_bucket_retries`, so
+                                // the next normal flush cycle's tb-block buckets them with their
+                                // now-current reconstructed sortAt — preserving the defer-on-
+                                // unloaded-sort-field semantics (a slot re-deferred if the sort
+                                // field isn't fully loaded that cycle, never dropped).
+                                if extra > 0 {
+                                    if let Some(ref tb_arc) = flush_time_buckets {
+                                        let sfn = tb_arc.load().sort_field_name().to_string();
+                                        let removed: HashSet<u32> =
+                                            coalescer.alive_removes().iter().copied().collect();
+                                        let inserted: HashSet<u32> = coalescer
+                                            .alive_inserts()
+                                            .iter()
+                                            .copied()
+                                            .filter(|s| !removed.contains(s))
+                                            .collect();
+                                        // sortAt mutations that are neither fresh inserts nor
+                                        // removes — these have PRIOR bucket membership that must
+                                        // be cleared at defer time, because the pending_bucket_
+                                        // retries drain does a PLAIN insert_slot (its contract:
+                                        // old membership already cleared — mirrors the normal
+                                        // unloaded branch). Without this, a sortAt change that
+                                        // crosses a bucket boundary leaves the slot stale in its
+                                        // old bucket.
+                                        let sort_changed: Vec<u32> = coalescer
+                                            .mutated_sort_slots()
+                                            .get(sfn.as_str())
+                                            .map(|set| {
+                                                set.iter()
+                                                    .copied()
+                                                    .filter(|s| {
+                                                        !removed.contains(s) && !inserted.contains(s)
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        // One clone-mutate-store: clear removed slots AND the old
+                                        // membership of sort-changed slots (flush thread is the
+                                        // sole tb_arc writer, so no lost-update race).
+                                        if !removed.is_empty() || !sort_changed.is_empty() {
+                                            let mut tb = (*tb_arc.load_full()).clone();
+                                            for &slot in &removed {
+                                                tb.remove_slot(slot);
+                                                pending_bucket_retries.remove(&slot);
+                                            }
+                                            for &slot in &sort_changed {
+                                                tb.remove_slot(slot);
+                                            }
+                                            tb_arc.store(Arc::new(tb));
+                                        }
+                                        // Defer (re-)bucketing to the next cycle's tb-block:
+                                        // fresh inserts (no prior membership) + sort-changed
+                                        // (membership just cleared) → plain insert on drain.
+                                        let mut affected: HashSet<u32> = inserted;
+                                        affected.extend(sort_changed.iter().copied());
+                                        let space_left = PENDING_BUCKET_RETRY_CAP
+                                            .saturating_sub(pending_bucket_retries.len());
+                                        let mut enqueued = 0usize;
+                                        for &slot in affected.iter().take(space_left) {
+                                            if pending_bucket_retries.insert(slot) {
+                                                enqueued += 1;
+                                            }
+                                        }
+                                        // Overflow at the cap = the same permanent-loss risk the
+                                        // unloaded branch guards; account it identically instead
+                                        // of a silent drop. This batch is already consumed, so a
+                                        // dropped slot only re-buckets via the periodic backfill.
+                                        let dropped = affected.len().saturating_sub(enqueued);
+                                        if dropped > 0 {
+                                            tracing::error!(
+                                                "[time-bucket] ForcePublish retry queue at cap ({}); {} force-published sortAt slots not re-bucketed (rely on backfill) — sort field '{}'",
+                                                PENDING_BUCKET_RETRY_CAP,
+                                                dropped,
+                                                sfn,
+                                            );
+                                            #[cfg(feature = "server")]
+                                            {
+                                                let bg = flush_metrics_bridge.load();
+                                                if let Some(m) = (**bg).as_ref() {
+                                                    m.timebucket_dropped_capacity_exceeded_total
+                                                        .with_label_values(&[&m.index_name, &sfn])
+                                                        .inc_by(dropped as u64);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 let flush_elapsed = t_flush.elapsed();
                                 // Compact diffs before publishing — only needed if
                                 // mutations were drained. Lazy loads insert clean base
