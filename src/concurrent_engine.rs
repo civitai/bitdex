@@ -3093,6 +3093,11 @@ impl ConcurrentEngine {
                                                 // `reconcile_apply` reads the worker's
                                                 // (name, stale, missing) tuples by ref —
                                                 // no split/clone of the candidate bitmaps.
+                                                // Timing is only consumed by the
+                                                // server-gated observe below; gate the
+                                                // Instant too or it's an unused var under
+                                                // default features (-D warnings CI gate).
+                                                #[cfg(feature = "server")]
                                                 let apply_start = std::time::Instant::now();
                                                 let alive = staging.slots.alive_bitmap();
                                                 let mut tb = (*tb_arc.load_full()).clone();
@@ -3102,6 +3107,7 @@ impl ConcurrentEngine {
                                                     now_secs,
                                                     &removals,
                                                 );
+                                                #[cfg(feature = "server")]
                                                 let apply_elapsed = apply_start.elapsed();
                                                 let changed = !report.is_empty();
                                                 #[cfg(feature = "server")]
