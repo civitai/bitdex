@@ -227,6 +227,13 @@ triggers:
       # ahead. NULL for draft posts → explicit isPublished=false shadow.
       - target: publishedAt
         expression: '(SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = {postId})'
+      # availability + postedToId share the same structural gap as publishedAt:
+      # their only steady-state writer is the Post fan-out, which never fires
+      # for images added to an unchanged post. Inherit both at insert too.
+      - target: availability
+        expression: '(SELECT p."availability"::text FROM "Post" p WHERE p.id = {postId})'
+      - target: postedToId
+        expression: '(SELECT p."modelVersionId" FROM "Post" p WHERE p.id = {postId})'
 
   - table: TagsOnImageNew
     slot_field: imageId

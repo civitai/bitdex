@@ -398,6 +398,10 @@ pub struct ConcurrentEngine {
     /// Overdue-deferred sweep per-pass candidate cap. Hot-reloadable via
     /// PATCH /config. Seeded from `DeferredAliveConfig::sweep_limit`.
     deferred_sweep_limit: Arc<AtomicUsize>,
+    /// Slots with a submitted-but-not-yet-published deferred schedule.
+    /// Bridges the submit→publish visibility window for `is_slot_deferred`
+    /// (see `MutationSender::deferred_pending`).
+    deferred_pending: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1096,6 +1100,7 @@ impl ConcurrentEngine {
         // on crash (audit 2026-07-07 Mode A, loss window W2).
         let deferred_seq = coalescer.deferred_seq_handle();
         let deferred_durable_seq = Arc::new(AtomicU64::new(0));
+        let deferred_pending = coalescer.deferred_pending_handle();
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
             ms.load_all_cursors().unwrap_or_default()
@@ -1296,6 +1301,7 @@ impl ConcurrentEngine {
                 time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
             deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
+            deferred_pending: Arc::clone(&deferred_pending),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1401,6 +1407,7 @@ impl ConcurrentEngine {
             let flush_shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> = Arc::clone(&shared_string_maps);
             let flush_shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> = Arc::clone(&shared_dictionaries);
             let flush_deferred_durable = Arc::clone(&deferred_durable_seq);
+            let flush_deferred_pending = coalescer.deferred_pending_handle();
             thread::Builder::new()
                 .name("bitdex-flush".to_string())
                 .spawn(move || {
@@ -1496,6 +1503,14 @@ impl ConcurrentEngine {
                             .as_secs();
                         let activated = staging.slots.activate_due(now_unix);
                         if !activated.is_empty() {
+                            // Activated slots are leaving deferred state — drop any
+                            // stale pending-deferred bridge entries (normally already
+                            // pruned at publish; this covers publish-skipped cycles).
+                            if let Ok(mut p) = flush_deferred_pending.lock() {
+                                for slot in &activated {
+                                    p.remove(slot);
+                                }
+                            }
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -2391,6 +2406,17 @@ impl ConcurrentEngine {
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
+                            // Deferred schedules applied this batch are now visible in
+                            // the published snapshot's deferred map — prune them from
+                            // the pending-deferred bridge set (kept only for the
+                            // submit→publish window; see MutationSender docs).
+                            if coalescer.has_deferred_alive() {
+                                if let Ok(mut p) = flush_deferred_pending.lock() {
+                                    for slot in coalescer.deferred_scheduled_slots() {
+                                        p.remove(&slot);
+                                    }
+                                }
+                            }
                             // Async cache worker enqueue MUST happen after publish so
                             // the worker cannot dequeue + evaluate against a stale
                             // snapshot — `cache_worker` calls `inner.load()` to obtain
@@ -4526,6 +4552,7 @@ impl ConcurrentEngine {
             time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
             deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
+            deferred_pending: Arc::clone(&deferred_pending),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -8096,11 +8123,18 @@ impl ConcurrentEngine {
         snap.slots.is_alive(slot)
     }
     /// Whether a slot is scheduled for deferred activation (not yet alive).
-    /// Reads the published snapshot; a deferral applied to staging becomes
-    /// visible here on the next publish. Linear in deferred-map size — only
-    /// call on cold paths (the ops processor consults it solely for ops that
-    /// target non-alive slots).
+    /// Checks the pending-deferred bridge set first (deferrals submitted but
+    /// not yet visible in a published snapshot — without this, follow-up ops
+    /// arriving within the publish window would be skipped or auto-promoted
+    /// to a fresh alive insert), then the published snapshot's deferred map.
+    /// Linear in deferred-map size — only call on cold paths (the ops
+    /// processor consults it solely for ops that target non-alive slots).
     pub fn is_slot_deferred(&self, slot: u32) -> bool {
+        if let Ok(p) = self.deferred_pending.lock() {
+            if p.contains(&slot) {
+                return true;
+            }
+        }
         let snap = self.snapshot();
         snap.slots.is_deferred(slot)
     }

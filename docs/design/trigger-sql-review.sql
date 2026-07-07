@@ -48,11 +48,11 @@ CREATE TRIGGER trg_cleanup_bitdex_ops
 -- Part 2: Per-table triggers (generated from sync config YAML)
 -- -----------------------------------------------------------------------
 
--- [1/8] Table: Image → Trigger: bitdex_image_f93accb5
+-- [1/8] Table: Image → Trigger: bitdex_image_a6ea374e
 -- Sets alive: yes
 -- On delete: emit delete op
 
-CREATE OR REPLACE FUNCTION bitdex_image_ops_f93accb5() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_image_ops_a6ea374e() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -73,7 +73,9 @@ BEGIN
       jsonb_build_object('op', 'set', 'field', 'minor', 'value', to_jsonb((NEW."flags" >> 3) & 1 = 1)),
       jsonb_build_object('op', 'set', 'field', 'poi', 'value', to_jsonb((NEW."flags" >> 4) & 1 = 1)),
       jsonb_build_object('op', 'set', 'field', 'existedAt', 'value', to_jsonb(GREATEST(extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint))),
-      jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")))
+      jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId"))),
+      jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb((SELECT p."availability"::text FROM "Post" p WHERE p.id = NEW."postId"))),
+      jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId")))
     );
     INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."id", _ops);
     RETURN NEW;
@@ -172,6 +174,18 @@ BEGIN
         jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")))
       );
     END IF;
+    IF ((SELECT p."availability"::text FROM "Post" p WHERE p.id = OLD."postId")) IS DISTINCT FROM ((SELECT p."availability"::text FROM "Post" p WHERE p.id = NEW."postId")) THEN
+      _ops := _ops || jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'availability', 'value', to_jsonb((SELECT p."availability"::text FROM "Post" p WHERE p.id = OLD."postId"))),
+        jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb((SELECT p."availability"::text FROM "Post" p WHERE p.id = NEW."postId")))
+      );
+    END IF;
+    IF ((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = OLD."postId")) IS DISTINCT FROM ((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId")) THEN
+      _ops := _ops || jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = OLD."postId"))),
+        jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId")))
+      );
+    END IF;
     IF jsonb_array_length(_ops) > 0 THEN
       INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."id", _ops);
     END IF;
@@ -180,10 +194,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_image_f93accb5 ON "Image";
-CREATE TRIGGER bitdex_image_f93accb5 AFTER INSERT OR UPDATE OR DELETE ON "Image"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_f93accb5();
-ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_f93accb5;
+DROP TRIGGER IF EXISTS bitdex_image_a6ea374e ON "Image";
+CREATE TRIGGER bitdex_image_a6ea374e AFTER INSERT OR UPDATE OR DELETE ON "Image"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_a6ea374e();
+ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_a6ea374e;
 
 
 -- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_bcbef3c3
@@ -461,7 +475,7 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_a13d0fe3;
 -- -----------------------------------------------------------------------
 -- Tables created: BitdexOps, bitdex_cursors
 -- Triggers: 8
---   bitdex_image_f93accb5 on "Image"
+--   bitdex_image_a6ea374e on "Image"
 --   bitdex_tagsonimagenew_bcbef3c3 on "TagsOnImageNew"
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
