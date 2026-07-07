@@ -8290,10 +8290,12 @@ impl ConcurrentEngine {
     }
 
     /// Number of alive slots below which the parallel scan is not worth the
-    /// pool spin-up + `Vec<u32>` collect; falls back to the sequential walk.
+    /// pool spin-up; falls back to the sequential walk.
     const PARALLEL_SCAN_MIN: u64 = 100_000;
-    /// Per-task slot chunk for the parallel scan.
-    const PARALLEL_SCAN_CHUNK: usize = 65_536;
+    /// Range partitions per thread. Over-partitioning (vs one range per thread)
+    /// lets rayon work-steal so an uneven alive distribution doesn't leave one
+    /// core scanning a dense range while others idle.
+    const PARALLEL_SCAN_CHUNKS_PER_THREAD: u32 = 4;
 
     /// Resolve the configured `reconcile_scan_threads` (0 = auto) to a concrete
     /// thread count for the dedicated scan pool. Auto = host logical CPUs capped
@@ -8351,11 +8353,10 @@ impl ConcurrentEngine {
         if threads <= 1 || alive.len() < Self::PARALLEL_SCAN_MIN || n == 0 {
             return seq(&mut alive.iter());
         }
+        let Some(max_slot) = alive.max() else {
+            return vec![RoaringBitmap::new(); n];
+        };
 
-        // Materialize the alive set once so it can be chunked across the pool.
-        // ~4 bytes/slot transient (e.g. ~428MB at 107M) — acceptable off the
-        // request hot path; the scan is periodic (or an explicit audit call).
-        let slots: Vec<u32> = alive.iter().collect();
         let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("tb-scan-{i}"))
@@ -8364,15 +8365,34 @@ impl ConcurrentEngine {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("time-bucket scan: dedicated pool build failed ({e}); sequential");
-                return seq(&mut slots.into_iter());
+                return seq(&mut alive.iter());
             }
         };
+
+        // Partition the slot-id space into contiguous ranges and scan each in
+        // parallel. Each task derives its slice of the alive set by intersecting
+        // with a range mask (roaring AND — the result stays compressed), so no
+        // 428MB `Vec<u32>` materialization: peak extra memory is ~one compressed
+        // sub-bitmap per active task, not one u32 per alive slot. Ranges are
+        // disjoint and cover [0, max_slot], so the union of partial results is
+        // exactly the sequential result.
+        let num_chunks = (threads as u32).saturating_mul(Self::PARALLEL_SCAN_CHUNKS_PER_THREAD);
+        // Ceil-divide the inclusive span [0, max_slot] into num_chunks buckets.
+        let span = (max_slot as u64 + 1).div_ceil(num_chunks as u64);
         pool.install(|| {
-            slots
-                .par_chunks(Self::PARALLEL_SCAN_CHUNK)
-                .map(|chunk| {
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|k| {
+                    let lo = k as u64 * span;
+                    if lo > max_slot as u64 {
+                        return vec![RoaringBitmap::new(); n]; // empty tail partition
+                    }
+                    let hi_incl = ((k as u64 + 1) * span - 1).min(max_slot as u64);
+                    let mut mask = RoaringBitmap::new();
+                    mask.insert_range(lo as u32..=hi_incl as u32);
+                    let part = &mask & alive;
                     let mut fresh = vec![RoaringBitmap::new(); n];
-                    for &slot in chunk {
+                    for slot in part.iter() {
                         let val = sort_field.reconstruct_value(slot) as u64;
                         if val > now_secs {
                             continue;
@@ -10537,6 +10557,12 @@ mod tests {
         // A future-dated slot (val > now) to exercise the `val > now_secs` skip.
         sf.insert(250_000, now as u32 + 10_000);
         alive.insert(250_000);
+        // A sparse slot far past the dense block: forces a large id gap so the
+        // range partitions include several empty ones and `max_slot` sits well
+        // beyond the bulk — guards the range-split math (empty-tail handling,
+        // ceil-div span) against a non-contiguous alive set.
+        sf.insert(5_000_000, (now - 100) as u32);
+        alive.insert(5_000_000);
 
         let cutoffs = vec![now - 3_600, now - 86_400, now - 600_000];
         let seq = ConcurrentEngine::scan_fresh_in_window(&sf, &alive, &cutoffs, now, 1);
