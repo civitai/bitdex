@@ -1085,6 +1085,14 @@ struct ConfigPatch {
     /// recency lag; raise it if the scan duty starts costing query latency.
     #[serde(default)]
     time_bucket_full_rebuild_interval_secs: Option<u64>,
+    /// Hot-reload knob for the overdue-deferred sweep interval (secs). The
+    /// WAL reader checks it between batches; `0` disables the sweep. See
+    /// `DeferredAliveConfig::sweep_interval_secs`.
+    #[serde(default)]
+    deferred_sweep_interval_secs: Option<u64>,
+    /// Hot-reload knob for the overdue-deferred sweep per-pass candidate cap.
+    #[serde(default)]
+    deferred_sweep_limit: Option<usize>,
 }
 
 /// Patchable fields for a filter field.
@@ -1361,6 +1369,11 @@ impl BitdexServer {
                     let mut reader = crate::ops_wal::WalReader::new(&wal_dir, cursor);
                     eprintln!("WAL reader started (cursor={}:{}, dir={})", cursor.generation, cursor.offset, wal_dir.display());
 
+                    // Overdue-deferred sweep timer (audit 2026-07-07 fix A4).
+                    // Config-driven: deferred_alive.sweep_interval_secs (0 = off).
+                    // Baselined to "now" so the first sweep runs one full
+                    // interval after boot (lazy loads settle first).
+                    let mut last_deferred_sweep = std::time::Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Pause WAL apply while the engine is in bulk-load mode.
@@ -1501,6 +1514,59 @@ impl BitdexServer {
                                     .with_label_values(&["wal-reader"])
                                     .inc();
                                 std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+                        // Overdue-deferred sweep: runs between WAL batches on this
+                        // thread (query + doc reads must stay off the flush thread).
+                        // Heals slots whose deferred activation was lost — shadow
+                        // still false with the stored source timestamp in the past.
+                        {
+                            let engine = {
+                                let guard = wal_state.index.lock();
+                                guard.as_ref().map(|idx| Arc::clone(&idx.engine))
+                            };
+                            if let Some(engine) = engine {
+                                let sweep_cfg = engine
+                                    .config()
+                                    .deferred_alive
+                                    .as_ref()
+                                    .map(|_| (engine.deferred_sweep_interval(), engine.deferred_sweep_limit()));
+                                if let Some((interval, limit)) = sweep_cfg {
+                                    if interval > 0
+                                        && last_deferred_sweep.elapsed().as_secs() >= interval
+                                        && !engine.is_loading_mode()
+                                    {
+                                        last_deferred_sweep = std::time::Instant::now();
+                                        let meta = crate::ops_processor::FieldMeta::from_config(
+                                            engine.config(),
+                                        );
+                                        let mut sink = crate::ingester::CoalescerSink::new(
+                                            engine.mutation_sender(),
+                                        );
+                                        let mut dw = crate::ops_processor::DocWriter::new(
+                                            engine.docstore_arc(),
+                                        );
+                                        let t0 = std::time::Instant::now();
+                                        let (checked, healed) =
+                                            crate::ops_processor::overdue_deferred_sweep(
+                                                &mut sink, &meta, &engine, &mut dw, limit,
+                                            );
+                                        dw.flush();
+                                        if let Err(e) = crate::ingester::BitmapSink::flush(&mut sink) {
+                                            eprintln!("overdue-deferred sweep: sink flush failed: {e}");
+                                        }
+                                        if !healed.is_empty() {
+                                            for &slot in &healed {
+                                                engine.evict_doc_cache(slot);
+                                            }
+                                            eprintln!(
+                                                "overdue-deferred sweep: checked={checked} healed={} in {:?}",
+                                                healed.len(),
+                                                t0.elapsed()
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2610,6 +2676,14 @@ async fn handle_patch_config(
                 if let Some(v) = patch.time_bucket_full_rebuild_interval_secs {
                     idx.engine.set_time_bucket_full_rebuild_interval(v);
                     eprintln!("Config patch: time_bucket_full_rebuild_interval_secs set to {v}");
+                }
+                if let Some(v) = patch.deferred_sweep_interval_secs {
+                    idx.engine.set_deferred_sweep_interval(v);
+                    eprintln!("Config patch: deferred_sweep_interval_secs set to {v}");
+                }
+                if let Some(v) = patch.deferred_sweep_limit {
+                    idx.engine.set_deferred_sweep_limit(v);
+                    eprintln!("Config patch: deferred_sweep_limit set to {v}");
                 }
                 if let Some(v) = patch.max_registered_prefilters {
                     if v > crate::prefilter::MAX_REGISTERED_PREFILTERS {

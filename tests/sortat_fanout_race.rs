@@ -54,6 +54,8 @@ fn build_config_with_deferred() -> Config {
     c.deferred_alive = Some(DeferredAliveConfig {
         source_field: "publishedAt".into(),
         ms_to_seconds: false,
+    sweep_interval_secs: 0,
+    sweep_limit: 20_000,
     });
     c
 }

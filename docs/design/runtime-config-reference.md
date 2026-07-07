@@ -57,6 +57,13 @@ All cache settings are persisted to `indexes/{name}/config.yaml` on PATCH and su
 |---------|------|---------|-----------|-----------------|
 | `time_buckets.range_buckets.{name}.refresh_interval_secs` | u64 | varies | YES | How often to rebuild time range bucket |
 
+### Deferred-Alive Sweep (memory-only — seed via config file)
+
+| Setting | Type | Default | Persisted | What It Controls |
+|---------|------|---------|-----------|-----------------|
+| `deferred_sweep_interval_secs` | u64 | 0 (off) | NO (seed via `deferred_alive.sweep_interval_secs`) | Interval for the overdue-deferred sweep — heals slots whose deferred activation was lost (shadow false + stored source timestamp past). Runs on the WAL reader thread between batches. |
+| `deferred_sweep_limit` | usize | 20,000 | NO (seed via `deferred_alive.sweep_limit`) | Max shadow-false candidates examined per sweep pass (sorted most-feed-relevant first). |
+
 ---
 
 ## Startup-Only Settings

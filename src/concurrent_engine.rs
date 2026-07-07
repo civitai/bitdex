@@ -391,6 +391,13 @@ pub struct ConcurrentEngine {
     /// restart. `0` disables the fallback. Seeded from
     /// `TimeBucketFieldConfig::full_rebuild_interval_secs`.
     time_bucket_full_rebuild_interval: Arc<AtomicU64>,
+    /// Overdue-deferred sweep interval (secs); 0 disables. Read by the WAL
+    /// reader between batches; hot-reloadable via PATCH /config. Seeded from
+    /// `DeferredAliveConfig::sweep_interval_secs`.
+    deferred_sweep_interval: Arc<AtomicU64>,
+    /// Overdue-deferred sweep per-pass candidate cap. Hot-reloadable via
+    /// PATCH /config. Seeded from `DeferredAliveConfig::sweep_limit`.
+    deferred_sweep_limit: Arc<AtomicUsize>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1056,6 +1063,22 @@ impl ConcurrentEngine {
                 .map(|tb| tb.full_rebuild_interval_secs)
                 .unwrap_or(0),
         ));
+        // Overdue-deferred sweep knobs — hot-reloadable via PATCH /config.
+        // Read by the WAL reader between batches (server feature).
+        let deferred_sweep_interval = Arc::new(AtomicU64::new(
+            config
+                .deferred_alive
+                .as_ref()
+                .map(|da| da.sweep_interval_secs)
+                .unwrap_or(0),
+        ));
+        let deferred_sweep_limit = Arc::new(AtomicUsize::new(
+            config
+                .deferred_alive
+                .as_ref()
+                .map(|da| da.sweep_limit)
+                .unwrap_or(20_000),
+        ));
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
@@ -1271,6 +1294,8 @@ impl ConcurrentEngine {
                 doc_cache: doc_cache.clone(),
                 par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
                 time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
+            deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
+            deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -4499,6 +4524,8 @@ impl ConcurrentEngine {
             doc_cache: doc_cache.clone(),
             par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
             time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
+            deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
+            deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -4611,6 +4638,24 @@ impl ConcurrentEngine {
     /// Read the current time-bucket full-reconcile interval (for /config GET).
     pub fn time_bucket_full_rebuild_interval(&self) -> u64 {
         self.time_bucket_full_rebuild_interval.load(Ordering::Relaxed)
+    }
+    /// Set the overdue-deferred sweep interval (secs). Hot-reload via
+    /// PATCH /config; `0` disables the sweep. The WAL reader checks this
+    /// between batches, so a change takes effect within one interval.
+    pub fn set_deferred_sweep_interval(&self, secs: u64) {
+        self.deferred_sweep_interval.store(secs, Ordering::Relaxed);
+    }
+    /// Read the current overdue-deferred sweep interval.
+    pub fn deferred_sweep_interval(&self) -> u64 {
+        self.deferred_sweep_interval.load(Ordering::Relaxed)
+    }
+    /// Set the overdue-deferred sweep per-pass candidate cap (hot-reload).
+    pub fn set_deferred_sweep_limit(&self, limit: usize) {
+        self.deferred_sweep_limit.store(limit, Ordering::Relaxed);
+    }
+    /// Read the current overdue-deferred sweep per-pass candidate cap.
+    pub fn deferred_sweep_limit(&self) -> usize {
+        self.deferred_sweep_limit.load(Ordering::Relaxed)
     }
     /// Set the bitmap shard compaction threshold across all bitmap stores
     /// (alive / filter / sort). ops_count > threshold triggers a per-shard

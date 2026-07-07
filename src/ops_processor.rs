@@ -1560,6 +1560,123 @@ fn process_delete<S: BitmapSink>(
     sink.alive_remove(slot);
     Ok(())
 }
+/// Overdue-deferred sweep (audit 2026-07-07, fix A4): heal slots whose
+/// deferred activation was lost before the durability fixes, or slips through
+/// any residual gap. Entirely config-driven — every field name is derived
+/// from `deferred_alive.source_field` (exists_boolean shadow registry +
+/// computed-sort deps); nothing is hardcoded.
+///
+/// Queries alive slots whose shadow (e.g. `isPublished`) is still false,
+/// most-feed-relevant first (computed sort target descending, capped at
+/// `limit`), doc-checks that the stored source timestamp is past, and
+/// re-emits the activation state via `recompute_computed_sorts_for_slot`
+/// (which writes the source sort layer, flips the shadow, and recomputes the
+/// computed target). Idempotent: healthy drafts (no stored source value) and
+/// legitimately deferred slots (future value) are skipped by the doc check.
+///
+/// Runs on the WAL reader thread between batches — never on the flush thread.
+/// Returns (candidates_checked, healed_slots).
+pub fn overdue_deferred_sweep<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
+    engine: &ConcurrentEngine,
+    doc_writer: &mut DocWriter,
+    limit: usize,
+) -> (usize, Vec<u32>) {
+    let Some((source_field, ms_to_secs)) = meta.deferred_alive_field.clone() else {
+        return (0, Vec::new());
+    };
+    let Some(shadow) = meta
+        .exists_boolean_shadows
+        .get(source_field.as_str())
+        .and_then(|s| s.first())
+        .cloned()
+    else {
+        // No shadow configured — nothing observable to sweep against.
+        return (0, Vec::new());
+    };
+    // Feed-relevance ordering: the computed target derived from the source
+    // (e.g. sortAt from publishedAt); fall back to the source sort field.
+    let sort_field = meta
+        .computed_deps
+        .get(source_field.as_str())
+        .and_then(|deps| deps.first().map(|d| d.target.clone()))
+        .unwrap_or_else(|| source_field.clone());
+    let query = BitdexQuery {
+        filters: vec![crate::query::FilterClause::Eq(
+            shadow.to_string(),
+            crate::query::Value::Bool(false),
+        )],
+        sort: Some(crate::query::SortClause {
+            field: sort_field,
+            direction: crate::query::SortDirection::Desc,
+        }),
+        limit,
+        cursor: None,
+        offset: None,
+        skip_cache: true,
+    };
+    let ids = match engine.execute_query(&query) {
+        Ok(result) => result.ids,
+        Err(e) => {
+            tracing::warn!("overdue-deferred sweep: query failed: {e}");
+            return (0, Vec::new());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut checked = 0usize;
+    let mut healed: Vec<u32> = Vec::new();
+    for id in ids {
+        if id < 0 || id > u32::MAX as i64 {
+            continue;
+        }
+        let slot = id as u32;
+        checked += 1;
+        let Ok(Some(doc)) = engine.get_document(slot) else {
+            continue;
+        };
+        let Some(crate::mutation::FieldValue::Single(v)) = doc.fields.get(source_field.as_str())
+        else {
+            continue; // genuine draft — no stored source value
+        };
+        // Extract the raw integer BEFORE any u32 narrowing — a milliseconds
+        // source would wrap u32 first and corrupt the comparison.
+        let raw: i64 = match v {
+            crate::types::Value::Integer(i) => *i,
+            other => match crate::mutation::value_to_sort_u32(other) {
+                Some(u) => u as i64,
+                None => continue,
+            },
+        };
+        let secs = if ms_to_secs { raw / 1000 } else { raw };
+        if secs <= 0 || secs > now {
+            continue; // draft (0) or legitimately deferred (future)
+        }
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert(source_field.as_str(), secs as u32);
+        let empty: HashMap<&str, u32> = HashMap::new();
+        recompute_computed_sorts_for_slot(
+            sink,
+            meta,
+            Some(engine),
+            slot,
+            &sort_values,
+            &empty,
+            Some(doc_writer),
+        );
+        healed.push(slot);
+    }
+    if !healed.is_empty() {
+        tracing::info!(
+            "overdue-deferred sweep: healed {} of {checked} shadow-false candidates",
+            healed.len()
+        );
+    }
+    (checked, healed)
+}
 /// Resolve a queryOpSet: execute the query to get matching slots,
 /// then apply the nested ops to each matching slot via the BitmapSink.
 ///
@@ -2070,7 +2187,7 @@ mod tests {
                 computed: Some(ComputedField { op: ComputedOp::Greatest, source_fields: vec!["existedAt".into(), "publishedAt".into()] }),
             },
         ];
-        config.deferred_alive = Some(DeferredAliveConfig { source_field: "publishedAt".into(), ms_to_seconds: false });
+        config.deferred_alive = Some(DeferredAliveConfig { source_field: "publishedAt".into(), ms_to_seconds: false, sweep_interval_secs: 0, sweep_limit: 20_000, });
         config.data_schema.fields = vec![
             FieldMapping { source: "publishedAtUnix".into(), target: "publishedAt".into(), value_type: FieldValueType::Integer, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: true, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
             FieldMapping { source: "publishedAtUnix".into(), target: "isPublished".into(), value_type: FieldValueType::ExistsBoolean, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: false, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
@@ -2970,6 +3087,8 @@ mod tests {
         config.deferred_alive = Some(DeferredAliveConfig {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         });
         // Add publishedAt as a sort field so it appears in meta
         config.sort_fields.push(SortFieldConfig {
@@ -3083,6 +3202,72 @@ mod tests {
         );
     }
 
+    /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow
+    /// stuck false and a stored past publishedAt (the lost-activation state)
+    /// must be healed; genuine drafts (no stored publishedAt) and legitimately
+    /// deferred slots (future publishedAt) must be left alone.
+    #[test]
+    fn test_overdue_deferred_sweep_heals_stuck_slots_only() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let stuck: u32 = 101; // past publishedAt, shadow false → heal
+        let draft: u32 = 102; // no publishedAt → skip
+        let future: u32 = 103; // future publishedAt → skip
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        // All three inserted alive with an explicit shadow=false bit (as the
+        // dump path's enrichment writes it for unpublished images).
+        let mut batch: Vec<EntityOps> = [stuck, draft, future]
+            .iter()
+            .map(|&s| EntityOps {
+                entity_id: s as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 500) },
+                    Op::Set { field: "isPublished".into(), value: json!(false) },
+                ],
+            })
+            .collect();
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        // Forge the lost-activation docs (deferred branch writes the doc only).
+        dw.write_set(stuck, "publishedAt", &json!(now - 100));
+        dw.write_set(future, "publishedAt", &json!(now + 3_600));
+        sink.flush().unwrap();
+        dw.flush();
+        // Wait for the flush thread to publish alive + shadow-false bits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_alive(future) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
+
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let (checked, healed) =
+            overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw2, 1_000);
+        dw2.flush();
+        assert!(checked >= 3, "all three shadow-false slots are candidates, got {checked}");
+        assert_eq!(healed, vec![stuck], "exactly the stuck slot must be healed");
+        // Heal emits the shadow flip and the publishedAt sort layer for `stuck`.
+        assert!(
+            rec.filter_inserts.contains(&("isPublished".to_string(), 1u64, stuck)),
+            "sweep must flip isPublished=true for the stuck slot"
+        );
+        assert!(
+            rec.sort_sets.iter().any(|(f, _, s)| f == "publishedAt" && *s == stuck),
+            "sweep must write the publishedAt sort layer for the stuck slot"
+        );
+        assert!(
+            !rec.filter_inserts.iter().any(|(f, v, s)| f == "isPublished" && *v == 1 && (*s == draft || *s == future)),
+            "draft and future slots must not be flipped"
+        );
+    }
+
     /// Regression (audit 2026-07-07 §3.1): deleting a deferred slot must
     /// cancel the pending activation — otherwise activate_due resurrects the
     /// deleted slot by replaying its stored doc.
@@ -3128,6 +3313,8 @@ mod tests {
         config.deferred_alive = Some(DeferredAliveConfig {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         });
         config.sort_fields.push(SortFieldConfig {
             name: "publishedAt".into(),

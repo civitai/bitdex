@@ -66,6 +66,8 @@ fn test_deferred_alive_far_future_invisible() {
         deferred_alive: Some(DeferredAliveConfig {
             source_field: "publishedAt".to_string(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         }),
         ..Default::default()
     };
@@ -140,6 +142,8 @@ fn test_deferred_alive_past_timestamp_visible() {
         deferred_alive: Some(DeferredAliveConfig {
             source_field: "publishedAt".to_string(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         }),
         ..Default::default()
     };
@@ -193,6 +197,8 @@ fn test_mixed_deferred_and_immediate() {
         deferred_alive: Some(DeferredAliveConfig {
             source_field: "publishedAt".to_string(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         }),
         ..Default::default()
     };
