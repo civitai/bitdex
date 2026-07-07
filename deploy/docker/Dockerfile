@@ -19,9 +19,15 @@ COPY . .
 # Remove dev-only scratch workspace member (not included via .dockerignore)
 RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 
-# Build for the native CPU architecture of the build host.
-# Override at build time: docker build --build-arg TARGET_CPU=znver5 ...
-ARG TARGET_CPU=native
+# Portable ISA floor shared by ALL prod nodes. Do NOT use `native`:
+# CI builds on GitHub-hosted ubuntu-latest, a heterogeneous CPU fleet — some
+# runners have AVX-512. With target-cpu=native, rustc auto-vectorizes ordinary
+# loops into AVX-512 (zmm) instructions non-deterministically per build host.
+# The Zen3 node talos-48r-b3a (Ryzen 9 5950X) lacks AVX-512 -> SIGILL (exit 132)
+# on boot. x86-64-v3 = AVX2/BMI2/FMA, no AVX-512 — supported by both the Zen3
+# (5950X) and Zen5 (EPYC) nodes. Override for a single-arch build:
+# docker build --build-arg TARGET_CPU=znver5 ...
+ARG TARGET_CPU=x86-64-v3
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
 # heap-prof swaps the bitdex-server global allocator from the system
