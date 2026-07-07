@@ -1260,7 +1260,7 @@ impl ConcurrentEngine {
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
                 par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
-            time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
+                time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
