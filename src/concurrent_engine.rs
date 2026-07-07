@@ -3610,16 +3610,23 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Persist slot counter + deferred alive (critical metadata)
+                        // Persist slot counter (critical metadata).
+                        //
+                        // The deferred-alive map is deliberately NOT written here.
+                        // The flush thread is the single writer (on every applied
+                        // deferral and after every activation drain) and writes from
+                        // *staging* — the authoritative state. This thread only sees
+                        // the *published* snapshot, which lags staging within a flush
+                        // cycle; writing it here raced the flush thread's write and
+                        // could regress the on-disk map to a pre-deferral state,
+                        // permanently orphaning scheduled slots when a crash landed
+                        // before the next flush-side persist (audit 2026-07-07,
+                        // Mode A loss window W1 — see
+                        // docs/_in/sync-writepath-audit-findings-2026-07-07.md).
                         {
                             let snap = merge_inner.load();
                             if let Err(e) = ms_.write_slot_counter(snap.slots.slot_counter()) {
                                 eprintln!("merge thread: slot_counter write failed: {e}");
-                            }
-                            if snap.slots.deferred_count() > 0 {
-                                if let Err(e) = ms_.write_deferred_alive(snap.slots.deferred_map()) {
-                                    eprintln!("merge thread: deferred_alive write failed: {e}");
-                                }
                             }
                         }
                         // Persist time bucket bitmaps + cutoffs (MetaStore)
