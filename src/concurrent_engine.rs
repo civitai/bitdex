@@ -1063,6 +1063,16 @@ impl ConcurrentEngine {
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
+        // Deferred-alive durability watermark. `deferred_seq` (owned by the
+        // coalescer, bumped by every MutationSender on DeferredAlive submit)
+        // counts scheduling ops ever sent; this counter tracks how many of
+        // them have been applied to staging AND persisted to MetaStore by the
+        // flush thread. The merge thread refuses to persist WAL cursors while
+        // the two diverge — otherwise a durable cursor could advance past a
+        // deferral that exists nowhere on disk, permanently orphaning the slot
+        // on crash (audit 2026-07-07 Mode A, loss window W2).
+        let deferred_seq = coalescer.deferred_seq_handle();
+        let deferred_durable_seq = Arc::new(AtomicU64::new(0));
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
             ms.load_all_cursors().unwrap_or_default()
@@ -1365,6 +1375,7 @@ impl ConcurrentEngine {
             // thread always sees the latest without holding a lock.
             let flush_shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> = Arc::clone(&shared_string_maps);
             let flush_shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> = Arc::clone(&shared_dictionaries);
+            let flush_deferred_durable = Arc::clone(&deferred_durable_seq);
             thread::Builder::new()
                 .name("bitdex-flush".to_string())
                 .spawn(move || {
@@ -1375,6 +1386,11 @@ impl ConcurrentEngine {
                 let mut was_loading = false;
                 let mut staging_dirty = false; // tracks unpublished mutations from loading mode
                 let mut flush_cycle: u64 = 0;
+                // Running count of DeferredAlive ops applied to staging. Paired
+                // with `flush_deferred_durable` (advanced only after a successful
+                // deferred-map persist) — see `deferred_durable_seq` docs at the
+                // declaration site.
+                let mut deferred_applied_total: u64 = 0;
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
@@ -1640,13 +1656,13 @@ impl ConcurrentEngine {
                         for sgk in coalescer.sort_clear_entries().keys() {
                             stale_fields.push(sgk.field.to_string());
                         }
-                        // Persist deferred map when new deferred entries are added.
+                        // Count DeferredAlive ops applied to staging this batch.
+                        // The map persist itself happens later in the cycle (with
+                        // the activation persist, after opslog append) and advances
+                        // `flush_deferred_durable` — until then the merge thread
+                        // holds back WAL-cursor persistence for these entries.
                         if coalescer.has_deferred_alive() {
-                            if let Some(ref ms) = flush_meta_store {
-                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
-                                }
-                            }
+                            deferred_applied_total += coalescer.deferred_alive_count() as u64;
                         }
                         // Update positive existence sets with any new distinct values.
                         // This is cheap (HashSet insert + Arc swap) and must be visible
@@ -2593,10 +2609,34 @@ impl ConcurrentEngine {
                     // activate_due for the same slot, which is idempotent on bitmap
                     // state (set-already-set = no-op) and produces a duplicate opslog
                     // entry at worst.
-                    if deferred_persist_needed {
-                        if let Some(ref ms) = flush_meta_store {
-                            if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                eprintln!("Warning: failed to persist deferred alive map: {e}");
+                    //
+                    // The same write also covers NEW deferrals applied earlier in
+                    // this cycle: `deferred_applied_total` counts DeferredAlive ops
+                    // applied to staging, and `flush_deferred_durable` advances only
+                    // after a successful persist. A failed write retries here every
+                    // cycle (watermark stays behind), and the merge thread refuses
+                    // to persist WAL cursors until the watermark catches up — so a
+                    // crash can no longer strand a scheduled slot with the cursor
+                    // already past its op (audit 2026-07-07 Mode A, window W2).
+                    {
+                        let durable_now = flush_deferred_durable.load(Ordering::SeqCst);
+                        if deferred_persist_needed || deferred_applied_total > durable_now {
+                            if let Some(ref ms) = flush_meta_store {
+                                match ms.write_deferred_alive(staging.slots.deferred_map()) {
+                                    Ok(()) => flush_deferred_durable
+                                        .store(deferred_applied_total, Ordering::SeqCst),
+                                    Err(e) => eprintln!(
+                                        "Warning: failed to persist deferred alive map \
+                                         (will retry next cycle; WAL cursor persistence \
+                                         is held back until it succeeds): {e}"
+                                    ),
+                                }
+                            } else {
+                                // No MetaStore configured (ephemeral/test engine):
+                                // nothing to persist and no durable cursor either —
+                                // advance the watermark so nothing wedges.
+                                flush_deferred_durable
+                                    .store(deferred_applied_total, Ordering::SeqCst);
                             }
                         }
                     }
@@ -3537,6 +3577,8 @@ impl ConcurrentEngine {
             let merge_prefilter_registry = Arc::clone(&prefilter_registry);
             let merge_warm_registry = Arc::clone(&warm_registry);
             let merge_tombstones_cleaned = Arc::clone(&boundstore_tombstones_cleaned);
+            let merge_deferred_seq = Arc::clone(&deferred_seq);
+            let merge_deferred_durable = Arc::clone(&deferred_durable_seq);
 
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
@@ -3551,6 +3593,18 @@ impl ConcurrentEngine {
                     // Only written to disk if data was actually persisted this cycle
                     // AND no write failures occurred.
                     let cursor_snapshot_for_persist = merge_cursors.lock().clone();
+                    // Deferred-durability gate: capture the DeferredAlive
+                    // submission count no earlier than the cursor snapshot. Any
+                    // deferral the snapshot cursor covers bumped `deferred_seq`
+                    // before its `set_cursor`, so its tick is <= this value.
+                    // Cursors are persisted below only when the flush thread's
+                    // durable watermark has caught up — i.e. every deferral the
+                    // cursor could cover is applied to staging AND persisted to
+                    // MetaStore. Otherwise a crash could leave the durable cursor
+                    // past a deferral op that exists nowhere on disk (audit
+                    // 2026-07-07 Mode A, loss window W2).
+                    let deferred_seq_at_snapshot =
+                        merge_deferred_seq.load(Ordering::SeqCst);
                     let mut did_persist_data = false;
                     let mut persist_had_errors = false;
                     // ── Per-shard compaction ────────────────────────────────
@@ -3920,7 +3974,22 @@ impl ConcurrentEngine {
                             bitmaps_synced = true;
                         }
                     }
-                    if did_persist_data && !persist_had_errors && bitmaps_synced {
+                    let deferred_durable_caught_up = merge_deferred_durable
+                        .load(Ordering::SeqCst)
+                        >= deferred_seq_at_snapshot;
+                    if !deferred_durable_caught_up {
+                        eprintln!(
+                            "merge thread: holding WAL cursor persist — deferred map \
+                             not yet durable (seq {} > durable {})",
+                            deferred_seq_at_snapshot,
+                            merge_deferred_durable.load(Ordering::SeqCst),
+                        );
+                    }
+                    if did_persist_data
+                        && !persist_had_errors
+                        && bitmaps_synced
+                        && deferred_durable_caught_up
+                    {
                         if let Some(ref ms_) = merge_meta_store {
                             for (name, value) in &cursor_snapshot_for_persist {
                                 if let Err(e) = ms_.write_cursor(name, value) {

@@ -458,15 +458,32 @@ impl Default for WriteBatch {
 #[derive(Clone)]
 pub struct MutationSender {
     tx: Sender<MutationOp>,
+    /// Monotone count of `DeferredAlive` ops ever submitted through any clone
+    /// of this sender. Bumped BEFORE the channel send so that a producer that
+    /// subsequently advances a durable cursor (e.g. the WAL reader) is
+    /// guaranteed `deferred_seq >= its op's tick` at cursor-advance time. The
+    /// flush thread pairs this with `deferred_durable_seq` (advanced only
+    /// after the deferred map is fsynced to MetaStore); the merge thread
+    /// refuses to persist WAL cursors while the two diverge. See audit
+    /// 2026-07-07 Mode A, loss window W2.
+    deferred_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 impl MutationSender {
     /// Submit a single mutation. Blocks if the channel is full (backpressure).
     pub fn send(&self, op: MutationOp) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
+        if matches!(op, MutationOp::DeferredAlive { .. }) {
+            self.deferred_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.tx.send(op)
     }
     /// Approximate number of pending ops in the channel (for metrics).
     pub fn pending_count(&self) -> usize {
         self.tx.len()
+    }
+    /// Handle to the deferred-alive submission counter (see field docs).
+    pub fn deferred_seq_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.deferred_seq)
     }
     /// Submit multiple mutations. Blocks per-op if the channel is full.
     pub fn send_batch(
@@ -474,7 +491,7 @@ impl MutationSender {
         ops: Vec<MutationOp>,
     ) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
         for op in ops {
-            self.tx.send(op)?;
+            self.send(op)?;
         }
         Ok(())
     }
@@ -485,17 +502,24 @@ pub struct WriteCoalescer {
     rx: Receiver<MutationOp>,
     tx: Sender<MutationOp>,
     batch: WriteBatch,
+    /// Shared with every `MutationSender` handed out (see `MutationSender::deferred_seq`).
+    deferred_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 impl WriteCoalescer {
     /// Create a new WriteCoalescer with a bounded channel of the given capacity.
     /// Returns the coalescer and a cloneable sender handle.
     pub fn new(capacity: usize) -> (Self, MutationSender) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
-        let sender = MutationSender { tx: tx.clone() };
+        let deferred_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sender = MutationSender {
+            tx: tx.clone(),
+            deferred_seq: Arc::clone(&deferred_seq),
+        };
         let coalescer = Self {
             rx,
             tx,
             batch: WriteBatch::new(),
+            deferred_seq,
         };
         (coalescer, sender)
     }
@@ -503,7 +527,12 @@ impl WriteCoalescer {
     pub fn sender(&self) -> MutationSender {
         MutationSender {
             tx: self.tx.clone(),
+            deferred_seq: Arc::clone(&self.deferred_seq),
         }
+    }
+    /// Handle to the shared deferred-alive submission counter.
+    pub fn deferred_seq_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.deferred_seq)
     }
     /// Approximate number of pending ops in the channel.
     pub fn pending_count(&self) -> usize {
@@ -587,6 +616,10 @@ impl WriteCoalescer {
     pub fn has_deferred_alive(&self) -> bool {
         self.batch.has_deferred_alive()
     }
+    /// Number of deferred alive entries in the prepared batch.
+    pub fn deferred_alive_count(&self) -> usize {
+        self.batch.deferred_alive.len()
+    }
     /// Returns the set of filter field names mutated in the prepared batch.
     /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
     pub fn mutated_filter_fields(&self) -> HashSet<&str> {
@@ -636,6 +669,48 @@ mod tests {
     use crate::config::{FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
     use std::thread;
+
+    /// The deferred-alive submission counter must tick for every DeferredAlive
+    /// submitted through any sender clone (and only for those), BEFORE the op
+    /// is observable in the channel — it is the merge thread's evidence that a
+    /// WAL cursor may cover an as-yet-unpersisted deferral (audit 2026-07-07
+    /// Mode A, window W2).
+    #[test]
+    fn test_deferred_seq_ticks_on_deferred_alive_submissions_only() {
+        let (coalescer, sender) = WriteCoalescer::new(64);
+        let seq = coalescer.deferred_seq_handle();
+        let sender2 = coalescer.sender();
+        assert_eq!(seq.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        sender
+            .send(MutationOp::AliveInsert { slots: vec![1] })
+            .unwrap();
+        assert_eq!(
+            seq.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-deferred ops must not tick the counter"
+        );
+
+        sender
+            .send(MutationOp::DeferredAlive { slot: 7, activate_at: 12345 })
+            .unwrap();
+        sender2
+            .send(MutationOp::DeferredAlive { slot: 8, activate_at: 12346 })
+            .unwrap();
+        assert_eq!(
+            seq.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every sender clone shares one counter"
+        );
+
+        sender
+            .send_batch(vec![
+                MutationOp::DeferredAlive { slot: 9, activate_at: 12347 },
+                MutationOp::AliveRemove { slots: vec![1] },
+            ])
+            .unwrap();
+        assert_eq!(seq.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
     fn setup_filter_index() -> FilterIndex {
         let mut filters = FilterIndex::new();
         filters.add_field(FilterFieldConfig {
