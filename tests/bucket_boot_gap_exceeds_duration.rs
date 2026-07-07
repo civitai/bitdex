@@ -117,6 +117,7 @@ fn make_config(bitmap_path: std::path::PathBuf) -> Config {
                 refresh_interval_secs: 1,
             }],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,

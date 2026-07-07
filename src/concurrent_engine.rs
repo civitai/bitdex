@@ -386,6 +386,11 @@ pub struct ConcurrentEngine {
     /// pool overhead from real work during perf experiments. Hot-reloadable
     /// via PATCH /api/indexes/{name}/config { "par_iter_min_threshold": N }.
     par_iter_min_threshold: Arc<AtomicUsize>,
+    /// Interval (secs) for the periodic FULL time-bucket reconcile scan. Read
+    /// each flush cycle so it can be retuned live via PATCH /config without a
+    /// restart. `0` disables the fallback. Seeded from
+    /// `TimeBucketFieldConfig::full_rebuild_interval_secs`.
+    time_bucket_full_rebuild_interval: Arc<AtomicU64>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1042,6 +1047,15 @@ impl ConcurrentEngine {
         // Wire the threshold into the docstore so its append_*_batch paths
         // observe the same hot-reload as the engine flush thread.
         docstore.set_par_iter_min_threshold_handle(Arc::clone(&par_iter_min_threshold));
+        // Time-bucket full reconcile interval — hot-reloadable via PATCH /config.
+        // Seeded from config; read each flush cycle by the periodic tb-block.
+        let time_bucket_full_rebuild_interval = Arc::new(AtomicU64::new(
+            config
+                .time_buckets
+                .as_ref()
+                .map(|tb| tb.full_rebuild_interval_secs)
+                .unwrap_or(0),
+        ));
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
@@ -1246,6 +1260,7 @@ impl ConcurrentEngine {
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
                 par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
+            time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1287,11 +1302,17 @@ impl ConcurrentEngine {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             // Interval (secs) for the periodic FULL time-bucket rebuild fallback.
-            // 0 disables it. See `TimeBucketFieldConfig::full_rebuild_interval_secs`.
-            let flush_bucket_full_rebuild_interval: u64 = config
+            // 0 disables it. Hot-reloadable via PATCH /config: the flush loop
+            // loads this handle each cycle instead of capturing a fixed value.
+            // See `TimeBucketFieldConfig::full_rebuild_interval_secs`.
+            let flush_tb_rebuild_interval_handle =
+                Arc::clone(&time_bucket_full_rebuild_interval);
+            // Threads for the dedicated reconcile-scan pool (0 = auto). Read once
+            // at flush-thread start; see `TimeBucketFieldConfig::reconcile_scan_threads`.
+            let flush_reconcile_scan_threads: usize = config
                 .time_buckets
                 .as_ref()
-                .map(|tb| tb.full_rebuild_interval_secs)
+                .map(|tb| tb.reconcile_scan_threads)
                 .unwrap_or(0);
             // Base dir for per-bucket-name diff logs (`bucket_diffs__{name}.log`) —
             // see `pending_bucket_diffs`'s doc comment for why these are per-bucket.
@@ -3206,6 +3227,10 @@ impl ConcurrentEngine {
                     // regressed-past-band slot either — so a non-zero
                     // bucket_entry_ttl_secs is required for the fallback to correct
                     // cached bucket queries. Cache MISSes are always correct.
+                    // Load the (hot-reloadable) interval once per cycle so a
+                    // PATCH /config retune takes effect without a restart.
+                    let flush_bucket_full_rebuild_interval =
+                        flush_tb_rebuild_interval_handle.load(Ordering::Relaxed);
                     if !is_loading && flush_bucket_full_rebuild_interval > 0 {
                         if let Some(ref tb_arc) = flush_time_buckets {
                             // 1) Apply any completed background rebuild. The flush
@@ -3390,12 +3415,13 @@ impl ConcurrentEngine {
                                 let snap = inner.load_full();
                                 let tb_snapshot = (*tb_arc.load_full()).clone();
                                 let tx = bucket_rebuild_tx.clone();
+                                let scan_threads = flush_reconcile_scan_threads;
                                 let spawned = std::thread::Builder::new()
                                     .name("bitdex-tbucket-rebuild".to_string())
                                     .spawn(move || {
                                         let start = std::time::Instant::now();
                                         let payload = Self::compute_time_bucket_reconcile(
-                                            &snap, &tb_snapshot,
+                                            &snap, &tb_snapshot, scan_threads,
                                         )
                                         .map(|r| {
                                             let elapsed = start.elapsed();
@@ -4396,6 +4422,7 @@ impl ConcurrentEngine {
             bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
             par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
+            time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -4497,6 +4524,17 @@ impl ConcurrentEngine {
     /// Read the current par_iter min-task threshold (for /config GET).
     pub fn par_iter_min_threshold(&self) -> usize {
         self.par_iter_min_threshold.load(Ordering::Relaxed)
+    }
+    /// Set the periodic time-bucket full-reconcile interval (secs). Hot-reload
+    /// via PATCH /config; `0` disables the fallback. The flush thread reads this
+    /// each cycle, so a change takes effect within one interval — no restart.
+    pub fn set_time_bucket_full_rebuild_interval(&self, secs: u64) {
+        self.time_bucket_full_rebuild_interval
+            .store(secs, Ordering::Relaxed);
+    }
+    /// Read the current time-bucket full-reconcile interval (for /config GET).
+    pub fn time_bucket_full_rebuild_interval(&self) -> u64 {
+        self.time_bucket_full_rebuild_interval.load(Ordering::Relaxed)
     }
     /// Set the bitmap shard compaction threshold across all bitmap stores
     /// (alive / filter / sort). ops_count > threshold triggers a per-shard
@@ -8212,6 +8250,7 @@ impl ConcurrentEngine {
     pub(crate) fn compute_time_bucket_reconcile(
         snap: &InnerEngine,
         tb: &TimeBucketManager,
+        scan_threads: usize,
     ) -> Option<Vec<(String, RoaringBitmap, RoaringBitmap)>> {
         let sort_field = snap.sorts.get_field(tb.sort_field_name())?;
         let alive = snap.slots.alive_bitmap();
@@ -8219,8 +8258,8 @@ impl ConcurrentEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // (name, cutoff, fresh in-window set, snapshot of current bucket bitmap).
-        let mut specs: Vec<(String, u64, RoaringBitmap, RoaringBitmap)> = tb
+        // (name, cutoff, snapshot of current bucket bitmap). Parallel to `fresh`.
+        let specs: Vec<(String, u64, RoaringBitmap)> = tb
             .bucket_names()
             .into_iter()
             .filter_map(|name| {
@@ -8228,26 +8267,18 @@ impl ConcurrentEngine {
                 Some((
                     name,
                     now_secs.saturating_sub(b.duration_secs),
-                    RoaringBitmap::new(),
                     RoaringBitmap::clone(b.bitmap()),
                 ))
             })
             .collect();
-        for slot in alive.iter() {
-            let val = sort_field.reconstruct_value(slot) as u64;
-            if val > now_secs {
-                continue;
-            }
-            for (_, cutoff, fresh, _) in specs.iter_mut() {
-                if val >= *cutoff {
-                    fresh.insert(slot);
-                }
-            }
-        }
+        let cutoffs: Vec<u64> = specs.iter().map(|(_, c, _)| *c).collect();
+        let fresh_sets =
+            Self::scan_fresh_in_window(sort_field, alive, &cutoffs, now_secs, scan_threads);
         Some(
             specs
                 .into_iter()
-                .map(|(name, _, fresh, old)| {
+                .zip(fresh_sets)
+                .map(|((name, _, old), fresh)| {
                     let mut stale = old.clone();
                     stale -= &fresh; // in bucket, no longer in window
                     let mut missing = fresh;
@@ -8256,6 +8287,114 @@ impl ConcurrentEngine {
                 })
                 .collect(),
         )
+    }
+
+    /// Number of alive slots below which the parallel scan is not worth the
+    /// pool spin-up + `Vec<u32>` collect; falls back to the sequential walk.
+    const PARALLEL_SCAN_MIN: u64 = 100_000;
+    /// Per-task slot chunk for the parallel scan.
+    const PARALLEL_SCAN_CHUNK: usize = 65_536;
+
+    /// Resolve the configured `reconcile_scan_threads` (0 = auto) to a concrete
+    /// thread count for the dedicated scan pool. Auto = host logical CPUs capped
+    /// at 16 so the burst scan can outrun the global `RAYON_NUM_THREADS` cap
+    /// without spawning an unbounded pool on very large hosts.
+    fn resolve_scan_threads(scan_threads: usize) -> usize {
+        if scan_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(16)
+        } else {
+            scan_threads
+        }
+    }
+
+    /// Shared scan for both the reconcile fallback and the `/time-buckets/audit`
+    /// endpoint: for each `cutoffs[i]`, compute the set of alive slots whose
+    /// reconstructed sort value lands in `[cutoffs[i], now_secs]` (the
+    /// "fresh in-window" set). Returns one bitmap per cutoff, in order.
+    ///
+    /// The walk is embarrassingly parallel — each slot's `reconstruct_value` is
+    /// an independent read of the immutable sort layers on the snapshot. When
+    /// the resolved thread count is > 1 and the alive set is large enough, it
+    /// runs on a DEDICATED rayon pool (independent of the global
+    /// `RAYON_NUM_THREADS` pool prod pins to 4). A thread count of 1, a small
+    /// alive set, or a pool-build failure all take the sequential path.
+    fn scan_fresh_in_window(
+        sort_field: &crate::sort::SortField,
+        alive: &RoaringBitmap,
+        cutoffs: &[u64],
+        now_secs: u64,
+        scan_threads: usize,
+    ) -> Vec<RoaringBitmap> {
+        use rayon::prelude::*;
+
+        let n = cutoffs.len();
+        let seq = |slots_iter: &mut dyn Iterator<Item = u32>| -> Vec<RoaringBitmap> {
+            let mut fresh = vec![RoaringBitmap::new(); n];
+            for slot in slots_iter {
+                let val = sort_field.reconstruct_value(slot) as u64;
+                if val > now_secs {
+                    continue;
+                }
+                for (i, &cutoff) in cutoffs.iter().enumerate() {
+                    if val >= cutoff {
+                        fresh[i].insert(slot);
+                    }
+                }
+            }
+            fresh
+        };
+
+        let threads = Self::resolve_scan_threads(scan_threads);
+        if threads <= 1 || alive.len() < Self::PARALLEL_SCAN_MIN || n == 0 {
+            return seq(&mut alive.iter());
+        }
+
+        // Materialize the alive set once so it can be chunked across the pool.
+        // ~4 bytes/slot transient (e.g. ~428MB at 107M) — acceptable off the
+        // request hot path; the scan is periodic (or an explicit audit call).
+        let slots: Vec<u32> = alive.iter().collect();
+        let pool = match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("tb-scan-{i}"))
+            .build()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("time-bucket scan: dedicated pool build failed ({e}); sequential");
+                return seq(&mut slots.into_iter());
+            }
+        };
+        pool.install(|| {
+            slots
+                .par_chunks(Self::PARALLEL_SCAN_CHUNK)
+                .map(|chunk| {
+                    let mut fresh = vec![RoaringBitmap::new(); n];
+                    for &slot in chunk {
+                        let val = sort_field.reconstruct_value(slot) as u64;
+                        if val > now_secs {
+                            continue;
+                        }
+                        for (i, &cutoff) in cutoffs.iter().enumerate() {
+                            if val >= cutoff {
+                                fresh[i].insert(slot);
+                            }
+                        }
+                    }
+                    fresh
+                })
+                .reduce(
+                    || vec![RoaringBitmap::new(); n],
+                    |mut acc, part| {
+                        for (a, p) in acc.iter_mut().zip(part) {
+                            *a |= p;
+                        }
+                        acc
+                    },
+                )
+        })
     }
 
     /// Get per-bucket statistics (name, slot count, cutoff).
@@ -8294,7 +8433,11 @@ impl ConcurrentEngine {
     /// paired with its reconstructed sort value. Used to diagnose the live
     /// insert-path gap: are missing slots future-dated-at-insert, recently
     /// activated, or edited? `sample == 0` preserves the counts-only response.
-    pub fn time_bucket_audit(&self, sample: usize) -> crate::error::Result<serde_json::Value> {
+    pub fn time_bucket_audit(
+        &self,
+        sample: usize,
+        order: &str,
+    ) -> crate::error::Result<serde_json::Value> {
         let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config("no time_buckets configured".into())
         })?;
@@ -8311,9 +8454,16 @@ impl ConcurrentEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let scan_threads = self
+            .config
+            .time_buckets
+            .as_ref()
+            .map(|tb| tb.reconcile_scan_threads)
+            .unwrap_or(0);
         let tb = tb_arc.load();
-        // (name, cutoff, current bucket bitmap, fresh in-window set)
-        let mut specs: Vec<(String, u64, RoaringBitmap, RoaringBitmap)> = tb
+        // (name, cutoff, current bucket bitmap). `fresh` computed by the shared
+        // parallel scan below (same walk the periodic reconcile uses).
+        let specs: Vec<(String, u64, RoaringBitmap)> = tb
             .bucket_names()
             .into_iter()
             .filter_map(|name| {
@@ -8322,34 +8472,53 @@ impl ConcurrentEngine {
                     name,
                     now_secs.saturating_sub(b.duration_secs),
                     RoaringBitmap::clone(b.bitmap()),
-                    RoaringBitmap::new(),
                 ))
             })
             .collect();
-        for slot in alive.iter() {
-            let val = sort_field.reconstruct_value(slot) as u64;
-            if val > now_secs {
-                continue;
-            }
-            for (_, cutoff, _, fresh) in specs.iter_mut() {
-                if val >= *cutoff {
-                    fresh.insert(slot);
-                }
-            }
-        }
+        let cutoffs: Vec<u64> = specs.iter().map(|(_, c, _)| *c).collect();
+        let fresh_sets =
+            Self::scan_fresh_in_window(sort_field, alive, &cutoffs, now_secs, scan_threads);
+
         let mut buckets = serde_json::Map::new();
-        for (name, _, current, fresh) in specs {
+        for ((name, _, current), fresh) in specs.into_iter().zip(fresh_sets) {
             let mut stale = current.clone();
             stale -= &fresh;
             let mut missing = fresh.clone();
             missing -= &current;
-            // Emit [{slot, sortAt}, ...] for the first `sample` slots (bitmap
-            // iteration is ascending slot-id). sortAt lets the caller test the
-            // future-dated-at-insert hypothesis without a second reconstruct pass.
+            // Emit [{slot, sortAt}, ...] for up to `sample` slots. Default
+            // `lowest_id` (ascending) surfaces oldest/pre-boot slots first;
+            // `highest_id` surfaces the most RECENT slots (high ids = recent
+            // inserts = post-boot) to isolate the ongoing residual source from
+            // boot residue; `random` strides the set for an unbiased spread.
+            // sortAt is included so the caller can test future-dated-at-insert
+            // without a second reconstruct pass.
             let sample_of = |bm: &RoaringBitmap| -> serde_json::Value {
+                let picked: Vec<u32> = match order {
+                    "highest_id" => {
+                        let mut v: Vec<u32> = bm.iter().rev().take(sample).collect();
+                        v.reverse();
+                        v
+                    }
+                    "random" => {
+                        let total = bm.len();
+                        if total == 0 || sample == 0 {
+                            Vec::new()
+                        } else {
+                            // Deterministic stride (no RNG dependency): evenly
+                            // spaced ranks across the set.
+                            let take = (sample as u64).min(total);
+                            let step = (total / take).max(1);
+                            (0..take)
+                                .filter_map(|k| bm.select((k * step) as u32))
+                                .collect()
+                        }
+                    }
+                    // "lowest_id" and any unrecognized value.
+                    _ => bm.iter().take(sample).collect(),
+                };
                 serde_json::Value::Array(
-                    bm.iter()
-                        .take(sample)
+                    picked
+                        .into_iter()
                         .map(|slot| {
                             serde_json::json!({
                                 "slot": slot,
@@ -8375,6 +8544,7 @@ impl ConcurrentEngine {
         Ok(serde_json::json!({
             "now_unix": now_secs,
             "sort_field": sort_field_name,
+            "sample_order": order,
             "buckets": serde_json::Value::Object(buckets),
         }))
     }
@@ -10330,6 +10500,57 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use std::thread;
+
+    /// The parallel reconcile scan (dedicated pool) must produce byte-for-byte
+    /// the same per-bucket `fresh` sets as the sequential walk. This is the
+    /// correctness proof for parallelizing the ~79s full-alive scan: the two
+    /// paths only differ in HOW slots are visited, never in the membership
+    /// result. Uses > `PARALLEL_SCAN_MIN` slots so the parallel branch actually
+    /// engages, and cutoffs that split the value spread across in/out of window.
+    #[test]
+    fn scan_fresh_in_window_parallel_matches_sequential() {
+        use crate::sort::SortField;
+
+        let sf_config = SortFieldConfig {
+            name: "sortAt".to_string(),
+            source_type: "uint32".to_string(),
+            encoding: "linear".to_string(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        };
+        let mut sf = SortField::new(sf_config);
+        let now: u64 = 1_000_000;
+        let mut alive = RoaringBitmap::new();
+        // 250k slots (> PARALLEL_SCAN_MIN) with values spread over a 90k-second
+        // band ending at `now`, plus a scattered tail of much older values so
+        // some slots fall outside the narrower windows.
+        for slot in 0..250_000u32 {
+            let val = if slot % 7 == 0 {
+                (now as u32).saturating_sub(500_000 + (slot % 100_000)) // way old
+            } else {
+                (now as u32).saturating_sub((slot % 90_000) as u32) // in recent band
+            };
+            sf.insert(slot, val);
+            alive.insert(slot);
+        }
+        // A future-dated slot (val > now) to exercise the `val > now_secs` skip.
+        sf.insert(250_000, now as u32 + 10_000);
+        alive.insert(250_000);
+
+        let cutoffs = vec![now - 3_600, now - 86_400, now - 600_000];
+        let seq = ConcurrentEngine::scan_fresh_in_window(&sf, &alive, &cutoffs, now, 1);
+        let par = ConcurrentEngine::scan_fresh_in_window(&sf, &alive, &cutoffs, now, 8);
+
+        assert_eq!(seq.len(), cutoffs.len());
+        assert_eq!(seq, par, "parallel scan must match sequential scan exactly");
+        // Windows nest (3600 ⊂ 86400 ⊂ 600000): each larger window is a superset.
+        assert!(seq[0].len() <= seq[1].len());
+        assert!(seq[1].len() <= seq[2].len());
+        assert!(!seq[0].is_empty(), "recent window must have members");
+        // The future-dated slot is excluded from every window.
+        assert!(!seq[2].contains(250_000), "future-dated slot must be skipped");
+    }
     fn test_config() -> Config {
         Config {
             filter_fields: vec![
@@ -12119,6 +12340,7 @@ mod tests {
                     },
                 ],
                 full_rebuild_interval_secs: 3600,
+                reconcile_scan_threads: 0,
             }),
             max_page_size: 100,
             flush_interval_us: 50,

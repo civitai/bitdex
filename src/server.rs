@@ -1078,6 +1078,13 @@ struct ConfigPatch {
     /// (manual POST and auto-promotion) are gated. Range: 0-32.
     #[serde(default)]
     max_registered_prefilters: Option<usize>,
+    /// Hot-reload knob for the periodic time-bucket full-reconcile interval
+    /// (secs). The flush thread reads it each cycle, so a change takes effect
+    /// within one interval — no restart. `0` disables the reconcile fallback.
+    /// Lower it (e.g. 120) once the parallel scan makes the walk cheap, to cut
+    /// recency lag; raise it if the scan duty starts costing query latency.
+    #[serde(default)]
+    time_bucket_full_rebuild_interval_secs: Option<u64>,
 }
 
 /// Patchable fields for a filter field.
@@ -2599,6 +2606,10 @@ async fn handle_patch_config(
                 if let Some(v) = patch.bitmap_compact_threshold {
                     idx.engine.set_bitmap_compact_threshold(v);
                     eprintln!("Config patch: bitmap_compact_threshold set to {v}");
+                }
+                if let Some(v) = patch.time_bucket_full_rebuild_interval_secs {
+                    idx.engine.set_time_bucket_full_rebuild_interval(v);
+                    eprintln!("Config patch: time_bucket_full_rebuild_interval_secs set to {v}");
                 }
                 if let Some(v) = patch.max_registered_prefilters {
                     if v > crate::prefilter::MAX_REGISTERED_PREFILTERS {
@@ -4474,6 +4485,14 @@ struct TimeBucketAuditParams {
     /// Number of missing/stale slot IDs to sample per bucket (0 = counts only).
     #[serde(default)]
     sample: usize,
+    /// Sample ordering: `lowest_id` (default, oldest/pre-boot first),
+    /// `highest_id` (most recent slots — isolates the ongoing residual source
+    /// from boot residue), or `random` (even stride across the set).
+    #[serde(default = "default_audit_order")]
+    order: String,
+}
+fn default_audit_order() -> String {
+    "lowest_id".to_string()
 }
 
 async fn handle_time_bucket_audit(
@@ -4495,7 +4514,8 @@ async fn handle_time_bucket_audit(
     };
     // Cap the sample so a stray ?sample=10000000 can't build a huge JSON payload.
     let sample = params.sample.min(1000);
-    match tokio::task::spawn_blocking(move || engine.time_bucket_audit(sample)).await {
+    let order = params.order;
+    match tokio::task::spawn_blocking(move || engine.time_bucket_audit(sample, &order)).await {
         Ok(Ok(audit)) => Json(serde_json::json!({"status": "ok", "audit": audit})).into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,

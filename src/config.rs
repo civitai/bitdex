@@ -736,9 +736,23 @@ pub struct TimeBucketFieldConfig {
     /// Default: 3600 (1h).
     #[serde(default = "default_full_rebuild_interval_secs")]
     pub full_rebuild_interval_secs: u64,
+    /// Number of threads for the periodic reconcile SCAN (the alive-set +
+    /// sort-layer walk that computes fresh-in-window membership). The scan is
+    /// embarrassingly parallel — each slot's `reconstruct_value` is independent —
+    /// so it runs on a DEDICATED rayon pool (not the global `RAYON_NUM_THREADS`
+    /// pool, which prod pins to 4 for the steady CPU floor). At 107M slots the
+    /// single-threaded scan is ~79s; parallelizing brings it to single-digit
+    /// seconds so `full_rebuild_interval_secs` can be cranked without the scan
+    /// dominating a core. `0` = auto (host logical CPUs, capped at 16).
+    /// `1` forces the sequential path.
+    #[serde(default = "default_reconcile_scan_threads")]
+    pub reconcile_scan_threads: usize,
 }
 fn default_full_rebuild_interval_secs() -> u64 {
     3600
+}
+fn default_reconcile_scan_threads() -> usize {
+    0
 }
 /// Configuration for a single sort field.
 #[derive(Debug, Clone, Serialize, Deserialize)]

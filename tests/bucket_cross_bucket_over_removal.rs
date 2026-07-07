@@ -102,6 +102,7 @@ fn build_engine() -> (ConcurrentEngine, u64) {
                 },
             ],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         cache: CacheConfig {
             bucket_entry_ttl_secs: 0, // TTL band-aid OFF — prove the live path works

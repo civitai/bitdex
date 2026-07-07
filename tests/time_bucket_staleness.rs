@@ -83,6 +83,7 @@ fn build_engine() -> (ConcurrentEngine, u64) {
                 },
             ],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -194,6 +195,7 @@ fn engine_reopened_with_unloaded_sort(
                 refresh_interval_secs: 86400,
             }],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -299,6 +301,7 @@ fn deferred_inserts_land_in_bucket_after_sort_field_reloads() {
                 refresh_interval_secs: 86400,
             }],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         max_page_size: 1000,
         flush_interval_us: 50,
@@ -419,7 +422,7 @@ fn audit_reports_accurate_membership_and_window_boundaries() {
     }
     wait_for_alive(&engine, 15, 2000);
 
-    let audit = engine.time_bucket_audit(0).expect("audit should succeed");
+    let audit = engine.time_bucket_audit(0, "lowest_id").expect("audit should succeed");
     let get = |bucket: &str, field: &str| -> u64 {
         audit["buckets"][bucket][field].as_u64().unwrap_or(u64::MAX)
     };
@@ -457,14 +460,14 @@ fn audit_sample_param_emits_slot_sortat_arrays() {
     wait_for_alive(&engine, 10, 2000);
 
     // sample=0 → counts only, no sample keys.
-    let plain = engine.time_bucket_audit(0).expect("audit ok");
+    let plain = engine.time_bucket_audit(0, "lowest_id").expect("audit ok");
     assert!(
         plain["buckets"]["24h"].get("missing_sample").is_none(),
         "sample=0 must not emit missing_sample"
     );
 
     // sample>0 → sample keys present as arrays; healthy bucket → empty.
-    let sampled = engine.time_bucket_audit(5).expect("audit ok");
+    let sampled = engine.time_bucket_audit(5, "lowest_id").expect("audit ok");
     let b24 = &sampled["buckets"]["24h"];
     let missing_sample = b24["missing_sample"]
         .as_array()
@@ -474,4 +477,39 @@ fn audit_sample_param_emits_slot_sortat_arrays() {
         .expect("stale_sample is an array");
     assert!(missing_sample.is_empty(), "healthy 24h bucket has no missing slots");
     assert!(stale_sample.is_empty(), "healthy 24h bucket has no stale slots");
+}
+
+/// The `order` param controls sample ordering and is echoed as `sample_order`.
+/// Every variant (including on empty sample sets, which exercise `select`/`rev`
+/// on empty bitmaps) must succeed without panic. `lowest_id` is the default.
+#[test]
+fn audit_order_param_variants_do_not_panic_and_echo_order() {
+    let (engine, now) = build_engine();
+    for slot in 1..=10u32 {
+        engine
+            .put(
+                slot,
+                &make_doc(vec![
+                    ("sortAt", FieldValue::Single(Value::Integer((now - 3600) as i64))),
+                    ("category", FieldValue::Single(Value::Integer(1))),
+                ]),
+            )
+            .unwrap();
+    }
+    wait_for_alive(&engine, 10, 2000);
+
+    for order in ["lowest_id", "highest_id", "random", "bogus_defaults_to_lowest"] {
+        let audit = engine
+            .time_bucket_audit(5, order)
+            .unwrap_or_else(|e| panic!("audit ok for order={order}: {e}"));
+        assert_eq!(
+            audit["sample_order"].as_str(),
+            Some(order),
+            "sample_order must echo the requested order"
+        );
+        // Healthy engine → empty missing/stale samples for every order.
+        let b24 = &audit["buckets"]["24h"];
+        assert!(b24["missing_sample"].as_array().expect("array").is_empty());
+        assert!(b24["stale_sample"].as_array().expect("array").is_empty());
+    }
 }
