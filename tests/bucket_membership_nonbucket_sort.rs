@@ -99,6 +99,7 @@ fn build_engine(async_maintenance: bool) -> (ConcurrentEngine, u64) {
                 },
             ],
             full_rebuild_interval_secs: 0,
+            reconcile_scan_threads: 0,
         }),
         cache: CacheConfig {
             async_maintenance,
