@@ -1281,6 +1281,8 @@ impl ConcurrentEngine {
             // OFF by default (zero hot-path cost); enable for a diagnostic window
             // via BITDEX_TB_SOURCE_DIAG=1. When on, the tb-block verifies each
             // sortAt-mutated slot landed in its window bucket (aggregated).
+            // server-gated: the only consumer is the server-feature metric block.
+            #[cfg(feature = "server")]
             let tb_source_diag: bool = std::env::var("BITDEX_TB_SOURCE_DIAG")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
