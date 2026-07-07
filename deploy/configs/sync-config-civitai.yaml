@@ -216,6 +216,17 @@ triggers:
       # Without this, new images get sortAt=0 because existedAt is never emitted.
       - target: existedAt
         expression: "GREATEST(extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)"
+      # Inherit the post's publish state at insert (audit 2026-07-07, Mode B).
+      # Images added to an ALREADY-published post previously never received
+      # publishedAt: the Post fan-out only fires on Post row changes, and the
+      # publish-time fan-out ran before the image existed — so the doc stayed
+      # publishedAt=0 / isPublished=false forever. The subquery resolves the
+      # parent Post's publishedAt at insert (and re-resolves if the image moves
+      # posts); the isPublished shadow and sortAt recompute follow server-side
+      # from the Set, including the deferred branch when the post is scheduled
+      # ahead. NULL for draft posts → explicit isPublished=false shadow.
+      - target: publishedAt
+        expression: '(SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = {postId})'
 
   - table: TagsOnImageNew
     slot_field: imageId

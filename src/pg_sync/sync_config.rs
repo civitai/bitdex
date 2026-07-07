@@ -626,8 +626,10 @@ triggers: []
     #[test]
     fn generate_trigger_sql_review_file() {
         // Generates docs/design/trigger-sql-review.sql for safety review
-        // before deploying triggers to production PG.
-        let yaml_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/design/sync-config-civitai.yaml");
+        // before deploying triggers to production PG. Reads the DEPLOY config
+        // (the one production actually uses) — the old docs/design copy no
+        // longer exists, which made this generator silently no-op.
+        let yaml_path = concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/configs/sync-config-civitai.yaml");
         let yaml = match std::fs::read_to_string(yaml_path) {
             Ok(y) => y,
             Err(_) => return, // Skip if file not found (CI)
@@ -638,7 +640,7 @@ triggers: []
 
         sql.push_str("-- =======================================================================\n");
         sql.push_str("-- BitDex Sync V2 — Trigger SQL Review\n");
-        sql.push_str("-- Generated from: docs/design/sync-config-civitai.yaml\n");
+        sql.push_str("-- Generated from: deploy/configs/sync-config-civitai.yaml\n");
         sql.push_str("-- Run `cargo test generate_trigger_sql_review_file` to regenerate\n");
         sql.push_str("-- \n");
         sql.push_str("-- This file is for REVIEW ONLY. Do not execute manually.\n");
