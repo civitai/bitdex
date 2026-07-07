@@ -230,3 +230,51 @@ fn source_update_in_to_in_window_keeps_slot() {
         n
     );
 }
+
+/// Variant 3 (Ivanna's bet) — bucket membership established via a BOOT REBUILD
+/// (rebuild_time_buckets), NOT a live insert, then a single per-row existedAt
+/// bump moves sortAt in-window. Mirrors the prod outlier (months-old slot,
+/// single moderation edit, membership from rebuild_time_buckets on load).
+#[test]
+fn source_update_after_boot_rebuild_buckets_slot() {
+    let engine = ConcurrentEngine::new(build_config()).unwrap();
+    let now = now_secs();
+    let slot: i64 = 1;
+    let existed_old = now - 60 * 86400; // 60 days ago → sortAt OUT of 24h
+    let existed_new = now - 3600; // 1h ago → sortAt IN 24h
+
+    let mut insert = vec![EntityOps {
+        entity_id: slot,
+        creates_slot: true,
+        ops: vec![
+            Op::Set { field: "postId".into(), value: json!(42) },
+            Op::Set { field: "existedAt".into(), value: json!(existed_old as i64) },
+        ],
+    }];
+    drain_batch(&engine, &mut insert);
+    wait_for_alive(&engine, 1, 5000);
+
+    // Boot: establish bucket membership from truth (how a pre-existing slot's
+    // membership is set on load), NOT via a live insert.
+    engine.rebuild_time_buckets().expect("rebuild_time_buckets");
+    assert_eq!(bucket_count(&engine, "24h"), 0, "out-of-window slot not bucketed after boot rebuild");
+
+    let mut update = vec![EntityOps {
+        entity_id: slot,
+        creates_slot: false,
+        ops: vec![
+            Op::Remove { field: "existedAt".into(), value: json!(existed_old as i64) },
+            Op::Set { field: "existedAt".into(), value: json!(existed_new as i64) },
+        ],
+    }];
+    drain_batch(&engine, &mut update);
+    wait_for_sortat(&engine, slot as u32, existed_new, 5000);
+
+    let n = bucket_count(&engine, "24h");
+    assert_eq!(
+        n, 1,
+        "BUG (post-boot-rebuild): existedAt bump moved sortAt in-window (layer={}) but slot never entered 24h bucket (count={})",
+        read_sort_layer(&engine, "sortAt", slot as u32),
+        n
+    );
+}
