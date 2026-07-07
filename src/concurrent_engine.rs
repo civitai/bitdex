@@ -2708,31 +2708,51 @@ impl ConcurrentEngine {
                                         let sfn = tb_arc.load().sort_field_name().to_string();
                                         let removed: HashSet<u32> =
                                             coalescer.alive_removes().iter().copied().collect();
-                                        if !removed.is_empty() {
+                                        let inserted: HashSet<u32> = coalescer
+                                            .alive_inserts()
+                                            .iter()
+                                            .copied()
+                                            .filter(|s| !removed.contains(s))
+                                            .collect();
+                                        // sortAt mutations that are neither fresh inserts nor
+                                        // removes — these have PRIOR bucket membership that must
+                                        // be cleared at defer time, because the pending_bucket_
+                                        // retries drain does a PLAIN insert_slot (its contract:
+                                        // old membership already cleared — mirrors the normal
+                                        // unloaded branch). Without this, a sortAt change that
+                                        // crosses a bucket boundary leaves the slot stale in its
+                                        // old bucket.
+                                        let sort_changed: Vec<u32> = coalescer
+                                            .mutated_sort_slots()
+                                            .get(sfn.as_str())
+                                            .map(|set| {
+                                                set.iter()
+                                                    .copied()
+                                                    .filter(|s| {
+                                                        !removed.contains(s) && !inserted.contains(s)
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        // One clone-mutate-store: clear removed slots AND the old
+                                        // membership of sort-changed slots (flush thread is the
+                                        // sole tb_arc writer, so no lost-update race).
+                                        if !removed.is_empty() || !sort_changed.is_empty() {
                                             let mut tb = (*tb_arc.load_full()).clone();
                                             for &slot in &removed {
                                                 tb.remove_slot(slot);
                                                 pending_bucket_retries.remove(&slot);
                                             }
+                                            for &slot in &sort_changed {
+                                                tb.remove_slot(slot);
+                                            }
                                             tb_arc.store(Arc::new(tb));
                                         }
-                                        // Slots to (re-)bucket next cycle = alive-inserts +
-                                        // sortAt mutations, minus this batch's removes.
-                                        let mut affected: HashSet<u32> = HashSet::new();
-                                        for &slot in coalescer.alive_inserts() {
-                                            if !removed.contains(&slot) {
-                                                affected.insert(slot);
-                                            }
-                                        }
-                                        if let Some(set) =
-                                            coalescer.mutated_sort_slots().get(sfn.as_str())
-                                        {
-                                            for &slot in set {
-                                                if !removed.contains(&slot) {
-                                                    affected.insert(slot);
-                                                }
-                                            }
-                                        }
+                                        // Defer (re-)bucketing to the next cycle's tb-block:
+                                        // fresh inserts (no prior membership) + sort-changed
+                                        // (membership just cleared) → plain insert on drain.
+                                        let mut affected: HashSet<u32> = inserted;
+                                        affected.extend(sort_changed.iter().copied());
                                         let space_left = PENDING_BUCKET_RETRY_CAP
                                             .saturating_sub(pending_bucket_retries.len());
                                         let mut enqueued = 0usize;
