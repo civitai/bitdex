@@ -67,6 +67,10 @@ pub struct MetricsBridge {
     /// `timebucket_dropped_no_sort_field_total` which counts slots that were
     /// successfully deferred and will replay later. Labels: index, field.
     pub timebucket_dropped_capacity_exceeded_total: prometheus::IntCounterVec,
+    /// Source diagnostic (missing-adds): sortAt-mutated slot reconstructs in-window
+    /// but is absent from the bucket bitmap right after live maintenance. Labels:
+    /// index, field, bucket.
+    pub timebucket_applied_not_bucketed_total: prometheus::IntCounterVec,
     /// Periodic full time-bucket rebuild (prune) fallback observability.
     /// `index`-labeled; the per-bucket ones also carry a `bucket` label.
     pub time_bucket_full_rebuild_duration_seconds: prometheus::HistogramVec,
@@ -1852,6 +1856,66 @@ impl ConcurrentEngine {
                                                     &sort_field_name,
                                                 ])
                                                 .inc_by(deferred as u64);
+                                        }
+                                    }
+                                    // === Source diagnostic (B, #timebucket-missing-adds) ===
+                                    // After every sortAt mutation this cycle is applied to
+                                    // `tb`, verify each sortAt-mutated ALIVE slot whose
+                                    // reconstructed value lands in a bucket window actually
+                                    // made it into that bucket. Prod shows in-window sortAt
+                                    // updates that reach the sort LAYER but not the bucket
+                                    // (~22% of 24h at 107M) with no existing counter and no
+                                    // local repro — this fires at the MOMENT of loss, before
+                                    // the hourly backfill masks it. `via` names the path that
+                                    // should have bucketed it (told-but-didn't-stick vs the
+                                    // alive-insert path). Cheap: O(changed slots × buckets).
+                                    #[cfg(feature = "server")]
+                                    if sort_field_loaded {
+                                        if let (Some(bridge), Some(sf)) = (bridge_opt, sort_field) {
+                                            if let Some(mutated) =
+                                                mutated_slots.get(sort_field_name.as_str())
+                                            {
+                                                let removed: HashSet<u32> =
+                                                    alive_removes.iter().copied().collect();
+                                                let inserted: HashSet<u32> =
+                                                    alive_inserts.iter().copied().collect();
+                                                for &slot in mutated.iter() {
+                                                    if removed.contains(&slot) {
+                                                        continue;
+                                                    }
+                                                    let ts = sf.reconstruct_value(slot) as u64;
+                                                    if ts == 0 || ts > now_secs {
+                                                        continue;
+                                                    }
+                                                    for name in tb.bucket_names() {
+                                                        let Some(b) = tb.get_bucket(&name) else {
+                                                            continue;
+                                                        };
+                                                        let cutoff =
+                                                            now_secs.saturating_sub(b.duration_secs);
+                                                        if ts >= cutoff && !b.bitmap().contains(slot) {
+                                                            let via = if inserted.contains(&slot) {
+                                                                "alive_insert"
+                                                            } else {
+                                                                "sort_value_changed"
+                                                            };
+                                                            bridge
+                                                                .timebucket_applied_not_bucketed_total
+                                                                .with_label_values(&[
+                                                                    &bridge.index_name,
+                                                                    &sort_field_name,
+                                                                    &name,
+                                                                ])
+                                                                .inc();
+                                                            tracing::warn!(
+                                                                target: "time_bucket",
+                                                                "[tb-source] applied-but-unbucketed slot={} ts={} bucket={} via={}",
+                                                                slot, ts, name, via,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     tb_arc.store(Arc::new(tb));

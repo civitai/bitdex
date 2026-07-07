@@ -79,6 +79,7 @@ pub struct Metrics {
     pub flush_timebucket_nanos: IntGaugeVec,
     pub timebucket_dropped_no_sort_field_total: IntCounterVec,
     pub timebucket_dropped_capacity_exceeded_total: IntCounterVec,
+    pub timebucket_applied_not_bucketed_total: IntCounterVec,
     pub timebucket_anomalous_ts_total: IntCounterVec,
     // Periodic full time-bucket rebuild (prune) fallback observability.
     pub time_bucket_full_rebuild_duration_seconds: HistogramVec,
@@ -593,6 +594,14 @@ impl Metrics {
                 "Slot timestamps reconstructed during time-bucket flush that look anomalous. kind=zero (uninitialized), future (clock skew), wrapped (u32 ms-as-secs wraparound suspected).",
             ),
             &["index", "field", "kind"],
+        )
+        .unwrap();
+        let timebucket_applied_not_bucketed_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_timebucket_applied_not_bucketed_total",
+                "Source diagnostic: a slot whose bucket sort-field value was mutated this flush cycle reconstructs to an in-window value but is ABSENT from that bucket's bitmap right after the live maintenance store. Non-zero pins the missing-adds source (in-window sortAt reaches the sort layer but not the bucket). Label `bucket` = window; the log trace carries `via` (alive_insert | sort_value_changed).",
+            ),
+            &["index", "field", "bucket"],
         )
         .unwrap();
         let time_bucket_full_rebuild_duration_seconds = HistogramVec::new(
@@ -1315,6 +1324,7 @@ impl Metrics {
         registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
         registry.register(Box::new(timebucket_dropped_no_sort_field_total.clone())).unwrap();
         registry.register(Box::new(timebucket_dropped_capacity_exceeded_total.clone())).unwrap();
+        registry.register(Box::new(timebucket_applied_not_bucketed_total.clone())).unwrap();
         registry.register(Box::new(timebucket_anomalous_ts_total.clone())).unwrap();
         registry.register(Box::new(time_bucket_full_rebuild_duration_seconds.clone())).unwrap();
         registry.register(Box::new(time_bucket_full_rebuild_total.clone())).unwrap();
@@ -1474,6 +1484,7 @@ impl Metrics {
             flush_timebucket_nanos,
             timebucket_dropped_no_sort_field_total,
             timebucket_dropped_capacity_exceeded_total,
+            timebucket_applied_not_bucketed_total,
             timebucket_anomalous_ts_total,
             time_bucket_full_rebuild_duration_seconds,
             time_bucket_full_rebuild_total,
