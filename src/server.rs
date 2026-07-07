@@ -1834,6 +1834,10 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
                 .metrics
                 .timebucket_dropped_capacity_exceeded_total
                 .clone(),
+            timebucket_applied_not_bucketed_total: state
+                .metrics
+                .timebucket_applied_not_bucketed_total
+                .clone(),
             timebucket_anomalous_ts_total: state
                 .metrics
                 .timebucket_anomalous_ts_total
@@ -2191,6 +2195,10 @@ async fn handle_create_index(
         timebucket_dropped_capacity_exceeded_total: state
             .metrics
             .timebucket_dropped_capacity_exceeded_total
+            .clone(),
+        timebucket_applied_not_bucketed_total: state
+            .metrics
+            .timebucket_applied_not_bucketed_total
             .clone(),
         timebucket_anomalous_ts_total: state.metrics.timebucket_anomalous_ts_total.clone(),
         time_bucket_full_rebuild_duration_seconds: state.metrics.time_bucket_full_rebuild_duration_seconds.clone(),

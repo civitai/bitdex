@@ -67,6 +67,10 @@ pub struct MetricsBridge {
     /// `timebucket_dropped_no_sort_field_total` which counts slots that were
     /// successfully deferred and will replay later. Labels: index, field.
     pub timebucket_dropped_capacity_exceeded_total: prometheus::IntCounterVec,
+    /// Source diagnostic (missing-adds): sortAt-mutated slot reconstructs in-window
+    /// but is absent from the bucket bitmap right after live maintenance. Labels:
+    /// index, field, bucket.
+    pub timebucket_applied_not_bucketed_total: prometheus::IntCounterVec,
     /// Periodic full time-bucket rebuild (prune) fallback observability.
     /// `index`-labeled; the per-bucket ones also carry a `bucket` label.
     pub time_bucket_full_rebuild_duration_seconds: prometheus::HistogramVec,
@@ -1273,6 +1277,15 @@ impl ConcurrentEngine {
             let flush_metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> =
                 Arc::clone(&metrics_bridge);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
+            // Source diagnostic (missing-adds) gate — read once per flush thread.
+            // OFF by default (zero hot-path cost); enable for a diagnostic window
+            // via BITDEX_TB_SOURCE_DIAG=1. When on, the tb-block verifies each
+            // sortAt-mutated slot landed in its window bucket (aggregated).
+            // server-gated: the only consumer is the server-feature metric block.
+            #[cfg(feature = "server")]
+            let tb_source_diag: bool = std::env::var("BITDEX_TB_SOURCE_DIAG")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             // Interval (secs) for the periodic FULL time-bucket rebuild fallback.
             // 0 disables it. See `TimeBucketFieldConfig::full_rebuild_interval_secs`.
             let flush_bucket_full_rebuild_interval: u64 = config
@@ -1852,6 +1865,91 @@ impl ConcurrentEngine {
                                                     &sort_field_name,
                                                 ])
                                                 .inc_by(deferred as u64);
+                                        }
+                                    }
+                                    // === Source diagnostic (B, #timebucket-missing-adds) ===
+                                    // After every sortAt mutation this cycle is applied to
+                                    // `tb`, verify each sortAt-mutated ALIVE slot whose
+                                    // reconstructed value lands in a bucket window actually
+                                    // made it into that bucket. Prod shows in-window sortAt
+                                    // updates that reach the sort LAYER but not the bucket
+                                    // (~22% of 24h at 107M) with no existing counter and no
+                                    // local repro — this fires at the MOMENT of loss, before
+                                    // the hourly backfill masks it. `via` = which path should
+                                    // have bucketed it. OFF by default (BITDEX_TB_SOURCE_DIAG);
+                                    // bucket handles hoisted out of the slot loop; per-cycle
+                                    // scan capped; logging aggregated to one line per
+                                    // (bucket, via) so a mass-miss cycle can't log-storm.
+                                    #[cfg(feature = "server")]
+                                    if tb_source_diag && sort_field_loaded {
+                                        if let (Some(bridge), Some(sf)) = (bridge_opt, sort_field) {
+                                            if let Some(mutated) =
+                                                mutated_slots.get(sort_field_name.as_str())
+                                            {
+                                                const TB_DIAG_SCAN_CAP: usize = 20_000;
+                                                let removed: HashSet<u32> =
+                                                    alive_removes.iter().copied().collect();
+                                                let inserted: HashSet<u32> =
+                                                    alive_inserts.iter().copied().collect();
+                                                // Hoist bucket (name, cutoff, bitmap ref) once.
+                                                let bucket_specs: Vec<(String, u64, &Arc<roaring::RoaringBitmap>)> =
+                                                    tb.bucket_names()
+                                                        .into_iter()
+                                                        .filter_map(|name| {
+                                                            let b = tb.get_bucket(&name)?;
+                                                            Some((
+                                                                name,
+                                                                now_secs.saturating_sub(b.duration_secs),
+                                                                b.bitmap(),
+                                                            ))
+                                                        })
+                                                        .collect();
+                                                // Aggregate: (bucket, via) -> (count, first-N sample "slot@ts").
+                                                let mut agg: std::collections::HashMap<
+                                                    (String, &'static str),
+                                                    (u64, Vec<String>),
+                                                > = std::collections::HashMap::new();
+                                                for &slot in mutated.iter().take(TB_DIAG_SCAN_CAP) {
+                                                    if removed.contains(&slot) {
+                                                        continue;
+                                                    }
+                                                    let ts = sf.reconstruct_value(slot) as u64;
+                                                    if ts == 0 || ts > now_secs {
+                                                        continue;
+                                                    }
+                                                    let via = if inserted.contains(&slot) {
+                                                        "alive_insert"
+                                                    } else {
+                                                        "sort_value_changed"
+                                                    };
+                                                    for (name, cutoff, bitmap) in &bucket_specs {
+                                                        if ts >= *cutoff && !bitmap.contains(slot) {
+                                                            let e = agg
+                                                                .entry((name.clone(), via))
+                                                                .or_insert((0, Vec::new()));
+                                                            e.0 += 1;
+                                                            if e.1.len() < 20 {
+                                                                e.1.push(format!("{slot}@{ts}"));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                for ((name, via), (count, samples)) in agg {
+                                                    bridge
+                                                        .timebucket_applied_not_bucketed_total
+                                                        .with_label_values(&[
+                                                            &bridge.index_name,
+                                                            &sort_field_name,
+                                                            &name,
+                                                        ])
+                                                        .inc_by(count);
+                                                    tracing::warn!(
+                                                        target: "time_bucket",
+                                                        "[tb-source] applied-but-unbucketed bucket={} via={} count={} samples=[{}]",
+                                                        name, via, count, samples.join(","),
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     tb_arc.store(Arc::new(tb));
