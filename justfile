@@ -158,11 +158,11 @@ loadtest-direct:
 
 # Build Docker image
 docker:
-    docker build -f docker/Dockerfile -t bitdex-v2 .
+    docker build -f deploy/docker/Dockerfile -t bitdex-v2 .
 
 # Build Docker image with SIMD
 docker-simd:
-    docker build -f docker/Dockerfile.simd -t bitdex-v2-simd .
+    docker build -f deploy/docker/Dockerfile.simd -t bitdex-v2-simd .
 
 # ─── Release ──────────────────────────────────────────────────────
 
