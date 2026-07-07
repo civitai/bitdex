@@ -254,8 +254,24 @@ impl SlotAllocator {
         if slot >= current {
             self.next_slot.store(slot + 1, Ordering::Relaxed);
         }
+        // Re-schedule semantics: a slot lives under at most ONE activation
+        // key. Without this, a publish-date change while deferred left the
+        // old entry in place — activate_due would fire at the earlier time
+        // and replay the doc ahead of schedule. Deferred maps are small
+        // (thousands), so the linear sweep is fine.
+        self.cancel_deferred(slot);
         // Add to deferred map (not alive yet)
         self.deferred.entry(activate_at_unix).or_default().push(slot);
+    }
+
+    /// Remove a slot from the deferred map entirely (all activation keys).
+    /// Used on re-schedule (see `schedule_alive`) and on delete of a deferred
+    /// slot — a deleted slot must not be resurrected by a later activation.
+    pub fn cancel_deferred(&mut self, slot: u32) {
+        self.deferred.retain(|_, slots| {
+            slots.retain(|s| *s != slot);
+            !slots.is_empty()
+        });
     }
 
     /// Activate all slots whose scheduled time has arrived (key <= now_unix).

@@ -887,7 +887,16 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // Delete absorbs everything — clear all bitmaps for this slot.
         if entry.ops.iter().any(|op| matches!(op, Op::Delete)) {
             match process_delete(sink, meta, slot, engine) {
-                Ok(()) => applied += 1,
+                Ok(()) => {
+                    // A deferred (not-yet-alive) slot has no bitmap bits to
+                    // clear, but its deferred-map entry must go too — a later
+                    // activate_due would otherwise resurrect the deleted slot
+                    // by replaying its stored doc.
+                    if engine.map(|e| e.is_slot_deferred(slot)).unwrap_or(false) {
+                        sink.deferred_cancel(slot);
+                    }
+                    applied += 1;
+                }
                 Err(e) => {
                     tracing::warn!("ops processor: delete slot {slot} failed: {e}");
                     errors += 1;
@@ -908,6 +917,38 @@ pub fn apply_ops_batch<S: BitmapSink>(
         if !creates_slot && !has_query_op_set {
             if let Some(eng) = engine {
                 if !eng.is_slot_alive(slot) {
+                    // Deferred slots are allocated (below the high-water mark)
+                    // but not alive — the plain not-alive skip used to drop
+                    // EVERY follow-up op for them: publish-date reschedules,
+                    // unpublishes, tag/metric updates, all silently lost until
+                    // activation replayed a stale doc (audit 2026-07-07, §3.1).
+                    // While deferred: persist all field writes to the docstore
+                    // (activation replays the doc, so they surface then), and
+                    // if the deferred source field itself changed, re-schedule
+                    // the activation — schedule_alive dedupes the old key, and
+                    // a now-past timestamp activates on the next flush cycle.
+                    if eng.is_slot_deferred(slot) {
+                        if let Some(ref mut dw) = doc_writer {
+                            for op in &entry.ops {
+                                match op {
+                                    Op::Set { field, value } => dw.write_set(slot, field, value),
+                                    Op::Add { field, value } => dw.write_add(slot, field, value),
+                                    Op::Remove { field, value } => {
+                                        dw.write_remove(slot, field, value)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(new_at) = get_deferred_timestamp(meta, &entry.ops) {
+                            sink.deferred_alive(slot, new_at);
+                            tracing::info!(
+                                "ops processor: rescheduled deferred slot {slot} to {new_at}"
+                            );
+                        }
+                        applied += 1;
+                        continue;
+                    }
                     if slot >= eng.slot_counter() {
                         // Slot is beyond high-water mark — this is a new entity,
                         // not a stale op for a deleted slot. Auto-promote.
@@ -1914,6 +1955,7 @@ mod tests {
         alive_inserts: Vec<u32>,
         alive_removes: Vec<u32>,
         deferred_alive: Vec<(u32, u64)>,
+        deferred_cancels: Vec<u32>,
     }
     impl RecordingSink {
         fn new() -> Self {
@@ -1925,6 +1967,7 @@ mod tests {
                 alive_inserts: Vec::new(),
                 alive_removes: Vec::new(),
                 deferred_alive: Vec::new(),
+                deferred_cancels: Vec::new(),
             }
         }
     }
@@ -1949,6 +1992,9 @@ mod tests {
         }
         fn deferred_alive(&mut self, slot: u32, activate_at: u64) {
             self.deferred_alive.push((slot, activate_at));
+        }
+        fn deferred_cancel(&mut self, slot: u32) {
+            self.deferred_cancels.push(slot);
         }
         fn flush(&mut self) -> crate::error::Result<()> {
             Ok(())
@@ -2959,6 +3005,122 @@ mod tests {
         assert!(sink.filter_inserts.is_empty(), "deferred should skip ALL bitmaps including filter");
         assert!(sink.sort_sets.is_empty(), "deferred should skip ALL bitmaps including sort");
     }
+    /// Poll until the engine's published snapshot shows the slot as deferred.
+    fn wait_for_deferred(engine: &ConcurrentEngine, slot: u32, timeout_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_deferred(slot) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("slot {slot} never became deferred within {timeout_ms}ms");
+    }
+
+    /// Regression (audit 2026-07-07 §3.1): ops for a deferred, not-yet-alive
+    /// slot were silently dropped by the not-alive guard — a publish-date
+    /// reschedule while deferred was lost, so the slot activated at the stale
+    /// time. While deferred, a Set on the deferred source field must
+    /// re-schedule the activation (and persist to the doc), not be skipped.
+    #[test]
+    fn test_deferred_slot_reschedule_not_dropped() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 77;
+        let now = unit_now_secs() as i64;
+        let t1 = now + 3_600; // initial schedule: +1h
+        let t2 = now + 7_200; // rescheduled: +2h
+
+        // Fresh insert carrying a future publishedAt → deferred branch.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(t1) },
+            ],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        // Follow-up op (creates_slot=false): reschedule publishedAt. Recorded
+        // via RecordingSink so we can assert exactly what the guard emits.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: json!(t2) }],
+        }];
+        let (applied2, skipped2, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!(
+            (applied2, skipped2, errors2),
+            (1, 0, 0),
+            "reschedule for a deferred slot must be applied, not skipped"
+        );
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, t2 as u64)],
+            "guard must re-schedule the deferred activation at the new time"
+        );
+        assert!(
+            rec.alive_inserts.is_empty() && rec.filter_inserts.is_empty(),
+            "no bitmap mutations while still deferred"
+        );
+        // Doc must carry the new publishedAt for the eventual activation replay.
+        let doc = engine.get_document(slot).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("publishedAt"),
+            Some(&crate::mutation::FieldValue::Single(crate::types::Value::Integer(t2))),
+        );
+    }
+
+    /// Regression (audit 2026-07-07 §3.1): deleting a deferred slot must
+    /// cancel the pending activation — otherwise activate_due resurrects the
+    /// deleted slot by replaying its stored doc.
+    #[test]
+    fn test_deferred_slot_delete_cancels_activation() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 78;
+        let now = unit_now_secs() as i64;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: json!(now + 3_600) }],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        let mut rec = RecordingSink::new();
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Delete],
+        }];
+        let (applied2, _, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), None);
+        assert_eq!((applied2, errors2), (1, 0));
+        assert_eq!(
+            rec.deferred_cancels,
+            vec![slot],
+            "delete of a deferred slot must cancel its pending activation"
+        );
+    }
+
     #[test]
     fn test_deferred_alive_past_publishedat() {
         use crate::config::DeferredAliveConfig;

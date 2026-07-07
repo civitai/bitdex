@@ -8050,6 +8050,15 @@ impl ConcurrentEngine {
         let snap = self.snapshot();
         snap.slots.is_alive(slot)
     }
+    /// Whether a slot is scheduled for deferred activation (not yet alive).
+    /// Reads the published snapshot; a deferral applied to staging becomes
+    /// visible here on the next publish. Linear in deferred-map size — only
+    /// call on cold paths (the ops processor consults it solely for ops that
+    /// target non-alive slots).
+    pub fn is_slot_deferred(&self, slot: u32) -> bool {
+        let snap = self.snapshot();
+        snap.slots.is_deferred(slot)
+    }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
         self.docstore.read().build_schema_registry()

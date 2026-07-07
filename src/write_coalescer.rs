@@ -118,6 +118,11 @@ pub enum MutationOp {
     /// The slot's filter/sort bitmaps are set immediately, but the alive bit
     /// is deferred until `activate_at` (seconds since epoch).
     DeferredAlive { slot: u32, activate_at: u64 },
+    /// Remove a slot from the deferred map (all activation keys). Emitted when
+    /// a deferred (not-yet-alive) slot is deleted so a later `activate_due`
+    /// cannot resurrect it. Applied before any `DeferredAlive` in the same
+    /// batch, so a delete+re-insert batch nets out to the re-insert's schedule.
+    DeferredCancel { slot: u32 },
 }
 /// Key for grouping filter operations by target bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -144,6 +149,7 @@ pub struct WriteBatch {
     alive_inserts: Vec<u32>,
     alive_removes: Vec<u32>,
     deferred_alive: Vec<(u32, u64)>,
+    deferred_cancels: Vec<u32>,
 }
 impl WriteBatch {
     pub fn new() -> Self {
@@ -156,6 +162,7 @@ impl WriteBatch {
             alive_inserts: Vec::new(),
             alive_removes: Vec::new(),
             deferred_alive: Vec::new(),
+            deferred_cancels: Vec::new(),
         }
     }
     /// Push a list of ops directly (used by deferred alive activation in the flush thread).
@@ -186,6 +193,7 @@ impl WriteBatch {
         self.alive_inserts.clear();
         self.alive_removes.clear();
         self.deferred_alive.clear();
+        self.deferred_cancels.clear();
         for op in self.ops.drain(..) {
             match op {
                 MutationOp::FilterInsert { field, value, slots } => {
@@ -229,6 +237,9 @@ impl WriteBatch {
                 MutationOp::DeferredAlive { slot, activate_at } => {
                     self.deferred_alive.push((slot, activate_at));
                 }
+                MutationOp::DeferredCancel { slot } => {
+                    self.deferred_cancels.push(slot);
+                }
             }
         }
         // Sort all slot ID vectors for optimal roaring-rs extend() performance
@@ -252,9 +263,10 @@ impl WriteBatch {
     pub fn has_alive_mutations(&self) -> bool {
         !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
     }
-    /// Returns true if this batch contains deferred alive entries.
+    /// Returns true if this batch contains deferred-map mutations
+    /// (schedules or cancels).
     pub fn has_deferred_alive(&self) -> bool {
-        !self.deferred_alive.is_empty()
+        !self.deferred_alive.is_empty() || !self.deferred_cancels.is_empty()
     }
     /// Extract filter mutations for Tier 2 fields before apply.
     ///
@@ -414,6 +426,12 @@ impl WriteBatch {
         for &slot in &self.alive_removes {
             slots.alive_remove_one(slot);
         }
+        // Deferred-map maintenance: cancels first, then schedules — a
+        // delete+re-insert in one batch nets out to the re-insert's schedule
+        // (schedule_alive itself dedupes any prior key for the slot).
+        for &slot in &self.deferred_cancels {
+            slots.cancel_deferred(slot);
+        }
         // Schedule deferred alive activations
         for &(slot, activate_at) in &self.deferred_alive {
             slots.schedule_alive(slot, activate_at);
@@ -471,7 +489,10 @@ pub struct MutationSender {
 impl MutationSender {
     /// Submit a single mutation. Blocks if the channel is full (backpressure).
     pub fn send(&self, op: MutationOp) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
-        if matches!(op, MutationOp::DeferredAlive { .. }) {
+        if matches!(
+            op,
+            MutationOp::DeferredAlive { .. } | MutationOp::DeferredCancel { .. }
+        ) {
             self.deferred_seq
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -616,9 +637,11 @@ impl WriteCoalescer {
     pub fn has_deferred_alive(&self) -> bool {
         self.batch.has_deferred_alive()
     }
-    /// Number of deferred alive entries in the prepared batch.
+    /// Number of deferred-map mutations (schedules + cancels) in the prepared
+    /// batch. Feeds the flush thread's durable watermark — must count exactly
+    /// what `deferred_seq` ticks for.
     pub fn deferred_alive_count(&self) -> usize {
-        self.batch.deferred_alive.len()
+        self.batch.deferred_alive.len() + self.batch.deferred_cancels.len()
     }
     /// Returns the set of filter field names mutated in the prepared batch.
     /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
