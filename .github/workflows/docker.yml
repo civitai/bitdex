@@ -46,6 +46,11 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           push: true
+          # Pin a portable ISA floor — never build with target-cpu=native on the
+          # heterogeneous ubuntu-latest fleet (AVX-512 zmm codegen SIGILLs the
+          # Zen3 node talos-48r-b3a). x86-64-v3 = AVX2/BMI2/FMA, no AVX-512.
+          build-args: |
+            TARGET_CPU=x86-64-v3
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=dockerfile-${{ hashFiles('deploy/docker/Dockerfile') }}
