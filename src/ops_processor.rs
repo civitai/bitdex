@@ -1296,6 +1296,62 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
             }
         }
     }
+
+    // --- Safety net: complete a lost deferred activation (2026-07-03) ---
+    // A scheduled-ahead slot is deferred (doc.publishedAt = future, bitmap +
+    // isPublished shadow untouched) and is meant to be activated by the flush
+    // thread's `activate_due` when its time arrives. Prod audit found ~49.7k
+    // slots whose activation was never applied (deferred-map scheduling lost):
+    // they went live (publishedAt now in the past) but the `isPublished`
+    // exists_boolean shadow stayed false and the `publishedAt` source sort
+    // layer stayed 0, so they are excluded from `isPublished=true` feeds. The
+    // computed `sortAt` heals on its own here (it derives from the stored
+    // publishedAt once past), which masked the real defect.
+    //
+    // Whenever a recompute touches such a slot, finish the job the lost
+    // activation should have done: write the `publishedAt` source sort layer
+    // and flip the `isPublished` shadow to true. Both are idempotent, so
+    // already-activated slots are unaffected. A slot still legitimately
+    // deferred (publishedAt in the future) or a genuine draft (no stored
+    // publishedAt) is skipped by the `> 0 && <= now` guard. This does NOT
+    // remove the need to fix the deferred-map scheduling itself — it bounds
+    // the blast radius so live-but-unflipped slots self-correct on the next
+    // source-field op. See docs/_in/deferred-publish-isPublished-corrected-diagnosis-2026-07-03.md.
+    if let (Some(eng), Some((deferred_name, _ms))) = (engine, deferred_field) {
+        if let Ok(Some(doc)) = eng.get_document(slot) {
+            if let Some(crate::mutation::FieldValue::Single(ref v)) =
+                doc.fields.get(deferred_name)
+            {
+                if let Some(pub_val) = value_to_sort_u32(v) {
+                    if pub_val > 0 && pub_val <= now_secs_for_deferred {
+                        // publishedAt source sort layer — full overwrite.
+                        if let Some((arc_name, num_bits)) = meta.sort_fields.get(deferred_name) {
+                            for bit in 0..*num_bits {
+                                if (pub_val >> bit) & 1 == 1 {
+                                    sink.sort_set(arc_name.clone(), bit, slot);
+                                } else {
+                                    sink.sort_clear(arc_name.clone(), bit, slot);
+                                }
+                            }
+                            if let Some(ref mut dw) = doc_writer {
+                                dw.write_set(slot, deferred_name, &serde_json::json!(pub_val));
+                            }
+                        }
+                        // isPublished exists_boolean shadow → true (key 1).
+                        if let Some(shadows) = meta.exists_boolean_shadows.get(deferred_name) {
+                            for arc_name in shadows {
+                                sink.filter_remove(arc_name.clone(), 0, slot);
+                                sink.filter_insert(arc_name.clone(), 1, slot);
+                                if let Some(ref mut dw) = doc_writer {
+                                    dw.write_set(slot, arc_name.as_ref(), &serde_json::json!(true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Process a `set` op: set the new value's bitmap bit for this slot.
@@ -1943,6 +1999,118 @@ mod tests {
             computed: None,
         }];
         config
+    }
+    /// Build a config exercising the deferred-publish safety net: a computed
+    /// `sortAt = GREATEST(existedAt, publishedAt)`, `publishedAt` as both a
+    /// sort field and the `deferred_alive` source, and an `isPublished`
+    /// exists_boolean shadow sharing the `publishedAtUnix` source.
+    fn safety_net_config() -> Config {
+        use crate::config::{ComputedField, ComputedOp, DeferredAliveConfig};
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "isPublished".into(),
+            field_type: FilterFieldType::Boolean,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        }];
+        config.sort_fields = vec![
+            SortFieldConfig { name: "existedAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false, computed: None },
+            SortFieldConfig { name: "publishedAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false, computed: None },
+            SortFieldConfig {
+                name: "sortAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false,
+                computed: Some(ComputedField { op: ComputedOp::Greatest, source_fields: vec!["existedAt".into(), "publishedAt".into()] }),
+            },
+        ];
+        config.deferred_alive = Some(DeferredAliveConfig { source_field: "publishedAt".into(), ms_to_seconds: false });
+        config.data_schema.fields = vec![
+            FieldMapping { source: "publishedAtUnix".into(), target: "publishedAt".into(), value_type: FieldValueType::Integer, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: true, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
+            FieldMapping { source: "publishedAtUnix".into(), target: "isPublished".into(), value_type: FieldValueType::ExistsBoolean, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: false, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
+        ];
+        config
+    }
+
+    fn unit_now_secs() -> u32 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32
+    }
+
+    /// Regression (2026-07-03): the recompute safety net must complete a LOST
+    /// deferred activation. A scheduled-ahead slot whose `activate_due` replay
+    /// was never applied is stuck with `doc.publishedAt` in the past but its
+    /// `isPublished` shadow false and `publishedAt` sort layer at 0 — excluded
+    /// from `isPublished=true` feeds. When any recompute touches such a slot,
+    /// the net must flip `isPublished=true` and write the `publishedAt` layer.
+    #[test]
+    fn test_recompute_safety_net_completes_lost_activation() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 42u32;
+        let t_pub = unit_now_secs() - 100; // published in the past
+        let new_existed = t_pub - 50; // publishedAt is the max → sortAt = t_pub
+
+        // Forge the stuck state: doc carries a past publishedAt, but no op ever
+        // set the bitmap/shadow (as the deferred branch leaves it).
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        dw.write_set(slot, "publishedAt", &json!(t_pub as i64));
+        dw.flush();
+
+        // A later existedAt re-scan fires recompute for this slot.
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert("existedAt", new_existed);
+        let old_sort_values: HashMap<&str, u32> = HashMap::new();
+
+        let mut sink = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink, &meta, Some(&engine), slot, &sort_values, &old_sort_values, None);
+
+        // isPublished shadow flipped to true (clear false bit, set true bit).
+        assert!(
+            sink.filter_inserts.contains(&("isPublished".to_string(), 1u64, slot)),
+            "safety net must insert isPublished=true, got inserts={:?}", sink.filter_inserts
+        );
+        assert!(
+            sink.filter_removes.contains(&("isPublished".to_string(), 0u64, slot)),
+            "safety net must clear isPublished=false, got removes={:?}", sink.filter_removes
+        );
+
+        // publishedAt sort layer written from the stored doc value (set bits only).
+        let pub_bits: Vec<usize> = sink.sort_sets.iter().filter(|(f, _, _)| f == "publishedAt").map(|(_, b, _)| *b).collect();
+        let expected_bits: Vec<usize> = (0..32).filter(|b| (t_pub >> b) & 1 == 1).collect();
+        assert_eq!(pub_bits, expected_bits, "safety net must write publishedAt sort-layer set-bits for the stored value");
+    }
+
+    /// The safety net must NOT force-activate a slot that is still legitimately
+    /// deferred (publishedAt in the future) — that would leak scheduled posts.
+    #[test]
+    fn test_recompute_safety_net_skips_future_publishedat() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 43u32;
+        let t_future = unit_now_secs() + 86_400; // 1 day out
+        let new_existed = unit_now_secs() - 100;
+
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        dw.write_set(slot, "publishedAt", &json!(t_future as i64));
+        dw.flush();
+
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert("existedAt", new_existed);
+        let old_sort_values: HashMap<&str, u32> = HashMap::new();
+
+        let mut sink = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink, &meta, Some(&engine), slot, &sort_values, &old_sort_values, None);
+
+        // No publishedAt sort-layer writes and no isPublished flip — the slot
+        // stays deferred until activate_due handles it.
+        assert!(
+            !sink.sort_sets.iter().any(|(f, _, _)| f == "publishedAt"),
+            "safety net must not write publishedAt layer for a future value, got {:?}", sink.sort_sets
+        );
+        assert!(
+            !sink.filter_inserts.iter().any(|(f, v, _)| f == "isPublished" && *v == 1),
+            "safety net must not flip isPublished for a future value, got {:?}", sink.filter_inserts
+        );
     }
     #[test]
     fn test_set_op_filter_insert() {
