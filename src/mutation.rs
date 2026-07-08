@@ -140,12 +140,28 @@ pub fn diff_document(
         }
     }
     let mut ops = Vec::new();
+    // exists_boolean targets are DERIVE-ONLY in this path: the stored doc's
+    // copy of a shadow can be stale (the deferred branch deliberately never
+    // updates it pre-activation), so emitting it from the doc would fight the
+    // authoritative derivation at the function tail — and because batch apply
+    // groups removes-before-inserts, conflicting pairs would land the slot in
+    // BOTH boolean bitmaps. Skip them in the doc-value loops below.
+    let shadow_targets: std::collections::HashSet<&str> = config
+        .data_schema
+        .fields
+        .iter()
+        .filter(|fm| matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean))
+        .map(|fm| fm.target.as_str())
+        .collect();
     if is_upsert {
         // Upsert: diff old vs new, only emit ops for changed fields
         let empty_fields = HashMap::new();
         let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
         for filter_config in &config.filter_fields {
             let field_name = &filter_config.name;
+            if shadow_targets.contains(field_name.as_str()) {
+                continue; // derive-only (tail of function)
+            }
             let old_val = old_fields.get(field_name);
             let new_val = new_doc.fields.get(field_name);
             if field_values_equal(old_val, new_val) {
@@ -221,6 +237,9 @@ pub fn diff_document(
         }
         // Set all new bitmaps
         for filter_config in &config.filter_fields {
+            if shadow_targets.contains(filter_config.name.as_str()) {
+                continue; // derive-only (tail of function)
+            }
             if let Some(field_value) = new_doc.fields.get(&filter_config.name) {
                 let arc_name = registry.get(&filter_config.name);
                 collect_filter_insert_ops(&mut ops, &arc_name, slot, field_value);
@@ -271,10 +290,85 @@ pub fn diff_document(
             }
         }
     }
+    // Derive exists_boolean shadow bitmaps (fresh insert + upsert).
+    //
+    // The steady-state ops path flips shadows (e.g. isPublished derived from
+    // publishedAt) inside process_set_op — but this diff path is the ONLY
+    // mutation source for deferred-activation replay (activate_due replays
+    // diff_document(None, doc)), and the deferred branch deliberately keeps
+    // the shadow OUT of the stored doc so pre-activation reads don't claim
+    // published. Until 2026-07-08 there was NO derivation here, so a deferred
+    // publish never flipped its shadow: the surviving core of the audit's
+    // Mode A (live specimens 136112167/136112697 — a publish fan-out whose
+    // publishedAt was seconds in the future of the pod clock deferred, then
+    // activated with isPublished stuck false forever).
+    //
+    // Full-overwrite semantics (remove the opposite key, insert the derived
+    // key) — idempotent absolute, same contract as the sort-layer replay
+    // above.
+    for (shadow_name, derived) in derive_exists_boolean_shadows(config, &new_doc.fields) {
+        let arc_name = registry.get(&shadow_name);
+        let (set_key, clear_key) = if derived { (1u64, 0u64) } else { (0u64, 1u64) };
+        ops.push(MutationOp::FilterRemove {
+            field: arc_name.clone(),
+            value: clear_key,
+            slots: vec![slot],
+        });
+        ops.push(MutationOp::FilterInsert {
+            field: arc_name,
+            value: set_key,
+            slots: vec![slot],
+        });
+    }
     // Alive insert (for both fresh insert and upsert -- idempotent).
     // If we reach here, the document is not deferred (checked at top of function).
     ops.push(MutationOp::AliveInsert { slots: vec![slot] });
     ops
+}
+
+/// Derive the value of every exists_boolean shadow target from a document's
+/// fields. For each `ExistsBoolean` mapping in the data schema, presence is
+/// judged by the sibling target that shares the mapping's source (the doc
+/// stores TARGET-named fields — e.g. source `publishedAtUnix` materializes as
+/// doc field `publishedAt`), falling back to the source name itself. A field
+/// that is present with a non-null value derives `true`; absent or null
+/// derives `false`. Returns `(shadow_target_name, derived_value)` pairs;
+/// shadow targets that are also directly present in the doc are skipped —
+/// the doc's explicit value already flowed through the filter loop above.
+pub fn derive_exists_boolean_shadows(
+    config: &Config,
+    fields: &HashMap<String, FieldValue>,
+) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for fm in &config.data_schema.fields {
+        if !matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean) {
+            continue;
+        }
+        // NOTE: derivation is authoritative even when the doc carries an
+        // explicit shadow value — the stored copy can be STALE (the deferred
+        // branch never updates it pre-activation; live specimens 136112167/
+        // 136112697 had explicit isPublished=false from insert time). The
+        // sibling-presence probe below always computes the truthful value,
+        // identical to what the dump enrichment would have computed.
+        // Presence source: sibling target sharing this mapping's source.
+        let mut probe: Option<&FieldValue> = None;
+        for sibling in &config.data_schema.fields {
+            if sibling.source == fm.source && sibling.target != fm.target {
+                if let Some(v) = fields.get(&sibling.target) {
+                    probe = Some(v);
+                    break;
+                }
+            }
+        }
+        if probe.is_none() {
+            probe = fields.get(&fm.source);
+        }
+        // Docs never store nulls (a null Set writes field absence), so
+        // presence of any value derives true.
+        let derived = probe.is_some();
+        out.push((fm.target.clone(), derived));
+    }
+    out
 }
 /// Pure diff for partial update (PATCH): like diff_document upsert path,
 /// but ONLY processes fields present in new_doc. Missing fields are skipped

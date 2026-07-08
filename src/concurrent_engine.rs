@@ -1521,6 +1521,24 @@ impl ConcurrentEngine {
                                     p.remove(slot);
                                 }
                             }
+                            // Doc coherence for derived shadows: the deferred
+                            // branch deliberately kept shadow fields (e.g.
+                            // isPublished) OUT of the stored doc so pre-
+                            // activation reads don't claim published. The
+                            // replay's diff_document now derives the shadow
+                            // BITMAP state (2026-07-08 fix); this writer keeps
+                            // the DOC in agreement, and the touched slots'
+                            // DocCache entries are evicted after the write
+                            // (flush-then-evict, same contract as #296).
+                            // (DocWriter lives in the pg-sync-gated ops_processor
+                            // module; the bitmap-side derivation below is
+                            // feature-independent, only this doc-coherence rider
+                            // is gated — prod always builds with pg-sync.)
+                            #[cfg(feature = "pg-sync")]
+                            let mut shadow_dw: Option<(
+                                crate::ops_processor::DocWriter,
+                                Vec<u32>,
+                            )> = None;
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1528,6 +1546,33 @@ impl ConcurrentEngine {
                                         let doc = crate::mutation::Document {
                                             fields: stored_doc.fields.clone(),
                                         };
+                                        #[cfg(feature = "pg-sync")]
+                                        {
+                                            let derived =
+                                                crate::mutation::derive_exists_boolean_shadows(
+                                                    &flush_config,
+                                                    &doc.fields,
+                                                );
+                                            if !derived.is_empty() {
+                                                let (dw, touched) =
+                                                    shadow_dw.get_or_insert_with(|| {
+                                                        (
+                                                            crate::ops_processor::DocWriter::new(
+                                                                std::sync::Arc::clone(&docstore),
+                                                            ),
+                                                            Vec::new(),
+                                                        )
+                                                    });
+                                                for (name, val) in &derived {
+                                                    dw.write_set(
+                                                        slot,
+                                                        name,
+                                                        &serde_json::json!(val),
+                                                    );
+                                                }
+                                                touched.push(slot);
+                                            }
+                                        }
                                         let ops = crate::mutation::diff_document(
                                             slot,
                                             None,
@@ -1549,6 +1594,16 @@ impl ConcurrentEngine {
                                         coalescer.push_ops(vec![
                                             MutationOp::AliveInsert { slots: vec![slot] },
                                         ]);
+                                    }
+                                }
+                            }
+                            drop(ds);
+                            #[cfg(feature = "pg-sync")]
+                            if let Some((mut dw, touched)) = shadow_dw.take() {
+                                dw.flush();
+                                if let Some(ref cache) = flush_doc_cache {
+                                    for slot in touched {
+                                        cache.remove(slot);
                                     }
                                 }
                             }
@@ -2805,6 +2860,23 @@ impl ConcurrentEngine {
                                 if extra > 0 {
                                     #[allow(unused_assignments)]
                                     { staging_dirty = true; }
+                                    // Deferred-map mutations drained by THIS
+                                    // path bypass the main loop's watermark
+                                    // accounting. Without this bump, every
+                                    // fan-out-barrier drain that carried a
+                                    // DeferredAlive/Cancel left
+                                    // deferred_applied_total permanently
+                                    // behind deferred_seq → the merge thread
+                                    // held WAL-cursor persistence forever
+                                    // (prod 2026-07-08: seq 1951 vs durable
+                                    // 1863, gap growing for 14h). The batch
+                                    // state persists after apply until the
+                                    // next prepare/flush, so the count is
+                                    // still readable here; the map persist +
+                                    // durable-watermark store happen at the
+                                    // same per-cycle site as always.
+                                    deferred_applied_total +=
+                                        coalescer.deferred_alive_count() as u64;
                                 }
                                 // Time-bucket maintenance for mutations drained HERE.
                                 // `coalescer.flush()` applies sort mutations to staging.sorts

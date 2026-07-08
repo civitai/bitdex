@@ -108,7 +108,7 @@ impl DocWriter {
     /// Clamps negative integers to 0 — sort fields (reactionCount, etc.) are
     /// unsigned in bitmaps; storing negatives in docstore would diverge from
     /// the bitmap value and confuse shadow-mode comparisons.
-    fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
+    pub(crate) fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
         let idx = match self.resolve_field(field) {
             Some(idx) => idx,
             None => return,
