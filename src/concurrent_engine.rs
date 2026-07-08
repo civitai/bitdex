@@ -4772,7 +4772,14 @@ impl ConcurrentEngine {
             Some(s) => s,
             None => return Ok(()), // no persistence configured
         };
-        let dict_dir = ms.root().join("dictionaries");
+        // Write where BOOT actually reads: `load_dictionaries(schema,
+        // bitmap_path)` probes `<bitmap_path>/dictionaries`, and ms.root() is
+        // `<bitmap_path>/shardstore` — the previous `ms.root().join(...)`
+        // target was a directory no load path ever consulted, so every
+        // steady-state dictionary persist was dead I/O and only fresh dumps
+        // (which write the correct dir) made dictionaries survive restarts
+        // (FOLLOWUP.md "LCS dictionary durability hole").
+        let dict_dir = Self::dictionaries_dir_for_meta_root(ms.root());
         for (name, dict) in self.dictionaries.iter() {
             if dict.is_dirty() {
                 let snap = dict.snapshot();
@@ -4784,34 +4791,77 @@ impl ConcurrentEngine {
         }
         Ok(())
     }
+    /// The canonical dictionaries directory (`<bitmap_path>/dictionaries`)
+    /// derived from the MetaStore root (`<bitmap_path>/shardstore`).
+    fn dictionaries_dir_for_meta_root(meta_root: &std::path::Path) -> std::path::PathBuf {
+        meta_root
+            .parent()
+            .unwrap_or(meta_root)
+            .join("dictionaries")
+    }
     /// Load dictionaries from disk for all LowCardinalityString fields in the schema.
     pub fn load_dictionaries(
         schema: &crate::config::DataSchema,
         dir: &std::path::Path,
     ) -> Result<HashMap<String, crate::dictionary::FieldDictionary>> {
         let dict_dir = dir.join("dictionaries");
+        // Legacy stray location: persist_dirty_dictionaries/save_snapshot
+        // historically wrote to <bitmap_path>/shardstore/dictionaries, which
+        // this loader never read (FOLLOWUP.md dictionary hole). Probe it as a
+        // fallback so any keys minted-and-persisted there before the path fix
+        // aren't abandoned; when both files exist, the one with the HIGHER max
+        // key wins (same lineage — the higher one is the superset).
+        let legacy_dir = dir.join("shardstore").join("dictionaries");
         let mut dicts = HashMap::new();
         for mapping in &schema.fields {
             if mapping.value_type == crate::config::FieldValueType::LowCardinalityString {
-                let path = dict_dir.join(format!("{}.dict", mapping.target));
-                match crate::dictionary::load_dictionary(&path) {
-                    Ok(Some(snap)) => {
+                let fname = format!("{}.dict", mapping.target);
+                let canonical = crate::dictionary::load_dictionary(&dict_dir.join(&fname))
+                    .map_err(|e| crate::error::BitdexError::Config(
+                        format!("Failed to load dictionary for '{}': {}", mapping.target, e),
+                    ))?;
+                // Legacy read is best-effort — a corrupt stray must not block boot.
+                let legacy = crate::dictionary::load_dictionary(&legacy_dir.join(&fname))
+                    .unwrap_or_default();
+                let max_key = |s: &crate::dictionary::DictionarySnapshot| {
+                    s.forward.values().copied().max().unwrap_or(0)
+                };
+                let chosen = match (canonical, legacy) {
+                    (Some(c), Some(l)) => {
+                        if max_key(&l) > max_key(&c) {
+                            eprintln!(
+                                "Dictionary '{}': legacy shardstore copy has newer keys \
+                                 ({} > {}) — using it",
+                                mapping.target, max_key(&l), max_key(&c)
+                            );
+                            Some(l)
+                        } else {
+                            Some(c)
+                        }
+                    }
+                    (Some(c), None) => Some(c),
+                    (None, Some(l)) => {
+                        eprintln!(
+                            "Dictionary '{}': found only the legacy shardstore copy — using it",
+                            mapping.target
+                        );
+                        Some(l)
+                    }
+                    (None, None) => None,
+                };
+                match chosen {
+                    Some(snap) => {
                         dicts.insert(
                             mapping.target.clone(),
                             crate::dictionary::FieldDictionary::from_snapshot(&snap),
                         );
                     }
-                    Ok(None) => {
+                    None => {
                         // No persisted dictionary — create empty
                         dicts.insert(
                             mapping.target.clone(),
                             crate::dictionary::FieldDictionary::new(),
                         );
-                    }
-                    Err(e) => {
-                        return Err(crate::error::BitdexError::Config(
-                            format!("Failed to load dictionary for '{}': {}", mapping.target, e),
-                        ));
                     }
                 }
             }
@@ -8946,10 +8996,13 @@ impl ConcurrentEngine {
             meta_s.write_cursor(name, value)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("write cursor: {e}")))?;
         }
-        // Save LowCardinalityString dictionaries alongside bitmaps.
+        // Save LowCardinalityString dictionaries alongside bitmaps — into the
+        // directory boot's load_dictionaries actually reads
+        // (<bitmap_path>/dictionaries, NOT <bitmap_path>/shardstore/…).
         if !self.dictionaries.is_empty() {
-            let dict_path = meta_s.root();
-            self.save_dictionaries(dict_path)?;
+            let dict_path = meta_s.root().parent().map(|p| p.to_path_buf())
+                .unwrap_or_else(|| meta_s.root().to_path_buf());
+            self.save_dictionaries(&dict_path)?;
         }
         Ok(())
     }
