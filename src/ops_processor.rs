@@ -2001,6 +2001,29 @@ fn apply_query_op_set<S: BitmapSink>(
         applied += 1;
     }
 
+    // Doc-cache coherence for fan-outs (stakeout 2026-07-08, specimen post
+    // 29660803): the WAL-reader loop evicts the DocCache by entry.entity_id,
+    // which for a queryOpSet is the SOURCE entity (e.g. Post.id) — the
+    // MATCHED slots' cached docs were never evicted, so GET /documents kept
+    // serving the stale pre-fan-out doc (publishedAt=0 / isPublished=false)
+    // for ~20+ minutes (LRU) on ~a third of recently-published posts' images,
+    // while bitmaps/search were already correct. Flush this fan-out's
+    // buffered doc writes FIRST, then evict exactly the matched slots —
+    // evict-before-flush would let a read between the two repopulate the
+    // cache from the still-old disk state. Per-fan-out eviction keeps the
+    // working set bounded (≤ max_fanout slots) instead of accumulating
+    // across the batch.
+    if applied > 0 {
+        if let Some(ref mut dw) = doc_writer {
+            dw.flush();
+        }
+        for &slot_id in slot_ids {
+            if (0..=u32::MAX as i64).contains(&slot_id) {
+                engine.evict_doc_cache(slot_id as u32);
+            }
+        }
+    }
+
     #[cfg(feature = "server")]
     if let Some(ref bridge) = metrics {
         bridge
@@ -2214,6 +2237,104 @@ mod tests {
             Ok(())
         }
     }
+    /// Regression (stakeout 2026-07-08, specimen post 29660803): a fan-out
+    /// mutates the MATCHED slots' docs, but the WAL-reader loop only evicts
+    /// the DocCache for the SOURCE entity_id (the Post) — so a previously
+    /// cached image doc kept serving the stale pre-fan-out state
+    /// (publishedAt=0/isPublished=false) for the LRU lifetime while
+    /// bitmaps/search were already correct. apply_query_op_set must flush its
+    /// doc writes and evict the matched slots itself.
+    #[test]
+    fn test_fanout_evicts_doc_cache_for_matched_slots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bitmap_path = dir.path().join("bitmaps"); // enables the DocCache
+        let docstore_path = dir.path().join("docs");
+
+        let mut config = test_config();
+        config.storage.bitmap_path = Some(bitmap_path);
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let image_slot: u32 = 7;
+        let post_id: i64 = 100;
+        let t_pub: i64 = 1_783_522_973;
+
+        // Insert the image (draft: no publishedAt), server-shaped.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: image_slot as i64,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(post_id) }],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, image_slot, 5_000);
+
+        // Cache the stale doc (cache-on-read), exactly like GET /documents.
+        let stale = engine.get_document(image_slot).unwrap().unwrap();
+        assert!(stale.fields.get("publishedAt").is_none());
+
+        // Post publishes → fan-out. Mimic the WAL-reader loop faithfully,
+        // including its (insufficient) source-entity eviction.
+        let mut sink2 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: post_id,
+            creates_slot: false,
+            ops: vec![Op::QueryOpSet {
+                query: Some(format!("postId eq {post_id}")),
+                ops: vec![Op::Set { field: "publishedAt".into(), value: json!(t_pub) }],
+            }],
+        }];
+        let (applied2, _, errors2) =
+            apply_ops_batch(&mut sink2, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        assert_eq!((applied2, errors2), (1, 0), "fan-out must match and apply");
+        crate::ingester::BitmapSink::flush(&mut sink2).unwrap();
+        dw2.flush();
+        engine.evict_doc_cache(post_id as u32); // the old loop's only eviction
+
+        // The very next read must see the fan-out's write — not the cached
+        // stale doc. (Fails before the fix: cache still holds the draft doc.)
+        let fresh = engine.get_document(image_slot).unwrap().unwrap();
+        assert_eq!(
+            fresh.fields.get("publishedAt"),
+            Some(&crate::mutation::FieldValue::Single(crate::types::Value::Integer(t_pub))),
+            "fan-out-mutated slot must serve the updated doc immediately"
+        );
+    }
+
+    /// Poll until the slot's alive bit is published.
+    fn wait_for_alive_slot(engine: &ConcurrentEngine, slot: u32, timeout_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_alive(slot) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("slot {slot} never became alive within {timeout_ms}ms");
+    }
+
     fn test_config() -> Config {
         let mut config = Config::default();
         config.filter_fields = vec![
