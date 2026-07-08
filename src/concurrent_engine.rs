@@ -45,6 +45,10 @@ pub struct MetricsBridge {
     /// queryOpSet rejection counter (issue #60). Label `reason="fanout_too_wide"`
     /// when fan-out exceeds `BITDEX_QUERY_OP_SET_MAX_FANOUT`.
     pub query_op_set_rejected_total: prometheus::IntCounterVec,
+    /// queryOpSet fan-outs that matched ZERO slots. Post-boot rate spike =
+    /// silent no-op signature (specimen 136063341; FOLLOWUP.md). Labels:
+    /// index, field (filter field name, low-cardinality).
+    pub query_op_set_zero_match_total: prometheus::IntCounterVec,
     /// Cumulative slot mutations from queryOpSet fan-outs. Sums to total work
     /// the WAL reader has done across all queryOpSets; not the same as the
     /// `applied` count returned per call.

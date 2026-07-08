@@ -1721,6 +1721,32 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
     }
     (checked, healed)
 }
+/// Field-name label for the zero-match fan-out counter. Low-cardinality by
+/// construction: the field NAME of the clause (never the value), recursing
+/// into the first leaf of compound clauses.
+#[cfg(feature = "server")]
+fn zero_match_field_label(clause: &crate::query::FilterClause) -> String {
+    use crate::query::FilterClause as FC;
+    match clause {
+        FC::Eq(f, _)
+        | FC::NotEq(f, _)
+        | FC::In(f, _)
+        | FC::NotIn(f, _)
+        | FC::Gt(f, _)
+        | FC::Lt(f, _)
+        | FC::Gte(f, _)
+        | FC::Lte(f, _)
+        | FC::IsNull(f)
+        | FC::IsNotNull(f) => f.clone(),
+        FC::BucketBitmap { field, .. } => field.clone(),
+        FC::Not(inner) => zero_match_field_label(inner),
+        FC::And(cs) | FC::Or(cs) => cs
+            .first()
+            .map(zero_match_field_label)
+            .unwrap_or_else(|| "none".to_string()),
+    }
+}
+
 /// Resolve a queryOpSet: execute the query to get matching slots,
 /// then apply the nested ops to each matching slot via the BitmapSink.
 ///
@@ -1738,6 +1764,13 @@ fn apply_query_op_set<S: BitmapSink>(
     mut doc_writer: Option<&mut DocWriter>,
 ) -> std::result::Result<usize, String> {
     let filters = parse_filter_from_query_str(query_str)?;
+    // Field label for the zero-match counter, captured before `filters` moves
+    // into the query. Metric labels must be low-cardinality: field NAME only.
+    #[cfg(feature = "server")]
+    let zero_match_field: String = filters
+        .first()
+        .map(zero_match_field_label)
+        .unwrap_or_else(|| "none".to_string());
     let query = BitdexQuery {
         filters,
         sort: None,
@@ -1801,6 +1834,26 @@ fn apply_query_op_set<S: BitmapSink>(
     }
 
     if slot_ids.is_empty() {
+        // Zero-match fan-out: indistinguishable here from a legitimately
+        // empty target (post with no images yet), so it must not fail — but
+        // it is also the exact signature of the silent no-op class (specimen
+        // 136063341: a fan-out that matched nothing on a freshly-dumped pod
+        // while PG had matching rows; suspected per-value lazy-load
+        // shadowing sync-created diffs — see FOLLOWUP.md). Count it, labeled
+        // by filter field, and log at info so a post-boot spike is
+        // attributable to a query shape without extra instrumentation.
+        tracing::info!(
+            target: "ops_processor",
+            "queryOpSet '{}' matched 0 slots — applied nothing",
+            query_str,
+        );
+        #[cfg(feature = "server")]
+        if let Some(ref bridge) = metrics {
+            bridge
+                .query_op_set_zero_match_total
+                .with_label_values(&[&bridge.index_name, &zero_match_field])
+                .inc();
+        }
         return Ok(0);
     }
     let dictionaries = Some(engine.dictionaries());

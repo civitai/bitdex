@@ -260,6 +260,15 @@ pub struct Metrics {
     /// distinguish narrow (postId-eq, ~1 slot) from wide (nsfwLevel-eq, millions)
     /// at the work-unit level rather than the API-call level.
     pub query_op_set_applied_slots_total: IntCounterVec,
+    /// Counter of queryOpSet fan-outs whose filter matched ZERO slots. A
+    /// zero-match is indistinguishable from a legitimately empty target (e.g.
+    /// a post with no images), so it can't hard-fail — but a rate spike,
+    /// especially right after boot on a freshly-dumped pod, is the signature
+    /// of the silent no-op class (specimen 136063341, 2026-07-08: suspected
+    /// per-value lazy-load shadowing sync-created diffs; see FOLLOWUP.md).
+    /// Labeled by the field name of the fan-out's filter so postId-shaped
+    /// misses stand out from legitimately-sparse fields.
+    pub query_op_set_zero_match_total: IntCounterVec,
 
     // -- 11c CPU floor attribution (2026-04-30) --
     /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
@@ -1172,6 +1181,14 @@ impl Metrics {
             &["index", "reason"],
         )
         .unwrap();
+        let query_op_set_zero_match_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_op_set_zero_match_total",
+                "queryOpSet fan-outs whose filter matched zero slots (silent no-op signature when spiking post-boot)",
+            ),
+            &["index", "field"],
+        )
+        .unwrap();
         let query_op_set_applied_slots_total = IntCounterVec::new(
             Opts::new(
                 "bitdex_query_op_set_applied_slots_total",
@@ -1425,6 +1442,7 @@ impl Metrics {
         registry.register(Box::new(bitmap_mem_scan_tick_seconds.clone())).unwrap();
         registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
         registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
+        registry.register(Box::new(query_op_set_zero_match_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
@@ -1575,6 +1593,7 @@ impl Metrics {
             query_op_set_fanout_size,
             query_op_set_rejected_total,
             query_op_set_applied_slots_total,
+            query_op_set_zero_match_total,
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,
