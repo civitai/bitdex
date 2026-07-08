@@ -59,9 +59,13 @@ CI-validated via a `trigger_gen::trigger_name` hash-equality gate against the li
 
 ## Observability gaps (carried from #289/#291)
 
-- `bitdex_fanout_barrier_skips_total`, `bitdex_query_op_set_zero_match_total` (#292), and
-  `time_bucket_*` not in prod `enabled_metrics` allowlist.
-- Prometheus does not scrape bitdex directly (audit-proxy measurements only).
+- CORRECTED 2026-07-08 (Sky): `enabled_metrics`/`disabled_metrics` gate only the 3 expensive
+  scrape-time groups (bitmap_memory, eviction_stats, boundstore_disk); all counters emit
+  unconditionally, and the PodMonitor now scrapes /metrics — so `zero_match_total` (#292) and
+  `time_bucket_*` are live as of the v1.1.29 roll with NO manifest change.
+- `bitdex_fanout_barrier_skips_total` NEVER EXISTED — aspirational comment only
+  (ops_processor.rs:872). Barrier-timeout skips today surface as errors, not a counter;
+  decide post-overhaul whether to add it (fan-out intents make skips retryable anyway).
 - Post-overhaul drift metric (doc-sampling sweep hit counter) MUST be allowlisted from day
   one (review finding F6c).
 
