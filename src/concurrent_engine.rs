@@ -1534,11 +1534,26 @@ impl ConcurrentEngine {
                             // module; the bitmap-side derivation below is
                             // feature-independent, only this doc-coherence rider
                             // is gated — prod always builds with pg-sync.)
+                            // DEADLOCK GUARD (v1.1.31 boot hang, 2026-07-08):
+                            // DocWriter::new takes docstore.read() itself.
+                            // Constructing it lazily INSIDE the `ds` read scope
+                            // below self-deadlocked whenever the merge thread's
+                            // doc-compaction write() queued between the two
+                            // reads (parking_lot read locks are not recursive
+                            // under a queued writer) — the flush thread hung at
+                            // boot-time activation and the server never bound.
+                            // Construct it BEFORE taking `ds`, unconditionally;
+                            // an idle writer with no pending ops costs nothing.
                             #[cfg(feature = "pg-sync")]
-                            let mut shadow_dw: Option<(
+                            let mut shadow_dw: (
                                 crate::ops_processor::DocWriter,
                                 Vec<u32>,
-                            )> = None;
+                            ) = (
+                                crate::ops_processor::DocWriter::new(
+                                    std::sync::Arc::clone(&docstore),
+                                ),
+                                Vec::new(),
+                            );
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1554,15 +1569,7 @@ impl ConcurrentEngine {
                                                     &doc.fields,
                                                 );
                                             if !derived.is_empty() {
-                                                let (dw, touched) =
-                                                    shadow_dw.get_or_insert_with(|| {
-                                                        (
-                                                            crate::ops_processor::DocWriter::new(
-                                                                std::sync::Arc::clone(&docstore),
-                                                            ),
-                                                            Vec::new(),
-                                                        )
-                                                    });
+                                                let (dw, touched) = (&mut shadow_dw.0, &mut shadow_dw.1);
                                                 for (name, val) in &derived {
                                                     dw.write_set(
                                                         slot,
@@ -1599,11 +1606,14 @@ impl ConcurrentEngine {
                             }
                             drop(ds);
                             #[cfg(feature = "pg-sync")]
-                            if let Some((mut dw, touched)) = shadow_dw.take() {
-                                dw.flush();
-                                if let Some(ref cache) = flush_doc_cache {
-                                    for slot in touched {
-                                        cache.remove(slot);
+                            {
+                                let (mut dw, touched) = shadow_dw;
+                                if !touched.is_empty() {
+                                    dw.flush();
+                                    if let Some(ref cache) = flush_doc_cache {
+                                        for slot in touched {
+                                            cache.remove(slot);
+                                        }
                                     }
                                 }
                             }
