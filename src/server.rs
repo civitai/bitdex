@@ -1367,6 +1367,14 @@ impl BitdexServer {
                         }
                     };
                     let mut reader = crate::ops_wal::WalReader::new(&wal_dir, cursor);
+                    // Highest gen for which retention (deletion of older gens)
+                    // has run, keyed to the persisted cursor — see the
+                    // retention block in the batch loop.
+                    let mut last_retention_gen: u32 = cursor.generation;
+                    // Boot-time cleanup: gens strictly below the boot cursor are
+                    // fully consumed AND durable (the boot cursor IS the persisted
+                    // one) — safe to delete immediately.
+                    reader.delete_gens_below(cursor.generation);
                     eprintln!("WAL reader started (cursor={}:{}, dir={})", cursor.generation, cursor.offset, wal_dir.display());
 
                     // Overdue-deferred sweep timer (audit 2026-07-07 fix A4).
@@ -1475,6 +1483,27 @@ impl BitdexServer {
                                         "wal-reader".to_string(),
                                         cursor.serialize(),
                                     );
+
+                                    // WAL retention: delete gen files strictly below the
+                                    // DURABLY-PERSISTED cursor's generation — never the
+                                    // reader's in-memory position, which runs up to a
+                                    // merge cycle ahead. Deleting on the reader's gen hop
+                                    // (the old behavior) opened a crash window where boot
+                                    // loaded a durable cursor into a deleted gen and
+                                    // silently skipped every op to that gen's end
+                                    // (FOLLOWUP.md P1). Throttled: only when the reader
+                                    // has moved past previously-retained gens.
+                                    if cursor.generation > last_retention_gen {
+                                        if let Some(persisted) = engine
+                                            .load_persisted_cursor("wal-reader")
+                                            .map(|v| crate::ops_wal::WalCursor::parse(&v))
+                                        {
+                                            if persisted.generation > last_retention_gen {
+                                                reader.delete_gens_below(persisted.generation);
+                                                last_retention_gen = persisted.generation;
+                                            }
+                                        }
+                                    }
 
                                     // Update metrics
                                     let m = &wal_state.metrics;

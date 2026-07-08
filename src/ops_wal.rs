@@ -263,7 +263,6 @@ impl WalReader {
             let flen = fs::metadata(&fp)?.len();
             if self.cursor.offset >= flen {
                 if let Some(g) = self.next_gen() {
-                    self.delete_consumed();
                     self.cursor = WalCursor::new(g, 0);
                     continue;
                 }
@@ -282,7 +281,6 @@ impl WalReader {
             let flen = fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
             if self.cursor.offset >= flen {
                 if let Some(g) = self.next_gen() {
-                    self.delete_consumed();
                     self.cursor = WalCursor::new(g, 0);
                     continue;
                 }
@@ -300,7 +298,6 @@ impl WalReader {
                         flen.saturating_sub(self.cursor.offset),
                         g,
                     );
-                    self.delete_consumed();
                     self.cursor = WalCursor::new(g, 0);
                     continue;
                 }
@@ -368,12 +365,26 @@ impl WalReader {
         list_generations(&self.dir).into_iter().find(|&g| g > self.cursor.generation)
     }
 
-    fn delete_consumed(&self) {
-        let p = gen_path(&self.dir, self.cursor.generation);
-        if p.exists() {
-            match fs::remove_file(&p) {
-                Ok(_) => eprintln!("WAL cleanup: deleted gen {} ({})", self.cursor.generation, p.display()),
-                Err(e) => eprintln!("WAL cleanup: failed to delete {}: {e}", p.display()),
+    /// Delete WAL generation files strictly BELOW `durable_gen`.
+    ///
+    /// Retention is keyed to the DURABLE (persisted) cursor, never the
+    /// reader's in-memory position: the merge thread persists the cursor up
+    /// to a cycle later than the reader advances it, so deleting a gen the
+    /// moment the reader hops past it (the old `delete_consumed` behavior)
+    /// left a crash window where boot loaded a durable cursor pointing INTO
+    /// a deleted gen and silently skipped to the next gen at offset 0 —
+    /// every op between the durable cursor and the deleted gen's end became
+    /// unreplayable (FOLLOWUP.md P1, found by adversarial design review
+    /// 2026-07-08). The caller (WAL-reader loop, which owns the engine
+    /// handle) passes the generation of the last DURABLY-persisted cursor.
+    pub fn delete_gens_below(&self, durable_gen: u32) {
+        for g in list_generations(&self.dir) {
+            if g < durable_gen {
+                let p = gen_path(&self.dir, g);
+                match fs::remove_file(&p) {
+                    Ok(_) => eprintln!("WAL cleanup: deleted gen {g} ({})", p.display()),
+                    Err(e) => eprintln!("WAL cleanup: failed to delete {}: {e}", p.display()),
+                }
             }
         }
     }
@@ -467,8 +478,14 @@ mod tests {
         assert_eq!(res.entries.len(), 2);
     }
 
+    /// Regression (FOLLOWUP.md P1, 2026-07-08): reading past a generation
+    /// must NOT delete it. Retention is keyed to the durably-persisted cursor
+    /// via `delete_gens_below`; the reader's in-memory position can run a
+    /// merge cycle ahead, and the old read-time deletion opened a crash
+    /// window where boot loaded a durable cursor pointing into a deleted gen
+    /// and silently skipped every op to that gen's end.
     #[test]
-    fn cleanup() {
+    fn cleanup_is_gated_on_durable_cursor_not_read_position() {
         let d = TempDir::new().unwrap();
         let w = WalWriter::with_rotation_size(d.path(), 50);
         let big = ops(1, vec![Op::Set {
@@ -482,11 +499,38 @@ mod tests {
         let before = list_generations(d.path());
         assert!(before.len() >= 2);
 
+        // Reader consumes EVERYTHING, hopping across all generations. The
+        // durable cursor (not modeled here) may still point at gen 0 — so
+        // nothing may be deleted by reading alone.
         let mut r = WalReader::new(d.path(), WalCursor::new(before[0], 0));
-        r.read_batch(100).unwrap();
+        let consumed = r.read_batch(100).unwrap();
+        assert_eq!(consumed.entries.len(), 3);
+        assert_eq!(
+            list_generations(d.path()),
+            before,
+            "reading must not delete any generation"
+        );
 
+        // Crash simulation: boot resumes from a DURABLE cursor still in the
+        // first gen — every op must still be readable.
+        let mut boot = WalReader::new(d.path(), WalCursor::new(before[0], 0));
+        let replay = boot.read_batch(100).unwrap();
+        assert_eq!(
+            replay.entries.len(),
+            3,
+            "ops between the durable cursor and the read position must remain replayable"
+        );
+
+        // Retention keyed to the durable cursor: durable cursor now in the
+        // LAST gen → everything below it may go, the last gen must stay.
+        let last = *before.last().unwrap();
+        r.delete_gens_below(last);
         let after = list_generations(d.path());
-        assert!(after.len() < before.len(), "consumed files should be deleted");
+        assert_eq!(after, vec![last], "only gens below the durable cursor are deleted");
+
+        // Idempotent + never deletes at-or-above the given gen.
+        r.delete_gens_below(last);
+        assert_eq!(list_generations(d.path()), vec![last]);
     }
 
     #[test]

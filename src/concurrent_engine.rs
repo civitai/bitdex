@@ -7947,6 +7947,15 @@ impl ConcurrentEngine {
     pub fn get_cursor(&self, name: &str) -> Option<String> {
         self.cursors.lock().get(name).cloned()
     }
+    /// Get a named cursor's DURABLY-PERSISTED value (from MetaStore, not the
+    /// in-memory map). The in-memory value can run up to a merge cycle ahead
+    /// of what a post-crash boot would load — retention decisions (e.g. WAL
+    /// gen deletion) must key on this, never on `get_cursor`.
+    pub fn load_persisted_cursor(&self, name: &str) -> Option<String> {
+        self.meta_store
+            .as_ref()
+            .and_then(|ms| ms.load_cursor(name).ok().flatten())
+    }
     /// Get all named cursors.
     pub fn get_all_cursors(&self) -> HashMap<String, String> {
         self.cursors.lock().clone()
