@@ -1525,35 +1525,28 @@ impl ConcurrentEngine {
                             // branch deliberately kept shadow fields (e.g.
                             // isPublished) OUT of the stored doc so pre-
                             // activation reads don't claim published. The
-                            // replay's diff_document now derives the shadow
-                            // BITMAP state (2026-07-08 fix); this writer keeps
-                            // the DOC in agreement, and the touched slots'
-                            // DocCache entries are evicted after the write
-                            // (flush-then-evict, same contract as #296).
-                            // (DocWriter lives in the pg-sync-gated ops_processor
-                            // module; the bitmap-side derivation below is
-                            // feature-independent, only this doc-coherence rider
-                            // is gated — prod always builds with pg-sync.)
-                            // DEADLOCK GUARD (v1.1.31 boot hang, 2026-07-08):
-                            // DocWriter::new takes docstore.read() itself.
-                            // Constructing it lazily INSIDE the `ds` read scope
-                            // below self-deadlocked whenever the merge thread's
-                            // doc-compaction write() queued between the two
-                            // reads (parking_lot read locks are not recursive
-                            // under a queued writer) — the flush thread hung at
-                            // boot-time activation and the server never bound.
-                            // Construct it BEFORE taking `ds`, unconditionally;
-                            // an idle writer with no pending ops costs nothing.
+                            // replay's diff_document derives the shadow BITMAP
+                            // state; the buffered writes below keep the DOC in
+                            // agreement and evict the touched slots' DocCache
+                            // entries (flush-then-evict, #296 contract).
+                            //
+                            // HARD LOCK RULE (v1.1.31/v1.1.32 boot hang — the
+                            // deterministic repro is tests/boot_activation_hang.rs):
+                            // NO DocWriter call may run while this thread holds a
+                            // docstore guard. DocWriter::new takes docstore.read(),
+                            // and write_set's resolve_field takes docstore.WRITE()
+                            // on a field-dict miss (ensure_field_index) — a shadow
+                            // target that no stored doc has ever carried (deferred
+                            // drafts never get their shadow written, by design)
+                            // therefore self-deadlocked the flush thread inside the
+                            // `ds` read scope, and boot blocked forever behind the
+                            // queued write in set_docstore_defaults (the missing
+                            // "dictionary_load" line in prod). So: collect the
+                            // derived pairs inside the read scope, and do ALL doc
+                            // writing strictly after `drop(ds)`.
                             #[cfg(feature = "pg-sync")]
-                            let mut shadow_dw: (
-                                crate::ops_processor::DocWriter,
-                                Vec<u32>,
-                            ) = (
-                                crate::ops_processor::DocWriter::new(
-                                    std::sync::Arc::clone(&docstore),
-                                ),
-                                Vec::new(),
-                            );
+                            let mut shadow_writes: Vec<(u32, Vec<(String, bool)>)> =
+                                Vec::new();
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1569,15 +1562,9 @@ impl ConcurrentEngine {
                                                     &doc.fields,
                                                 );
                                             if !derived.is_empty() {
-                                                let (dw, touched) = (&mut shadow_dw.0, &mut shadow_dw.1);
-                                                for (name, val) in &derived {
-                                                    dw.write_set(
-                                                        slot,
-                                                        name,
-                                                        &serde_json::json!(val),
-                                                    );
-                                                }
-                                                touched.push(slot);
+                                                // Buffer only — doc writes happen
+                                                // after drop(ds); see lock rule above.
+                                                shadow_writes.push((slot, derived));
                                             }
                                         }
                                         let ops = crate::mutation::diff_document(
@@ -1605,15 +1592,27 @@ impl ConcurrentEngine {
                                 }
                             }
                             drop(ds);
+                            // All docstore interaction (DocWriter construction,
+                            // field resolution incl. its lazy ensure_field_index
+                            // write lock, batch append) happens HERE, with no
+                            // docstore guard held on this thread.
                             #[cfg(feature = "pg-sync")]
-                            {
-                                let (mut dw, touched) = shadow_dw;
-                                if !touched.is_empty() {
-                                    dw.flush();
-                                    if let Some(ref cache) = flush_doc_cache {
-                                        for slot in touched {
-                                            cache.remove(slot);
-                                        }
+                            if !shadow_writes.is_empty() {
+                                let mut dw = crate::ops_processor::DocWriter::new(
+                                    std::sync::Arc::clone(&docstore),
+                                );
+                                let mut touched: Vec<u32> =
+                                    Vec::with_capacity(shadow_writes.len());
+                                for (slot, derived) in &shadow_writes {
+                                    for (name, val) in derived {
+                                        dw.write_set(*slot, name, &serde_json::json!(val));
+                                    }
+                                    touched.push(*slot);
+                                }
+                                dw.flush();
+                                if let Some(ref cache) = flush_doc_cache {
+                                    for slot in touched {
+                                        cache.remove(slot);
                                     }
                                 }
                             }
