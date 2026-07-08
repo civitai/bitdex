@@ -147,14 +147,36 @@ impl DictionarySnapshot {
     }
 }
 
-/// Save a dictionary snapshot to a JSON file.
+/// Save a dictionary snapshot to a JSON file — atomically and durably.
+///
+/// Write-tmp → fsync → rename-over. The previous bare `fs::write` could be
+/// torn by a crash, and an un-fsynced write could vanish entirely — either
+/// way boot would reload a stale dictionary and `from_snapshot`'s
+/// `next_key = max + 1` would RE-ISSUE keys already referenced by docs and
+/// filter bitmaps on disk, silently aliasing two distinct strings to one key
+/// forever (FOLLOWUP.md "LCS dictionary durability hole", 2026-07-08).
 pub fn save_dictionary(snapshot: &DictionarySnapshot, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dict dir: {e}"))?;
     }
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("serialize dict: {e}"))?;
-    std::fs::write(path, json).map_err(|e| format!("write dict: {e}"))?;
+    let tmp = path.with_extension("dict.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create dict tmp: {e}"))?;
+        use std::io::Write as _;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("write dict tmp: {e}"))?;
+        f.sync_data().map_err(|e| format!("fsync dict tmp: {e}"))?;
+    }
+    // Windows can't rename over an existing file; prod (Linux) rename is
+    // atomic either way. remove+rename leaves a torn window only on Windows
+    // dev boxes, never in prod.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename dict into place: {e}"))?;
     Ok(())
 }
 
@@ -268,6 +290,38 @@ mod tests {
         assert_eq!(dict2.get("hello"), dict.get("hello"));
         assert_eq!(dict2.get("world"), dict.get("world"));
         assert_eq!(loaded.originals.get("hello"), Some(&"Hello".to_string()));
+    }
+
+    /// save_dictionary must atomically replace an existing file (tmp + fsync +
+    /// rename) and leave no tmp litter — the old bare fs::write could tear or
+    /// vanish on crash, and boot's next_key = max+1 then re-issues on-disk-
+    /// referenced keys to different strings (FOLLOWUP.md dictionary hole).
+    #[test]
+    fn test_save_dictionary_atomic_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("field.dict");
+
+        let dict = FieldDictionary::new();
+        dict.get_or_insert("First");
+        save_dictionary(&dict.snapshot(), &path).unwrap();
+
+        // Overwrite with a grown snapshot (Windows rename-over path included).
+        dict.get_or_insert("Second");
+        dict.get_or_insert("Third");
+        save_dictionary(&dict.snapshot(), &path).unwrap();
+
+        let loaded = load_dictionary(&path).unwrap().unwrap();
+        assert_eq!(loaded.forward.len(), 3);
+        assert!(
+            !path.with_extension("dict.tmp").exists(),
+            "tmp file must not survive a successful save"
+        );
+
+        // Reopen: next key must continue past everything persisted.
+        let reopened = FieldDictionary::from_snapshot(&loaded);
+        let k_new = reopened.get_or_insert("Fourth");
+        let max_persisted = loaded.forward.values().copied().max().unwrap();
+        assert!(k_new > max_persisted, "no key re-issue after reload");
     }
 
     #[test]
