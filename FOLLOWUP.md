@@ -93,3 +93,14 @@ Every fresh dump+load takes exactly one self-healing OOMKill (exit 137) at load 
 the 40Gi limit (both pods reproduced during the 2026-07-08 v1.1.28 full nuke, ~15-30s
 recovery via skip-dump restart). Bump the bitdex container limit to 48Gi in talos-infra to
 make fresh loads restart-free. Owner: ava/infra; non-urgent.
+
+## Flux ImagePolicy footgun (from 2026-07-08 incident, ava)
+
+The bitdex ImagePolicy range is a wide `>=1.0.0`. Currently INERT — bitdex's deployment.yaml
+has no `$imagepolicy` setter markers (manual-bump only), so the ImageUpdateAutomation cannot
+rewrite the image lines. But if anyone ever adds a setter marker, the wide range would
+happily auto-pin known-bad tags (e.g. the dead 1.1.31/1.1.32 boot-hang builds). Before any
+marker is added: floor/pin the policy range or add known-bad exclusions. Also from the same
+incident, the durable emergency sequence: SUSPEND the Flux Kustomization FIRST, then
+kubectl set image, then bounce pods, then git revert PR, resume Flux only when cleared —
+set-image-then-bounce without the suspend recreates deleted pods on Flux's (bad) spec.
