@@ -25,30 +25,28 @@ point into the deleted gen; boot then silently skipped to the next gen at offset
 unreplayable gap. Fixed: reading never deletes; the WAL-reader loop deletes gens strictly
 below the durably-persisted cursor's generation. Regression test simulates the crash window.
 
-## Fan-out silent no-op on fresh pods — LAZY-SHADOW HYPOTHESIS (P1-adjacent, 2026-07-08)
+## Fan-out silent no-op — MECHANISM PINNED (stakeout 2026-07-08): DocCache evicts wrong slots
 
-Live specimen 136063341: image inserted on draft post 02:42:41, post 29651893 published
-02:42:51, Post→Image fan-out never applied (pub=0/isPub=false) on BOTH pods. Ruled OUT by
-logs: barrier-timeout skip, fan-out cap reject. Residual: trigger-no-emit vs silent 0-match;
-BitdexOps cleanup ate the row, so the split needs a catch-in-the-act repro.
+**Verdict (catch-in-the-act stakeout, specimen post 29660803):** NOT trigger-no-emit, NOT
+zero-match, NOT lazy-shadow (refuted by PR #295's test suite). The Post trigger emits, the
+fan-out applies to bitmaps correctly and writes the docstore on disk — but the WAL-reader
+loop evicts the DocCache by `entry.entity_id` (the Post), never the MATCHED image slots, so
+`GET /documents/{image}` serves the stale pre-fan-out doc (publishedAt=0/isPublished=false)
+for ~20+ min until LRU eviction. Search/bitmaps unaffected. Stakeout sizing (n=80 recently
+published posts): 25/80 doc-cache staleness (served-doc only), 2/80 TRUE bitmap miss
+(separate residual, below). **FIX: this branch** — `apply_query_op_set` flushes its doc
+writes and evicts the matched slot set itself (regression test proves it bites).
 
-**Prime suspect: lazy-shadow.** The post was created AFTER both dumps, so its postId value
-bitmap existed only as an in-memory sync diff; if the fan-out's queryOpSet lazy-loads the
-NONEXISTENT disk shard and the empty result shadows the diff, the query deterministically
-matches 0 on every fresh pod — same family as the known collectionIds shadowing gotcha.
-Identical behavior at 17min vs 87min post-dump fits deterministic-shadow, not a timing race.
+**Zero-match counter (#292) = red herring for this class:** ~46% of postId fan-outs
+legitimately match 0 (draft-post INSERT fan-out firing before any image exists). Publish
+fan-outs don't zero-match. Keep the counter, read it with that baseline.
 
-**Repro / split:** tail BitdexOps during a draft→publish, capture the queryOpSet row before
-cleanup, inspect engine-side match count: no row = trigger-no-emit; row + 0 match on a value
-PG says has rows = shadow (check whether the value's disk shard exists).
-
-**Interim mitigations:** (a) fix per-value lazy load to MERGE, not shadow, in-memory diffs
-when the disk shard is missing (collectionIds fix pattern); (b) zero-match fan-out counter —
-SHIPPED (#292), needs prod enabled_metrics allowlisting at next deploy; (c) optionally warm
-postId value shards at dump completion before `.ready`.
-
-**Structural fix:** overhaul's durable fan-out intents + forced value-shard load
-(write-pipeline-overhaul.md §2 fan-out axis).
+**REMAINING OPEN — true bitmap-miss residual (~2.5% of publishes in the sample):** posts
+29660027 (16 imgs) + 29660973 (1 img) had isPublished bitmap=0 with a captured fan-out row —
+a real engine-side apply miss, mechanism unknown. Re-arm the stakeout trap (tables retained:
+bitdex_fanout_capture / bitdex_post_publish_capture / bitdex_zm_log; script /tmp/trap.sql in
+pod bitdex-psql) and hunt with pod logs around the captured rows' created_at. The overhaul's
+durable fan-out intents cover this class structurally.
 
 ## Sync-config canonical source (from 2026-07-08 nuke op)
 
