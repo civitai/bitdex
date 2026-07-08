@@ -51,6 +51,12 @@ pub trait BitmapSink {
     /// is deferred until `activate_at` (seconds since epoch).
     fn deferred_alive(&mut self, slot: u32, activate_at: u64);
 
+    /// Cancel a pending deferred activation (remove the slot from the
+    /// deferred map). Emitted when a deferred, not-yet-alive slot is deleted
+    /// so a later `activate_due` cannot resurrect it. Default no-op: only the
+    /// steady-state coalescer path maintains a live deferred map.
+    fn deferred_cancel(&mut self, _slot: u32) {}
+
     /// Flush any buffered operations. Called after a batch of ingestions.
     fn flush(&mut self) -> Result<()>;
 }
@@ -116,6 +122,10 @@ impl BitmapSink for CoalescerSink {
             slot,
             activate_at,
         });
+    }
+
+    fn deferred_cancel(&mut self, slot: u32) {
+        self.pending.push(MutationOp::DeferredCancel { slot });
     }
 
     fn alive_remove(&mut self, slot: u32) {

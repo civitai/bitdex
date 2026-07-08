@@ -118,6 +118,11 @@ pub enum MutationOp {
     /// The slot's filter/sort bitmaps are set immediately, but the alive bit
     /// is deferred until `activate_at` (seconds since epoch).
     DeferredAlive { slot: u32, activate_at: u64 },
+    /// Remove a slot from the deferred map (all activation keys). Emitted when
+    /// a deferred (not-yet-alive) slot is deleted so a later `activate_due`
+    /// cannot resurrect it. Applied before any `DeferredAlive` in the same
+    /// batch, so a delete+re-insert batch nets out to the re-insert's schedule.
+    DeferredCancel { slot: u32 },
 }
 /// Key for grouping filter operations by target bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -143,7 +148,12 @@ pub struct WriteBatch {
     sort_clears: HashMap<SortGroupKey, Vec<u32>>,
     alive_inserts: Vec<u32>,
     alive_removes: Vec<u32>,
-    deferred_alive: Vec<(u32, u64)>,
+    /// Deferred-map mutations in ORIGINAL arrival order: `Some(at)` =
+    /// schedule, `None` = cancel. Order matters — cancel and schedule are not
+    /// commutative (a reschedule followed by a delete must end cancelled; a
+    /// delete followed by a re-insert must end scheduled), so these are never
+    /// grouped by type like the bitmap ops above.
+    deferred_muts: Vec<(u32, Option<u64>)>,
 }
 impl WriteBatch {
     pub fn new() -> Self {
@@ -155,7 +165,7 @@ impl WriteBatch {
             sort_clears: HashMap::new(),
             alive_inserts: Vec::new(),
             alive_removes: Vec::new(),
-            deferred_alive: Vec::new(),
+            deferred_muts: Vec::new(),
         }
     }
     /// Push a list of ops directly (used by deferred alive activation in the flush thread).
@@ -185,7 +195,7 @@ impl WriteBatch {
         self.sort_clears.clear();
         self.alive_inserts.clear();
         self.alive_removes.clear();
-        self.deferred_alive.clear();
+        self.deferred_muts.clear();
         for op in self.ops.drain(..) {
             match op {
                 MutationOp::FilterInsert { field, value, slots } => {
@@ -227,7 +237,10 @@ impl WriteBatch {
                     self.alive_removes.extend(slots);
                 }
                 MutationOp::DeferredAlive { slot, activate_at } => {
-                    self.deferred_alive.push((slot, activate_at));
+                    self.deferred_muts.push((slot, Some(activate_at)));
+                }
+                MutationOp::DeferredCancel { slot } => {
+                    self.deferred_muts.push((slot, None));
                 }
             }
         }
@@ -252,9 +265,10 @@ impl WriteBatch {
     pub fn has_alive_mutations(&self) -> bool {
         !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
     }
-    /// Returns true if this batch contains deferred alive entries.
+    /// Returns true if this batch contains deferred-map mutations
+    /// (schedules or cancels).
     pub fn has_deferred_alive(&self) -> bool {
-        !self.deferred_alive.is_empty()
+        !self.deferred_muts.is_empty()
     }
     /// Extract filter mutations for Tier 2 fields before apply.
     ///
@@ -414,9 +428,15 @@ impl WriteBatch {
         for &slot in &self.alive_removes {
             slots.alive_remove_one(slot);
         }
-        // Schedule deferred alive activations
-        for &(slot, activate_at) in &self.deferred_alive {
-            slots.schedule_alive(slot, activate_at);
+        // Deferred-map maintenance in ORIGINAL arrival order — last mutation
+        // per slot wins (schedule_alive dedupes any prior key for the slot).
+        // Replaying by type instead would make "reschedule then delete"
+        // incorrectly end scheduled.
+        for &(slot, mutation) in &self.deferred_muts {
+            match mutation {
+                Some(activate_at) => slots.schedule_alive(slot, activate_at),
+                None => slots.cancel_deferred(slot),
+            }
         }
         t.alive_ns = t0.elapsed().as_nanos() as u64;
 
@@ -458,15 +478,71 @@ impl Default for WriteBatch {
 #[derive(Clone)]
 pub struct MutationSender {
     tx: Sender<MutationOp>,
+    /// Monotone count of deferred-MAP mutations (`DeferredAlive` AND
+    /// `DeferredCancel`) ever submitted through any clone of this sender.
+    /// Bumped BEFORE the channel send so that a producer that subsequently
+    /// advances a durable cursor (e.g. the WAL reader) is guaranteed
+    /// `deferred_seq >= its op's tick` at cursor-advance time. The flush
+    /// thread pairs this with `deferred_durable_seq` (advanced only after the
+    /// deferred map is fsynced to MetaStore); the merge thread refuses to
+    /// persist WAL cursors while the two diverge. Cancels count too — a
+    /// durable cursor must not pass a non-durable cancel either, or a deleted
+    /// slot resurrects on restart. See audit 2026-07-07 Mode A, window W2.
+    deferred_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Slots with a submitted-but-not-yet-published deferred schedule. Covers
+    /// the window between `DeferredAlive` submission and the flush thread's
+    /// snapshot publish, during which the published snapshot's deferred map
+    /// doesn't know the slot yet — `ConcurrentEngine::is_slot_deferred` ORs
+    /// this set with the published map so follow-up ops in that window take
+    /// the deferred branch instead of being skipped or auto-promoted to a
+    /// fresh (alive!) insert. The flush thread prunes entries once published.
+    deferred_pending: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
 }
 impl MutationSender {
     /// Submit a single mutation. Blocks if the channel is full (backpressure).
     pub fn send(&self, op: MutationOp) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
-        self.tx.send(op)
+        let deferred = match op {
+            MutationOp::DeferredAlive { slot, .. } => {
+                if let Ok(mut p) = self.deferred_pending.lock() {
+                    p.insert(slot);
+                }
+                true
+            }
+            MutationOp::DeferredCancel { slot } => {
+                if let Ok(mut p) = self.deferred_pending.lock() {
+                    p.remove(&slot);
+                }
+                true
+            }
+            _ => false,
+        };
+        if deferred {
+            self.deferred_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let result = self.tx.send(op);
+        if result.is_err() && deferred {
+            // Channel disconnected (shutdown): the op will never be applied,
+            // so a permanently-behind durable watermark would wedge cursor
+            // persistence if the process somehow kept running. Roll back.
+            self.deferred_seq
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
     }
     /// Approximate number of pending ops in the channel (for metrics).
     pub fn pending_count(&self) -> usize {
         self.tx.len()
+    }
+    /// Handle to the deferred-map submission counter (see field docs).
+    pub fn deferred_seq_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.deferred_seq)
+    }
+    /// Handle to the pending-deferred slot set (see field docs).
+    pub fn deferred_pending_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<std::collections::HashSet<u32>>> {
+        Arc::clone(&self.deferred_pending)
     }
     /// Submit multiple mutations. Blocks per-op if the channel is full.
     pub fn send_batch(
@@ -474,7 +550,7 @@ impl MutationSender {
         ops: Vec<MutationOp>,
     ) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
         for op in ops {
-            self.tx.send(op)?;
+            self.send(op)?;
         }
         Ok(())
     }
@@ -485,17 +561,30 @@ pub struct WriteCoalescer {
     rx: Receiver<MutationOp>,
     tx: Sender<MutationOp>,
     batch: WriteBatch,
+    /// Shared with every `MutationSender` handed out (see `MutationSender::deferred_seq`).
+    deferred_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with every `MutationSender` (see `MutationSender::deferred_pending`).
+    deferred_pending: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
 }
 impl WriteCoalescer {
     /// Create a new WriteCoalescer with a bounded channel of the given capacity.
     /// Returns the coalescer and a cloneable sender handle.
     pub fn new(capacity: usize) -> (Self, MutationSender) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
-        let sender = MutationSender { tx: tx.clone() };
+        let deferred_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let deferred_pending =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let sender = MutationSender {
+            tx: tx.clone(),
+            deferred_seq: Arc::clone(&deferred_seq),
+            deferred_pending: Arc::clone(&deferred_pending),
+        };
         let coalescer = Self {
             rx,
             tx,
             batch: WriteBatch::new(),
+            deferred_seq,
+            deferred_pending,
         };
         (coalescer, sender)
     }
@@ -503,7 +592,19 @@ impl WriteCoalescer {
     pub fn sender(&self) -> MutationSender {
         MutationSender {
             tx: self.tx.clone(),
+            deferred_seq: Arc::clone(&self.deferred_seq),
+            deferred_pending: Arc::clone(&self.deferred_pending),
         }
+    }
+    /// Handle to the shared deferred-map submission counter.
+    pub fn deferred_seq_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.deferred_seq)
+    }
+    /// Handle to the shared pending-deferred slot set.
+    pub fn deferred_pending_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<std::collections::HashSet<u32>>> {
+        Arc::clone(&self.deferred_pending)
     }
     /// Approximate number of pending ops in the channel.
     pub fn pending_count(&self) -> usize {
@@ -587,6 +688,21 @@ impl WriteCoalescer {
     pub fn has_deferred_alive(&self) -> bool {
         self.batch.has_deferred_alive()
     }
+    /// Number of deferred-map mutations (schedules + cancels) in the prepared
+    /// batch. Feeds the flush thread's durable watermark — must count exactly
+    /// what `deferred_seq` ticks for.
+    pub fn deferred_alive_count(&self) -> usize {
+        self.batch.deferred_muts.len()
+    }
+    /// Slots whose deferred-map entries were scheduled in the prepared batch.
+    /// Used by the flush thread to maintain the pending-deferred set.
+    pub fn deferred_scheduled_slots(&self) -> impl Iterator<Item = u32> + '_ {
+        self.batch
+            .deferred_muts
+            .iter()
+            .filter(|(_, m)| m.is_some())
+            .map(|(s, _)| *s)
+    }
     /// Returns the set of filter field names mutated in the prepared batch.
     /// Valid after `prepare()` returned > 0, before the next `prepare()` call.
     pub fn mutated_filter_fields(&self) -> HashSet<&str> {
@@ -636,6 +752,89 @@ mod tests {
     use crate::config::{FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
     use std::thread;
+
+    /// The deferred-alive submission counter must tick for every DeferredAlive
+    /// submitted through any sender clone (and only for those), BEFORE the op
+    /// is observable in the channel — it is the merge thread's evidence that a
+    /// WAL cursor may cover an as-yet-unpersisted deferral (audit 2026-07-07
+    /// Mode A, window W2).
+    #[test]
+    fn test_deferred_seq_ticks_on_deferred_alive_submissions_only() {
+        let (coalescer, sender) = WriteCoalescer::new(64);
+        let seq = coalescer.deferred_seq_handle();
+        let sender2 = coalescer.sender();
+        assert_eq!(seq.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        sender
+            .send(MutationOp::AliveInsert { slots: vec![1] })
+            .unwrap();
+        assert_eq!(
+            seq.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-deferred ops must not tick the counter"
+        );
+
+        sender
+            .send(MutationOp::DeferredAlive { slot: 7, activate_at: 12345 })
+            .unwrap();
+        sender2
+            .send(MutationOp::DeferredAlive { slot: 8, activate_at: 12346 })
+            .unwrap();
+        assert_eq!(
+            seq.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every sender clone shares one counter"
+        );
+
+        sender
+            .send_batch(vec![
+                MutationOp::DeferredAlive { slot: 9, activate_at: 12347 },
+                MutationOp::AliveRemove { slots: vec![1] },
+            ])
+            .unwrap();
+        assert_eq!(seq.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Cancels tick too — a durable cursor must not pass a non-durable
+        // cancel either (deleted slot would resurrect on restart).
+        sender.send(MutationOp::DeferredCancel { slot: 7 }).unwrap();
+        assert_eq!(seq.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// Deferred-map mutations must apply in ARRIVAL order — cancel and
+    /// schedule are not commutative. "Reschedule then delete" must end
+    /// cancelled; "delete then re-insert" must end scheduled.
+    #[test]
+    fn test_deferred_mutations_apply_in_arrival_order() {
+        let mut slots = SlotAllocator::new();
+        let (mut coalescer, sender) = WriteCoalescer::new(64);
+        let mut filters = setup_filter_index();
+        let mut sorts = setup_sort_index();
+
+        // Case 1: schedule → cancel (delete after reschedule) ⇒ NOT deferred.
+        sender.send(MutationOp::DeferredAlive { slot: 5, activate_at: 99 }).unwrap();
+        sender.send(MutationOp::DeferredCancel { slot: 5 }).unwrap();
+        // Case 2: cancel → schedule (delete then re-insert) ⇒ deferred.
+        sender.send(MutationOp::DeferredCancel { slot: 6 }).unwrap();
+        sender.send(MutationOp::DeferredAlive { slot: 6, activate_at: 77 }).unwrap();
+        assert!(coalescer.prepare() > 0);
+        coalescer.apply_prepared(&mut slots, &mut filters, &mut sorts);
+
+        assert!(!slots.is_deferred(5), "reschedule-then-delete must end cancelled");
+        assert!(slots.is_deferred(6), "delete-then-reinsert must end scheduled");
+        assert_eq!(slots.deferred_map().get(&77), Some(&vec![6]));
+    }
+
+    /// The pending-deferred bridge set tracks submitted schedules until the
+    /// flush thread prunes them at publish, and cancels remove immediately.
+    #[test]
+    fn test_deferred_pending_set_tracks_submissions() {
+        let (coalescer, sender) = WriteCoalescer::new(64);
+        let pending = coalescer.deferred_pending_handle();
+        sender.send(MutationOp::DeferredAlive { slot: 11, activate_at: 42 }).unwrap();
+        assert!(pending.lock().unwrap().contains(&11));
+        sender.send(MutationOp::DeferredCancel { slot: 11 }).unwrap();
+        assert!(!pending.lock().unwrap().contains(&11));
+    }
     fn setup_filter_index() -> FilterIndex {
         let mut filters = FilterIndex::new();
         filters.add_field(FilterFieldConfig {

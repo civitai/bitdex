@@ -391,6 +391,17 @@ pub struct ConcurrentEngine {
     /// restart. `0` disables the fallback. Seeded from
     /// `TimeBucketFieldConfig::full_rebuild_interval_secs`.
     time_bucket_full_rebuild_interval: Arc<AtomicU64>,
+    /// Overdue-deferred sweep interval (secs); 0 disables. Read by the WAL
+    /// reader between batches; hot-reloadable via PATCH /config. Seeded from
+    /// `DeferredAliveConfig::sweep_interval_secs`.
+    deferred_sweep_interval: Arc<AtomicU64>,
+    /// Overdue-deferred sweep per-pass candidate cap. Hot-reloadable via
+    /// PATCH /config. Seeded from `DeferredAliveConfig::sweep_limit`.
+    deferred_sweep_limit: Arc<AtomicUsize>,
+    /// Slots with a submitted-but-not-yet-published deferred schedule.
+    /// Bridges the submit→publish visibility window for `is_slot_deferred`
+    /// (see `MutationSender::deferred_pending`).
+    deferred_pending: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1056,6 +1067,22 @@ impl ConcurrentEngine {
                 .map(|tb| tb.full_rebuild_interval_secs)
                 .unwrap_or(0),
         ));
+        // Overdue-deferred sweep knobs — hot-reloadable via PATCH /config.
+        // Read by the WAL reader between batches (server feature).
+        let deferred_sweep_interval = Arc::new(AtomicU64::new(
+            config
+                .deferred_alive
+                .as_ref()
+                .map(|da| da.sweep_interval_secs)
+                .unwrap_or(0),
+        ));
+        let deferred_sweep_limit = Arc::new(AtomicUsize::new(
+            config
+                .deferred_alive
+                .as_ref()
+                .map(|da| da.sweep_limit)
+                .unwrap_or(20_000),
+        ));
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
@@ -1063,6 +1090,17 @@ impl ConcurrentEngine {
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
+        // Deferred-alive durability watermark. `deferred_seq` (owned by the
+        // coalescer, bumped by every MutationSender on DeferredAlive submit)
+        // counts scheduling ops ever sent; this counter tracks how many of
+        // them have been applied to staging AND persisted to MetaStore by the
+        // flush thread. The merge thread refuses to persist WAL cursors while
+        // the two diverge — otherwise a durable cursor could advance past a
+        // deferral that exists nowhere on disk, permanently orphaning the slot
+        // on crash (audit 2026-07-07 Mode A, loss window W2).
+        let deferred_seq = coalescer.deferred_seq_handle();
+        let deferred_durable_seq = Arc::new(AtomicU64::new(0));
+        let deferred_pending = coalescer.deferred_pending_handle();
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
             ms.load_all_cursors().unwrap_or_default()
@@ -1261,6 +1299,9 @@ impl ConcurrentEngine {
                 doc_cache: doc_cache.clone(),
                 par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
                 time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
+            deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
+            deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
+            deferred_pending: Arc::clone(&deferred_pending),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1365,6 +1406,8 @@ impl ConcurrentEngine {
             // thread always sees the latest without holding a lock.
             let flush_shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> = Arc::clone(&shared_string_maps);
             let flush_shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> = Arc::clone(&shared_dictionaries);
+            let flush_deferred_durable = Arc::clone(&deferred_durable_seq);
+            let flush_deferred_pending = coalescer.deferred_pending_handle();
             thread::Builder::new()
                 .name("bitdex-flush".to_string())
                 .spawn(move || {
@@ -1375,6 +1418,11 @@ impl ConcurrentEngine {
                 let mut was_loading = false;
                 let mut staging_dirty = false; // tracks unpublished mutations from loading mode
                 let mut flush_cycle: u64 = 0;
+                // Running count of DeferredAlive ops applied to staging. Paired
+                // with `flush_deferred_durable` (advanced only after a successful
+                // deferred-map persist) — see `deferred_durable_seq` docs at the
+                // declaration site.
+                let mut deferred_applied_total: u64 = 0;
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
@@ -1455,6 +1503,14 @@ impl ConcurrentEngine {
                             .as_secs();
                         let activated = staging.slots.activate_due(now_unix);
                         if !activated.is_empty() {
+                            // Activated slots are leaving deferred state — drop any
+                            // stale pending-deferred bridge entries (normally already
+                            // pruned at publish; this covers publish-skipped cycles).
+                            if let Ok(mut p) = flush_deferred_pending.lock() {
+                                for slot in &activated {
+                                    p.remove(slot);
+                                }
+                            }
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1640,13 +1696,13 @@ impl ConcurrentEngine {
                         for sgk in coalescer.sort_clear_entries().keys() {
                             stale_fields.push(sgk.field.to_string());
                         }
-                        // Persist deferred map when new deferred entries are added.
+                        // Count DeferredAlive ops applied to staging this batch.
+                        // The map persist itself happens later in the cycle (with
+                        // the activation persist, after opslog append) and advances
+                        // `flush_deferred_durable` — until then the merge thread
+                        // holds back WAL-cursor persistence for these entries.
                         if coalescer.has_deferred_alive() {
-                            if let Some(ref ms) = flush_meta_store {
-                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
-                                }
-                            }
+                            deferred_applied_total += coalescer.deferred_alive_count() as u64;
                         }
                         // Update positive existence sets with any new distinct values.
                         // This is cheap (HashSet insert + Arc swap) and must be visible
@@ -2350,6 +2406,17 @@ impl ConcurrentEngine {
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
+                            // Deferred schedules applied this batch are now visible in
+                            // the published snapshot's deferred map — prune them from
+                            // the pending-deferred bridge set (kept only for the
+                            // submit→publish window; see MutationSender docs).
+                            if coalescer.has_deferred_alive() {
+                                if let Ok(mut p) = flush_deferred_pending.lock() {
+                                    for slot in coalescer.deferred_scheduled_slots() {
+                                        p.remove(&slot);
+                                    }
+                                }
+                            }
                             // Async cache worker enqueue MUST happen after publish so
                             // the worker cannot dequeue + evaluate against a stale
                             // snapshot — `cache_worker` calls `inner.load()` to obtain
@@ -2593,10 +2660,34 @@ impl ConcurrentEngine {
                     // activate_due for the same slot, which is idempotent on bitmap
                     // state (set-already-set = no-op) and produces a duplicate opslog
                     // entry at worst.
-                    if deferred_persist_needed {
-                        if let Some(ref ms) = flush_meta_store {
-                            if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                eprintln!("Warning: failed to persist deferred alive map: {e}");
+                    //
+                    // The same write also covers NEW deferrals applied earlier in
+                    // this cycle: `deferred_applied_total` counts DeferredAlive ops
+                    // applied to staging, and `flush_deferred_durable` advances only
+                    // after a successful persist. A failed write retries here every
+                    // cycle (watermark stays behind), and the merge thread refuses
+                    // to persist WAL cursors until the watermark catches up — so a
+                    // crash can no longer strand a scheduled slot with the cursor
+                    // already past its op (audit 2026-07-07 Mode A, window W2).
+                    {
+                        let durable_now = flush_deferred_durable.load(Ordering::SeqCst);
+                        if deferred_persist_needed || deferred_applied_total > durable_now {
+                            if let Some(ref ms) = flush_meta_store {
+                                match ms.write_deferred_alive(staging.slots.deferred_map()) {
+                                    Ok(()) => flush_deferred_durable
+                                        .store(deferred_applied_total, Ordering::SeqCst),
+                                    Err(e) => eprintln!(
+                                        "Warning: failed to persist deferred alive map \
+                                         (will retry next cycle; WAL cursor persistence \
+                                         is held back until it succeeds): {e}"
+                                    ),
+                                }
+                            } else {
+                                // No MetaStore configured (ephemeral/test engine):
+                                // nothing to persist and no durable cursor either —
+                                // advance the watermark so nothing wedges.
+                                flush_deferred_durable
+                                    .store(deferred_applied_total, Ordering::SeqCst);
                             }
                         }
                     }
@@ -3537,6 +3628,8 @@ impl ConcurrentEngine {
             let merge_prefilter_registry = Arc::clone(&prefilter_registry);
             let merge_warm_registry = Arc::clone(&warm_registry);
             let merge_tombstones_cleaned = Arc::clone(&boundstore_tombstones_cleaned);
+            let merge_deferred_seq = Arc::clone(&deferred_seq);
+            let merge_deferred_durable = Arc::clone(&deferred_durable_seq);
 
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
@@ -3551,6 +3644,18 @@ impl ConcurrentEngine {
                     // Only written to disk if data was actually persisted this cycle
                     // AND no write failures occurred.
                     let cursor_snapshot_for_persist = merge_cursors.lock().clone();
+                    // Deferred-durability gate: capture the DeferredAlive
+                    // submission count no earlier than the cursor snapshot. Any
+                    // deferral the snapshot cursor covers bumped `deferred_seq`
+                    // before its `set_cursor`, so its tick is <= this value.
+                    // Cursors are persisted below only when the flush thread's
+                    // durable watermark has caught up — i.e. every deferral the
+                    // cursor could cover is applied to staging AND persisted to
+                    // MetaStore. Otherwise a crash could leave the durable cursor
+                    // past a deferral op that exists nowhere on disk (audit
+                    // 2026-07-07 Mode A, loss window W2).
+                    let deferred_seq_at_snapshot =
+                        merge_deferred_seq.load(Ordering::SeqCst);
                     let mut did_persist_data = false;
                     let mut persist_had_errors = false;
                     // ── Per-shard compaction ────────────────────────────────
@@ -3610,16 +3715,23 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Persist slot counter + deferred alive (critical metadata)
+                        // Persist slot counter (critical metadata).
+                        //
+                        // The deferred-alive map is deliberately NOT written here.
+                        // The flush thread is the single writer (on every applied
+                        // deferral and after every activation drain) and writes from
+                        // *staging* — the authoritative state. This thread only sees
+                        // the *published* snapshot, which lags staging within a flush
+                        // cycle; writing it here raced the flush thread's write and
+                        // could regress the on-disk map to a pre-deferral state,
+                        // permanently orphaning scheduled slots when a crash landed
+                        // before the next flush-side persist (audit 2026-07-07,
+                        // Mode A loss window W1 — see
+                        // docs/_in/sync-writepath-audit-findings-2026-07-07.md).
                         {
                             let snap = merge_inner.load();
                             if let Err(e) = ms_.write_slot_counter(snap.slots.slot_counter()) {
                                 eprintln!("merge thread: slot_counter write failed: {e}");
-                            }
-                            if snap.slots.deferred_count() > 0 {
-                                if let Err(e) = ms_.write_deferred_alive(snap.slots.deferred_map()) {
-                                    eprintln!("merge thread: deferred_alive write failed: {e}");
-                                }
                             }
                         }
                         // Persist time bucket bitmaps + cutoffs (MetaStore)
@@ -3913,7 +4025,22 @@ impl ConcurrentEngine {
                             bitmaps_synced = true;
                         }
                     }
-                    if did_persist_data && !persist_had_errors && bitmaps_synced {
+                    let deferred_durable_caught_up = merge_deferred_durable
+                        .load(Ordering::SeqCst)
+                        >= deferred_seq_at_snapshot;
+                    if !deferred_durable_caught_up {
+                        eprintln!(
+                            "merge thread: holding WAL cursor persist — deferred map \
+                             not yet durable (seq {} > durable {})",
+                            deferred_seq_at_snapshot,
+                            merge_deferred_durable.load(Ordering::SeqCst),
+                        );
+                    }
+                    if did_persist_data
+                        && !persist_had_errors
+                        && bitmaps_synced
+                        && deferred_durable_caught_up
+                    {
                         if let Some(ref ms_) = merge_meta_store {
                             for (name, value) in &cursor_snapshot_for_persist {
                                 if let Err(e) = ms_.write_cursor(name, value) {
@@ -4423,6 +4550,9 @@ impl ConcurrentEngine {
             doc_cache: doc_cache.clone(),
             par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
             time_bucket_full_rebuild_interval: Arc::clone(&time_bucket_full_rebuild_interval),
+            deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
+            deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
+            deferred_pending: Arc::clone(&deferred_pending),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -4535,6 +4665,24 @@ impl ConcurrentEngine {
     /// Read the current time-bucket full-reconcile interval (for /config GET).
     pub fn time_bucket_full_rebuild_interval(&self) -> u64 {
         self.time_bucket_full_rebuild_interval.load(Ordering::Relaxed)
+    }
+    /// Set the overdue-deferred sweep interval (secs). Hot-reload via
+    /// PATCH /config; `0` disables the sweep. The WAL reader checks this
+    /// between batches, so a change takes effect within one interval.
+    pub fn set_deferred_sweep_interval(&self, secs: u64) {
+        self.deferred_sweep_interval.store(secs, Ordering::Relaxed);
+    }
+    /// Read the current overdue-deferred sweep interval.
+    pub fn deferred_sweep_interval(&self) -> u64 {
+        self.deferred_sweep_interval.load(Ordering::Relaxed)
+    }
+    /// Set the overdue-deferred sweep per-pass candidate cap (hot-reload).
+    pub fn set_deferred_sweep_limit(&self, limit: usize) {
+        self.deferred_sweep_limit.store(limit, Ordering::Relaxed);
+    }
+    /// Read the current overdue-deferred sweep per-pass candidate cap.
+    pub fn deferred_sweep_limit(&self) -> usize {
+        self.deferred_sweep_limit.load(Ordering::Relaxed)
     }
     /// Set the bitmap shard compaction threshold across all bitmap stores
     /// (alive / filter / sort). ops_count > threshold triggers a per-shard
@@ -7973,6 +8121,22 @@ impl ConcurrentEngine {
     pub fn is_slot_alive(&self, slot: u32) -> bool {
         let snap = self.snapshot();
         snap.slots.is_alive(slot)
+    }
+    /// Whether a slot is scheduled for deferred activation (not yet alive).
+    /// Checks the pending-deferred bridge set first (deferrals submitted but
+    /// not yet visible in a published snapshot — without this, follow-up ops
+    /// arriving within the publish window would be skipped or auto-promoted
+    /// to a fresh alive insert), then the published snapshot's deferred map.
+    /// Linear in deferred-map size — only call on cold paths (the ops
+    /// processor consults it solely for ops that target non-alive slots).
+    pub fn is_slot_deferred(&self, slot: u32) -> bool {
+        if let Ok(p) = self.deferred_pending.lock() {
+            if p.contains(&slot) {
+                return true;
+            }
+        }
+        let snap = self.snapshot();
+        snap.slots.is_deferred(slot)
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {

@@ -695,6 +695,43 @@ mod tests {
         assert_eq!(result, "OLD.\"nsfwLevel\"");
     }
 
+    /// Parent-table lookup via subquery in a computed_field expression (audit
+    /// 2026-07-07 Mode B: Image inherits Post.publishedAt at insert). The
+    /// {col} templating must pass the surrounding subquery SQL through
+    /// untouched, and the generated body must emit the Set on both INSERT and
+    /// UPDATE (re-resolving when the image moves posts).
+    #[test]
+    fn test_computed_field_subquery_lookup() {
+        let expr = r#"(SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = {postId})"#;
+        let substituted = substitute_columns(expr, "NEW");
+        assert_eq!(
+            substituted,
+            r#"(SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")"#,
+        );
+
+        let mut source = test_source("Image");
+        source.slot_field = Some("id".into());
+        source.sets_alive = true;
+        source.track_fields = Some(vec![TrackField::Simple("postId".into())]);
+        source.computed_fields = Some(vec![TriggerComputedField {
+            target: "publishedAt".into(),
+            expression: expr.into(),
+            value: None,
+        }]);
+        let sql = generate_trigger_sql(&source);
+        // INSERT branch: set op with the NEW-substituted subquery.
+        assert!(
+            sql.contains(r#"'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId"))"#),
+            "INSERT must emit publishedAt from the Post subquery:\n{sql}"
+        );
+        // UPDATE branch: IS DISTINCT FROM diff between OLD and NEW resolution.
+        assert!(
+            sql.contains(r#"WHERE p.id = OLD."postId") IS DISTINCT FROM"#)
+                || sql.contains(r#"WHERE p.id = OLD."postId")) IS DISTINCT FROM"#),
+            "UPDATE must diff the subquery between OLD and NEW postId:\n{sql}"
+        );
+    }
+
     /// Helper to build a test SyncSource with defaults for unused fields.
     fn test_source(table: &str) -> SyncSource {
         SyncSource {

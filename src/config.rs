@@ -174,6 +174,23 @@ pub struct DeferredAliveConfig {
     /// If true, the source value is in milliseconds and will be divided by 1000.
     #[serde(default)]
     pub ms_to_seconds: bool,
+    /// Overdue-deferred sweep interval in seconds; 0 disables the sweep.
+    ///
+    /// Safety net for lost deferred activations: periodically queries alive
+    /// slots whose exists_boolean shadow of `source_field` is still false
+    /// (feed-relevant first: sorted by the computed sort target descending,
+    /// capped at `sweep_limit`), doc-checks that the stored source timestamp
+    /// is in the past, and re-emits the activation state (source sort layer,
+    /// shadow flip, computed-sort recompute). Runs on the WAL reader thread
+    /// between batches — never on the flush thread.
+    #[serde(default)]
+    pub sweep_interval_secs: u64,
+    /// Max candidate slots examined per sweep pass (default 20,000).
+    #[serde(default = "default_deferred_sweep_limit")]
+    pub sweep_limit: usize,
+}
+fn default_deferred_sweep_limit() -> usize {
+    20_000
 }
 impl Default for Config {
     fn default() -> Self {
@@ -1351,6 +1368,8 @@ field_type = "single_value"
             deferred_alive: Some(DeferredAliveConfig {
                 source_field: "".into(),
                 ms_to_seconds: false,
+            sweep_interval_secs: 0,
+            sweep_limit: 20_000,
             }),
             ..Config::default()
         };
@@ -1462,6 +1481,8 @@ ms_to_seconds = true
             deferred_alive: Some(DeferredAliveConfig {
                 source_field: "scheduledAt".into(),
                 ms_to_seconds: false,
+            sweep_interval_secs: 0,
+            sweep_limit: 20_000,
             }),
             ..Config::default()
         };

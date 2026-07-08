@@ -1569,6 +1569,8 @@ mod tests {
         config.deferred_alive = Some(DeferredAliveConfig {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         });
         let registry = FieldRegistry::from_config(&config);
         // Old doc has nsfwLevel=16 and publishedAt=1000 (alive)

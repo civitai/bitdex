@@ -887,7 +887,18 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // Delete absorbs everything — clear all bitmaps for this slot.
         if entry.ops.iter().any(|op| matches!(op, Op::Delete)) {
             match process_delete(sink, meta, slot, engine) {
-                Ok(()) => applied += 1,
+                Ok(()) => {
+                    // A deferred (not-yet-alive) slot has no bitmap bits to
+                    // clear, but its deferred-map entry must go too — a later
+                    // activate_due would otherwise resurrect the deleted slot
+                    // by replaying its stored doc. Emitted unconditionally:
+                    // is_slot_deferred lags the published snapshot, and a
+                    // cancel for a never-deferred slot is a cheap no-op.
+                    if meta.deferred_alive_field.is_some() {
+                        sink.deferred_cancel(slot);
+                    }
+                    applied += 1;
+                }
                 Err(e) => {
                     tracing::warn!("ops processor: delete slot {slot} failed: {e}");
                     errors += 1;
@@ -908,6 +919,70 @@ pub fn apply_ops_batch<S: BitmapSink>(
         if !creates_slot && !has_query_op_set {
             if let Some(eng) = engine {
                 if !eng.is_slot_alive(slot) {
+                    // Deferred slots are allocated (below the high-water mark)
+                    // but not alive — the plain not-alive skip used to drop
+                    // EVERY follow-up op for them: publish-date reschedules,
+                    // unpublishes, tag/metric updates, all silently lost until
+                    // activation replayed a stale doc (audit 2026-07-07, §3.1).
+                    // While deferred: persist all field writes to the docstore
+                    // (activation replays the doc, so they surface then), and
+                    // if the deferred source field itself changed, re-schedule
+                    // the activation — schedule_alive dedupes the old key, and
+                    // a now-past timestamp activates on the next flush cycle.
+                    if eng.is_slot_deferred(slot) {
+                        if let Some(ref mut dw) = doc_writer {
+                            for op in &entry.ops {
+                                match op {
+                                    Op::Set { field, value } => dw.write_set(slot, field, value),
+                                    Op::Add { field, value } => dw.write_add(slot, field, value),
+                                    Op::Remove { field, value } => {
+                                        dw.write_remove(slot, field, value)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Does this batch touch the deferred source field at all?
+                        // (Set to null and Remove yield no timestamp, but they DO
+                        // change the schedule — they unschedule it.)
+                        let da_field = meta
+                            .deferred_alive_field
+                            .as_ref()
+                            .map(|(f, _)| f.as_str())
+                            .unwrap_or_default();
+                        let modifies_schedule = entry.ops.iter().any(|op| match op {
+                            Op::Set { field, .. } | Op::Remove { field, .. } => {
+                                field == da_field
+                            }
+                            _ => false,
+                        });
+                        if let Some(new_at) = get_deferred_timestamp(meta, &entry.ops) {
+                            // Reschedule (a past timestamp activates next cycle).
+                            sink.deferred_alive(slot, new_at);
+                            tracing::info!(
+                                "ops processor: rescheduled deferred slot {slot} to {new_at}"
+                            );
+                        } else if modifies_schedule {
+                            // Unschedule (publishedAt → null/removed): the entity
+                            // reverts to a plain draft, which is ALIVE. Schedule an
+                            // immediate activation — activate_due replays the full
+                            // stored doc, rebuilding every bitmap (not just this
+                            // op's fields), so the draft becomes fully queryable.
+                            // Leaving it deferred would keep it invisible until the
+                            // stale schedule fired.
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            sink.deferred_alive(slot, now);
+                            tracing::info!(
+                                "ops processor: unscheduled deferred slot {slot} — \
+                                 activating as draft"
+                            );
+                        }
+                        applied += 1;
+                        continue;
+                    }
                     if slot >= eng.slot_counter() {
                         // Slot is beyond high-water mark — this is a new entity,
                         // not a stale op for a deleted slot. Auto-promote.
@@ -1296,6 +1371,72 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
             }
         }
     }
+
+    // --- Safety net: complete a lost deferred activation (2026-07-03) ---
+    // A scheduled-ahead slot is deferred (doc.publishedAt = future, bitmap +
+    // isPublished shadow untouched) and is meant to be activated by the flush
+    // thread's `activate_due` when its time arrives. Prod audit found ~49.7k
+    // slots whose activation was never applied (deferred-map scheduling lost):
+    // they went live (publishedAt now in the past) but the `isPublished`
+    // exists_boolean shadow stayed false and the `publishedAt` source sort
+    // layer stayed 0, so they are excluded from `isPublished=true` feeds. The
+    // computed `sortAt` heals on its own here (it derives from the stored
+    // publishedAt once past), which masked the real defect.
+    //
+    // Whenever a recompute touches such a slot, finish the job the lost
+    // activation should have done: write the `publishedAt` source sort layer
+    // and flip the `isPublished` shadow to true. Both are idempotent, so
+    // already-activated slots are unaffected. A slot still legitimately
+    // deferred (publishedAt in the future) or a genuine draft (no stored
+    // publishedAt) is skipped by the `> 0 && <= now` guard. This does NOT
+    // remove the need to fix the deferred-map scheduling itself — it bounds
+    // the blast radius so live-but-unflipped slots self-correct on the next
+    // source-field op. See docs/_in/deferred-publish-isPublished-corrected-diagnosis-2026-07-03.md.
+    if let (Some(eng), Some((deferred_name, ms_to_secs))) = (engine, deferred_field) {
+        if let Ok(Some(doc)) = eng.get_document(slot) {
+            if let Some(crate::mutation::FieldValue::Single(ref v)) =
+                doc.fields.get(deferred_name)
+            {
+                // Extract the raw integer BEFORE any u32 narrowing — with
+                // ms_to_seconds configs the stored value is milliseconds and
+                // would wrap u32 first, corrupting both the comparison and
+                // the healed sort layer.
+                let raw: Option<i64> = match v {
+                    crate::types::Value::Integer(i) => Some(*i),
+                    other => value_to_sort_u32(other).map(|u| u as i64),
+                };
+                if let Some(raw) = raw {
+                    let secs = if ms_to_secs { raw / 1000 } else { raw };
+                    let pub_val = secs.clamp(0, u32::MAX as i64) as u32;
+                    if pub_val > 0 && pub_val <= now_secs_for_deferred {
+                        // publishedAt source sort layer — full overwrite.
+                        if let Some((arc_name, num_bits)) = meta.sort_fields.get(deferred_name) {
+                            for bit in 0..*num_bits {
+                                if (pub_val >> bit) & 1 == 1 {
+                                    sink.sort_set(arc_name.clone(), bit, slot);
+                                } else {
+                                    sink.sort_clear(arc_name.clone(), bit, slot);
+                                }
+                            }
+                            if let Some(ref mut dw) = doc_writer {
+                                dw.write_set(slot, deferred_name, &serde_json::json!(pub_val));
+                            }
+                        }
+                        // isPublished exists_boolean shadow → true (key 1).
+                        if let Some(shadows) = meta.exists_boolean_shadows.get(deferred_name) {
+                            for arc_name in shadows {
+                                sink.filter_remove(arc_name.clone(), 0, slot);
+                                sink.filter_insert(arc_name.clone(), 1, slot);
+                                if let Some(ref mut dw) = doc_writer {
+                                    dw.write_set(slot, arc_name.as_ref(), &serde_json::json!(true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Process a `set` op: set the new value's bitmap bit for this slot.
@@ -1462,6 +1603,123 @@ fn process_delete<S: BitmapSink>(
     // Dump mode fallback: just clear alive bit (no stored doc to read)
     sink.alive_remove(slot);
     Ok(())
+}
+/// Overdue-deferred sweep (audit 2026-07-07, fix A4): heal slots whose
+/// deferred activation was lost before the durability fixes, or slips through
+/// any residual gap. Entirely config-driven — every field name is derived
+/// from `deferred_alive.source_field` (exists_boolean shadow registry +
+/// computed-sort deps); nothing is hardcoded.
+///
+/// Queries alive slots whose shadow (e.g. `isPublished`) is still false,
+/// most-feed-relevant first (computed sort target descending, capped at
+/// `limit`), doc-checks that the stored source timestamp is past, and
+/// re-emits the activation state via `recompute_computed_sorts_for_slot`
+/// (which writes the source sort layer, flips the shadow, and recomputes the
+/// computed target). Idempotent: healthy drafts (no stored source value) and
+/// legitimately deferred slots (future value) are skipped by the doc check.
+///
+/// Runs on the WAL reader thread between batches — never on the flush thread.
+/// Returns (candidates_checked, healed_slots).
+pub fn overdue_deferred_sweep<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
+    engine: &ConcurrentEngine,
+    doc_writer: &mut DocWriter,
+    limit: usize,
+) -> (usize, Vec<u32>) {
+    let Some((source_field, ms_to_secs)) = meta.deferred_alive_field.clone() else {
+        return (0, Vec::new());
+    };
+    let Some(shadow) = meta
+        .exists_boolean_shadows
+        .get(source_field.as_str())
+        .and_then(|s| s.first())
+        .cloned()
+    else {
+        // No shadow configured — nothing observable to sweep against.
+        return (0, Vec::new());
+    };
+    // Feed-relevance ordering: the computed target derived from the source
+    // (e.g. sortAt from publishedAt); fall back to the source sort field.
+    let sort_field = meta
+        .computed_deps
+        .get(source_field.as_str())
+        .and_then(|deps| deps.first().map(|d| d.target.clone()))
+        .unwrap_or_else(|| source_field.clone());
+    let query = BitdexQuery {
+        filters: vec![crate::query::FilterClause::Eq(
+            shadow.to_string(),
+            crate::query::Value::Bool(false),
+        )],
+        sort: Some(crate::query::SortClause {
+            field: sort_field,
+            direction: crate::query::SortDirection::Desc,
+        }),
+        limit,
+        cursor: None,
+        offset: None,
+        skip_cache: true,
+    };
+    let ids = match engine.execute_query(&query) {
+        Ok(result) => result.ids,
+        Err(e) => {
+            tracing::warn!("overdue-deferred sweep: query failed: {e}");
+            return (0, Vec::new());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut checked = 0usize;
+    let mut healed: Vec<u32> = Vec::new();
+    for id in ids {
+        if id < 0 || id > u32::MAX as i64 {
+            continue;
+        }
+        let slot = id as u32;
+        checked += 1;
+        let Ok(Some(doc)) = engine.get_document(slot) else {
+            continue;
+        };
+        let Some(crate::mutation::FieldValue::Single(v)) = doc.fields.get(source_field.as_str())
+        else {
+            continue; // genuine draft — no stored source value
+        };
+        // Extract the raw integer BEFORE any u32 narrowing — a milliseconds
+        // source would wrap u32 first and corrupt the comparison.
+        let raw: i64 = match v {
+            crate::types::Value::Integer(i) => *i,
+            other => match crate::mutation::value_to_sort_u32(other) {
+                Some(u) => u as i64,
+                None => continue,
+            },
+        };
+        let secs = if ms_to_secs { raw / 1000 } else { raw };
+        if secs <= 0 || secs > now {
+            continue; // draft (0) or legitimately deferred (future)
+        }
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert(source_field.as_str(), secs as u32);
+        let empty: HashMap<&str, u32> = HashMap::new();
+        recompute_computed_sorts_for_slot(
+            sink,
+            meta,
+            Some(engine),
+            slot,
+            &sort_values,
+            &empty,
+            Some(doc_writer),
+        );
+        healed.push(slot);
+    }
+    if !healed.is_empty() {
+        tracing::info!(
+            "overdue-deferred sweep: healed {} of {checked} shadow-false candidates",
+            healed.len()
+        );
+    }
+    (checked, healed)
 }
 /// Resolve a queryOpSet: execute the query to get matching slots,
 /// then apply the nested ops to each matching slot via the BitmapSink.
@@ -1858,6 +2116,7 @@ mod tests {
         alive_inserts: Vec<u32>,
         alive_removes: Vec<u32>,
         deferred_alive: Vec<(u32, u64)>,
+        deferred_cancels: Vec<u32>,
     }
     impl RecordingSink {
         fn new() -> Self {
@@ -1869,6 +2128,7 @@ mod tests {
                 alive_inserts: Vec::new(),
                 alive_removes: Vec::new(),
                 deferred_alive: Vec::new(),
+                deferred_cancels: Vec::new(),
             }
         }
     }
@@ -1893,6 +2153,9 @@ mod tests {
         }
         fn deferred_alive(&mut self, slot: u32, activate_at: u64) {
             self.deferred_alive.push((slot, activate_at));
+        }
+        fn deferred_cancel(&mut self, slot: u32) {
+            self.deferred_cancels.push(slot);
         }
         fn flush(&mut self) -> crate::error::Result<()> {
             Ok(())
@@ -1943,6 +2206,118 @@ mod tests {
             computed: None,
         }];
         config
+    }
+    /// Build a config exercising the deferred-publish safety net: a computed
+    /// `sortAt = GREATEST(existedAt, publishedAt)`, `publishedAt` as both a
+    /// sort field and the `deferred_alive` source, and an `isPublished`
+    /// exists_boolean shadow sharing the `publishedAtUnix` source.
+    fn safety_net_config() -> Config {
+        use crate::config::{ComputedField, ComputedOp, DeferredAliveConfig};
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "isPublished".into(),
+            field_type: FilterFieldType::Boolean,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        }];
+        config.sort_fields = vec![
+            SortFieldConfig { name: "existedAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false, computed: None },
+            SortFieldConfig { name: "publishedAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false, computed: None },
+            SortFieldConfig {
+                name: "sortAt".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false,
+                computed: Some(ComputedField { op: ComputedOp::Greatest, source_fields: vec!["existedAt".into(), "publishedAt".into()] }),
+            },
+        ];
+        config.deferred_alive = Some(DeferredAliveConfig { source_field: "publishedAt".into(), ms_to_seconds: false, sweep_interval_secs: 0, sweep_limit: 20_000, });
+        config.data_schema.fields = vec![
+            FieldMapping { source: "publishedAtUnix".into(), target: "publishedAt".into(), value_type: FieldValueType::Integer, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: true, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
+            FieldMapping { source: "publishedAtUnix".into(), target: "isPublished".into(), value_type: FieldValueType::ExistsBoolean, fallback: None, string_map: None, doc_only: false, filter_only: false, ms_to_seconds: false, truncate_u32: false, case_sensitive: false, default_value: None, nullable: false },
+        ];
+        config
+    }
+
+    fn unit_now_secs() -> u32 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32
+    }
+
+    /// Regression (2026-07-03): the recompute safety net must complete a LOST
+    /// deferred activation. A scheduled-ahead slot whose `activate_due` replay
+    /// was never applied is stuck with `doc.publishedAt` in the past but its
+    /// `isPublished` shadow false and `publishedAt` sort layer at 0 — excluded
+    /// from `isPublished=true` feeds. When any recompute touches such a slot,
+    /// the net must flip `isPublished=true` and write the `publishedAt` layer.
+    #[test]
+    fn test_recompute_safety_net_completes_lost_activation() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 42u32;
+        let t_pub = unit_now_secs() - 100; // published in the past
+        let new_existed = t_pub - 50; // publishedAt is the max → sortAt = t_pub
+
+        // Forge the stuck state: doc carries a past publishedAt, but no op ever
+        // set the bitmap/shadow (as the deferred branch leaves it).
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        dw.write_set(slot, "publishedAt", &json!(t_pub as i64));
+        dw.flush();
+
+        // A later existedAt re-scan fires recompute for this slot.
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert("existedAt", new_existed);
+        let old_sort_values: HashMap<&str, u32> = HashMap::new();
+
+        let mut sink = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink, &meta, Some(&engine), slot, &sort_values, &old_sort_values, None);
+
+        // isPublished shadow flipped to true (clear false bit, set true bit).
+        assert!(
+            sink.filter_inserts.contains(&("isPublished".to_string(), 1u64, slot)),
+            "safety net must insert isPublished=true, got inserts={:?}", sink.filter_inserts
+        );
+        assert!(
+            sink.filter_removes.contains(&("isPublished".to_string(), 0u64, slot)),
+            "safety net must clear isPublished=false, got removes={:?}", sink.filter_removes
+        );
+
+        // publishedAt sort layer written from the stored doc value (set bits only).
+        let pub_bits: Vec<usize> = sink.sort_sets.iter().filter(|(f, _, _)| f == "publishedAt").map(|(_, b, _)| *b).collect();
+        let expected_bits: Vec<usize> = (0..32).filter(|b| (t_pub >> b) & 1 == 1).collect();
+        assert_eq!(pub_bits, expected_bits, "safety net must write publishedAt sort-layer set-bits for the stored value");
+    }
+
+    /// The safety net must NOT force-activate a slot that is still legitimately
+    /// deferred (publishedAt in the future) — that would leak scheduled posts.
+    #[test]
+    fn test_recompute_safety_net_skips_future_publishedat() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 43u32;
+        let t_future = unit_now_secs() + 86_400; // 1 day out
+        let new_existed = unit_now_secs() - 100;
+
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        dw.write_set(slot, "publishedAt", &json!(t_future as i64));
+        dw.flush();
+
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        sort_values.insert("existedAt", new_existed);
+        let old_sort_values: HashMap<&str, u32> = HashMap::new();
+
+        let mut sink = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink, &meta, Some(&engine), slot, &sort_values, &old_sort_values, None);
+
+        // No publishedAt sort-layer writes and no isPublished flip — the slot
+        // stays deferred until activate_due handles it.
+        assert!(
+            !sink.sort_sets.iter().any(|(f, _, _)| f == "publishedAt"),
+            "safety net must not write publishedAt layer for a future value, got {:?}", sink.sort_sets
+        );
+        assert!(
+            !sink.filter_inserts.iter().any(|(f, v, _)| f == "isPublished" && *v == 1),
+            "safety net must not flip isPublished for a future value, got {:?}", sink.filter_inserts
+        );
     }
     #[test]
     fn test_set_op_filter_insert() {
@@ -2756,6 +3131,8 @@ mod tests {
         config.deferred_alive = Some(DeferredAliveConfig {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         });
         // Add publishedAt as a sort field so it appears in meta
         config.sort_fields.push(SortFieldConfig {
@@ -2791,6 +3168,278 @@ mod tests {
         assert!(sink.filter_inserts.is_empty(), "deferred should skip ALL bitmaps including filter");
         assert!(sink.sort_sets.is_empty(), "deferred should skip ALL bitmaps including sort");
     }
+    /// Poll until the engine's published snapshot shows the slot as deferred.
+    fn wait_for_deferred(engine: &ConcurrentEngine, slot: u32, timeout_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_deferred(slot) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("slot {slot} never became deferred within {timeout_ms}ms");
+    }
+
+    /// Regression (audit 2026-07-07 §3.1): ops for a deferred, not-yet-alive
+    /// slot were silently dropped by the not-alive guard — a publish-date
+    /// reschedule while deferred was lost, so the slot activated at the stale
+    /// time. While deferred, a Set on the deferred source field must
+    /// re-schedule the activation (and persist to the doc), not be skipped.
+    #[test]
+    fn test_deferred_slot_reschedule_not_dropped() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 77;
+        let now = unit_now_secs() as i64;
+        let t1 = now + 3_600; // initial schedule: +1h
+        let t2 = now + 7_200; // rescheduled: +2h
+
+        // Fresh insert carrying a future publishedAt → deferred branch.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(t1) },
+            ],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        // Follow-up op (creates_slot=false): reschedule publishedAt. Recorded
+        // via RecordingSink so we can assert exactly what the guard emits.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: json!(t2) }],
+        }];
+        let (applied2, skipped2, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!(
+            (applied2, skipped2, errors2),
+            (1, 0, 0),
+            "reschedule for a deferred slot must be applied, not skipped"
+        );
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, t2 as u64)],
+            "guard must re-schedule the deferred activation at the new time"
+        );
+        assert!(
+            rec.alive_inserts.is_empty() && rec.filter_inserts.is_empty(),
+            "no bitmap mutations while still deferred"
+        );
+        // Doc must carry the new publishedAt for the eventual activation replay.
+        let doc = engine.get_document(slot).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("publishedAt"),
+            Some(&crate::mutation::FieldValue::Single(crate::types::Value::Integer(t2))),
+        );
+    }
+
+    /// Unscheduling while deferred (external review 2026-07-07, GPT #3 /
+    /// Gemini #1): a Set publishedAt=null on a deferred slot must not leave
+    /// it invisible until the stale schedule fires — it reverts to a draft,
+    /// which is alive. The guard must emit an immediate activation.
+    #[test]
+    fn test_deferred_slot_unschedule_activates_as_draft() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 79;
+        let now = unit_now_secs() as i64;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(now + 3_600) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        // Unschedule: publishedAt → null.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: serde_json::Value::Null }],
+        }];
+        let (applied2, skipped2, _) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!((applied2, skipped2), (1, 0));
+        assert_eq!(
+            rec.deferred_alive.len(),
+            1,
+            "unschedule must emit an immediate activation, got {:?}",
+            rec.deferred_alive
+        );
+        let (s, at) = rec.deferred_alive[0];
+        assert_eq!(s, slot);
+        assert!(
+            (at as i64) <= now + 5,
+            "activation must be scheduled at ~now (immediate), got {at}"
+        );
+    }
+
+    /// A follow-up op that does NOT touch the schedule (e.g. a tag update)
+    /// must keep the slot deferred — doc write only, no activation.
+    #[test]
+    fn test_deferred_slot_unrelated_op_stays_deferred() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 80;
+        let now = unit_now_secs() as i64;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: json!(now + 3_600) }],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "existedAt".into(), value: json!(now - 50) }],
+        }];
+        let (applied2, _, _) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!(applied2, 1, "doc write for a deferred slot must be applied");
+        assert!(
+            rec.deferred_alive.is_empty() && rec.alive_inserts.is_empty(),
+            "an op that doesn't touch the schedule must not activate or reschedule"
+        );
+    }
+
+    /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow
+    /// stuck false and a stored past publishedAt (the lost-activation state)
+    /// must be healed; genuine drafts (no stored publishedAt) and legitimately
+    /// deferred slots (future publishedAt) must be left alone.
+    #[test]
+    fn test_overdue_deferred_sweep_heals_stuck_slots_only() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let stuck: u32 = 101; // past publishedAt, shadow false → heal
+        let draft: u32 = 102; // no publishedAt → skip
+        let future: u32 = 103; // future publishedAt → skip
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        // All three inserted alive with an explicit shadow=false bit (as the
+        // dump path's enrichment writes it for unpublished images).
+        let mut batch: Vec<EntityOps> = [stuck, draft, future]
+            .iter()
+            .map(|&s| EntityOps {
+                entity_id: s as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 500) },
+                    Op::Set { field: "isPublished".into(), value: json!(false) },
+                ],
+            })
+            .collect();
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        // Forge the lost-activation docs (deferred branch writes the doc only).
+        dw.write_set(stuck, "publishedAt", &json!(now - 100));
+        dw.write_set(future, "publishedAt", &json!(now + 3_600));
+        sink.flush().unwrap();
+        dw.flush();
+        // Wait for the flush thread to publish alive + shadow-false bits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_alive(future) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
+
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let (checked, healed) =
+            overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw2, 1_000);
+        dw2.flush();
+        assert!(checked >= 3, "all three shadow-false slots are candidates, got {checked}");
+        assert_eq!(healed, vec![stuck], "exactly the stuck slot must be healed");
+        // Heal emits the shadow flip and the publishedAt sort layer for `stuck`.
+        assert!(
+            rec.filter_inserts.contains(&("isPublished".to_string(), 1u64, stuck)),
+            "sweep must flip isPublished=true for the stuck slot"
+        );
+        assert!(
+            rec.sort_sets.iter().any(|(f, _, s)| f == "publishedAt" && *s == stuck),
+            "sweep must write the publishedAt sort layer for the stuck slot"
+        );
+        assert!(
+            !rec.filter_inserts.iter().any(|(f, v, s)| f == "isPublished" && *v == 1 && (*s == draft || *s == future)),
+            "draft and future slots must not be flipped"
+        );
+    }
+
+    /// Regression (audit 2026-07-07 §3.1): deleting a deferred slot must
+    /// cancel the pending activation — otherwise activate_due resurrects the
+    /// deleted slot by replaying its stored doc.
+    #[test]
+    fn test_deferred_slot_delete_cancels_activation() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 78;
+        let now = unit_now_secs() as i64;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "publishedAt".into(), value: json!(now + 3_600) }],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        let mut rec = RecordingSink::new();
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Delete],
+        }];
+        let (applied2, _, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), None);
+        assert_eq!((applied2, errors2), (1, 0));
+        assert_eq!(
+            rec.deferred_cancels,
+            vec![slot],
+            "delete of a deferred slot must cancel its pending activation"
+        );
+    }
+
     #[test]
     fn test_deferred_alive_past_publishedat() {
         use crate::config::DeferredAliveConfig;
@@ -2798,6 +3447,8 @@ mod tests {
         config.deferred_alive = Some(DeferredAliveConfig {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
+        sweep_interval_secs: 0,
+        sweep_limit: 20_000,
         });
         config.sort_fields.push(SortFieldConfig {
             name: "publishedAt".into(),
