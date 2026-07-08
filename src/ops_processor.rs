@@ -3081,6 +3081,137 @@ mod tests {
         // In dump mode (no engine), delete only clears alive
         assert_eq!(sink.alive_removes, vec![42]);
     }
+    /// Regression (FOLLOWUP.md "LCS dictionary durability hole", 2026-07-08):
+    /// a key minted on the OPS path must survive a crash — persisted where
+    /// boot's `load_dictionaries` actually reads (`<bitmap_path>/dictionaries`,
+    /// not the old dead `shardstore/dictionaries` target), so a reopened
+    /// dictionary never re-issues an on-disk-referenced key to a different
+    /// string.
+    #[test]
+    fn test_ops_minted_dict_key_survives_crash_and_is_not_reissued() {
+        use crate::config::{DataSchema, FieldMapping, FieldValueType};
+        let dir = tempfile::TempDir::new().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+
+        let mut config = test_config();
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+        config.data_schema = DataSchema {
+            fields: vec![FieldMapping {
+                source: "type".into(),
+                target: "type".into(),
+                value_type: FieldValueType::LowCardinalityString,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            }],
+            ..Default::default()
+        };
+        let schema = config.data_schema.clone();
+
+        let minted_key;
+        {
+            // Boot dance as server.rs does it: engine + load_dictionaries +
+            // set_dictionaries.
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            let dicts = ConcurrentEngine::load_dictionaries(&schema, &bitmap_path).unwrap();
+            engine.set_dictionaries(dicts);
+
+            // Mint a key via the ops path (WAL-reader shape).
+            let meta = FieldMeta::from_config(engine.config());
+            let mut sink = RecordingSink::new();
+            let mut batch = vec![EntityOps {
+                entity_id: 4242,
+                creates_slot: true,
+                ops: vec![Op::Set { field: "type".into(), value: json!("HoloCine") }],
+            }];
+            let (applied, _, errors) =
+                apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), None);
+            assert_eq!((applied, errors), (1, 0));
+            minted_key = engine.dictionaries().get("type").unwrap().get("holocine").unwrap();
+
+            // What the WAL-reader loop now does after every batch.
+            engine.persist_dirty_dictionaries().unwrap();
+            // Crash: engine dropped without any HTTP-upsert/save_snapshot path.
+        }
+
+        // Reboot: the minted key must be present and never re-issued.
+        let reloaded = ConcurrentEngine::load_dictionaries(&schema, &bitmap_path).unwrap();
+        let dict = reloaded.get("type").expect("dictionary must exist after reboot");
+        assert_eq!(
+            dict.get("holocine"),
+            Some(minted_key),
+            "ops-minted key must survive the crash"
+        );
+        let k_new = dict.get_or_insert("SomethingElse");
+        assert_ne!(
+            k_new, minted_key,
+            "reopened dictionary must not re-issue the minted key"
+        );
+    }
+
+    /// Legacy-dir fallback: keys stranded in the old dead persist target
+    /// (`<bitmap_path>/shardstore/dictionaries`) are still picked up when the
+    /// canonical file is missing or older.
+    #[test]
+    fn test_load_dictionaries_legacy_shardstore_fallback() {
+        use crate::config::{DataSchema, FieldMapping, FieldValueType};
+        let dir = tempfile::TempDir::new().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let schema = DataSchema {
+            fields: vec![FieldMapping {
+                source: "type".into(),
+                target: "type".into(),
+                value_type: FieldValueType::LowCardinalityString,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            }],
+            ..Default::default()
+        };
+
+        // Stranded legacy copy with 2 keys; no canonical copy.
+        let legacy = crate::dictionary::FieldDictionary::new();
+        legacy.get_or_insert("alpha");
+        legacy.get_or_insert("beta");
+        crate::dictionary::save_dictionary(
+            &legacy.snapshot(),
+            &bitmap_path.join("shardstore").join("dictionaries").join("type.dict"),
+        )
+        .unwrap();
+
+        let loaded = ConcurrentEngine::load_dictionaries(&schema, &bitmap_path).unwrap();
+        let dict = loaded.get("type").unwrap();
+        assert_eq!(dict.get("alpha"), legacy.get("alpha"));
+        assert_eq!(dict.get("beta"), legacy.get("beta"));
+
+        // Canonical newer than legacy → canonical wins.
+        let canonical = crate::dictionary::FieldDictionary::new();
+        canonical.get_or_insert("alpha");
+        canonical.get_or_insert("beta");
+        canonical.get_or_insert("gamma");
+        crate::dictionary::save_dictionary(
+            &canonical.snapshot(),
+            &bitmap_path.join("dictionaries").join("type.dict"),
+        )
+        .unwrap();
+        let loaded2 = ConcurrentEngine::load_dictionaries(&schema, &bitmap_path).unwrap();
+        assert!(loaded2.get("type").unwrap().get("gamma").is_some());
+    }
+
     #[test]
     fn test_image_insert_all_fields() {
         let config = test_config();

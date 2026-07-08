@@ -1436,6 +1436,27 @@ impl BitdexServer {
                                     // Flush pending docstore writes (DocWriter buffers tuples)
                                     doc_writer.flush();
 
+                                    // Persist dictionaries dirtied by this batch. The ops
+                                    // path mints keys for new LowCardinalityString values
+                                    // (get_or_insert) but historically only the HTTP
+                                    // upsert handlers persisted — a crash after minting
+                                    // let boot reload a stale dict whose next_key
+                                    // RE-ISSUED an on-disk-referenced key to a different
+                                    // string: silent permanent value aliasing
+                                    // (FOLLOWUP.md). Cheap: is_dirty is an atomic load
+                                    // per field; the write (<1KB, atomic tmp+fsync+
+                                    // rename) only happens when a batch actually minted
+                                    // a new distinct string — rare in steady state.
+                                    if let Err(e) = engine.persist_dirty_dictionaries() {
+                                        eprintln!(
+                                            "WAL reader: dictionary persist failed \
+                                             (will retry next dirty batch): {e}"
+                                        );
+                                        wal_state.metrics.pgsync_errors_total
+                                            .with_label_values(&["wal-reader-dict-persist"])
+                                            .inc();
+                                    }
+
                                     // Invalidate doc cache for mutated entities so
                                     // GET /documents returns fresh data after ops.
                                     if applied > 0 {
