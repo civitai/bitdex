@@ -197,9 +197,15 @@ enum LazyLoad {
     },
     /// Per-value lazy load for high-cardinality multi_value fields.
     /// Only the specific queried values are loaded from disk.
+    /// `requested` is the FULL list the loader was asked for — including
+    /// values that turned out to have no disk entry (sync-created since the
+    /// last save). Those must still be marked loaded, or their VBs stay
+    /// unloaded forever: diffs never compact (merge_dirty requeues them
+    /// endlessly) and every touching query re-attempts a disk load.
     FilterValues {
         field: String,
         values: HashMap<u64, RoaringBitmap>,
+        requested: Vec<u64>,
     },
     SortField {
         name: String,
@@ -1631,12 +1637,11 @@ impl ConcurrentEngine {
                                 }
                                 stale_fields.push(name);
                             }
-                            LazyLoad::FilterValues { field, values } => {
+                            LazyLoad::FilterValues { field, values, requested } => {
                                 if let Some(f) = staging.filters.get_field(&field) {
-                                    // For per-value loads, we use load_from since only
-                                    // specific requested values are sent. The values in
-                                    // the map are all that were requested.
-                                    let requested: Vec<u64> = values.keys().copied().collect();
+                                    // `requested` (not values.keys()) so values with no
+                                    // disk entry get marked loaded via load_values'
+                                    // absent branch — see LazyLoad::FilterValues docs.
                                     f.load_values(values, &requested);
                                 }
                                 stale_fields.push(field);
@@ -2772,9 +2777,8 @@ impl ConcurrentEngine {
                                                 field.load_field_complete(bitmaps);
                                             }
                                         }
-                                        LazyLoad::FilterValues { field, values } => {
+                                        LazyLoad::FilterValues { field, values, requested } => {
                                             if let Some(f) = staging.filters.get_field(&field) {
-                                                let requested: Vec<u64> = values.keys().copied().collect();
                                                 f.load_values(values, &requested);
                                             }
                                         }
@@ -5468,21 +5472,27 @@ impl ConcurrentEngine {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
                         match fs.load_field_values(field_name, missing) {
-                            Ok(loaded) if !loaded.is_empty() => {
-                                let count = loaded.len();
-                                eprintln!(
-                                    "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
-                                    field_name, count, t0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                #[cfg(feature = "server")]
-                                if let Some(ref bridge) = metrics_ref {
-                                    bridge.lazy_load_duration
-                                        .with_label_values(&[&bridge.index_name, field_name])
-                                        .observe(t0.elapsed().as_secs_f64());
+                            Ok(loaded) => {
+                                if !loaded.is_empty() {
+                                    let count = loaded.len();
+                                    eprintln!(
+                                        "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
+                                        field_name, count, t0.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                    #[cfg(feature = "server")]
+                                    if let Some(ref bridge) = metrics_ref {
+                                        bridge.lazy_load_duration
+                                            .with_label_values(&[&bridge.index_name, field_name])
+                                            .observe(t0.elapsed().as_secs_f64());
+                                    }
                                 }
+                                // Push even when nothing was found on disk: the
+                                // requested-but-absent values (sync-created since
+                                // the last save) must be marked loaded so their
+                                // diffs can compact and queries stop re-attempting
+                                // the disk load.
                                 par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
                             }
-                            Ok(_) => {}
                             Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load values: {e}"))); }
                         }
                     });
@@ -5549,8 +5559,10 @@ impl ConcurrentEngine {
                             .with_label_values(&[&bridge.index_name, field_name])
                             .observe(t0.elapsed().as_secs_f64());
                     }
-                    loaded_values.push((field_name.clone(), loaded, missing.clone()));
                 }
+                // Push even when nothing was found on disk — see the parallel
+                // arm: absent values must be marked loaded via `requested`.
+                loaded_values.push((field_name.clone(), loaded, missing.clone()));
             }
         }
         // Sequential phase: send LazyLoad messages to flush thread and update pending sets.
@@ -5561,10 +5573,11 @@ impl ConcurrentEngine {
             });
             self.pending_filter_loads.lock().remove(name);
         }
-        for (field_name, loaded_vals, _missing) in &loaded_values {
+        for (field_name, loaded_vals, missing) in &loaded_values {
             let _ = self.lazy_tx.send(LazyLoad::FilterValues {
                 field: field_name.clone(),
                 values: loaded_vals.clone(),
+                requested: missing.clone(),
             });
         }
         if let Some((ref sort_name, ref layers)) = loaded_sort {
