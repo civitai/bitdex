@@ -104,3 +104,13 @@ marker is added: floor/pin the policy range or add known-bad exclusions. Also fr
 incident, the durable emergency sequence: SUSPEND the Flux Kustomization FIRST, then
 kubectl set image, then bounce pods, then git revert PR, resume Flux only when cleared —
 set-image-then-bounce without the suspend recreates deleted pods on Flux's (bad) spec.
+
+## Boot restore gated on persisted alive bitmap — deferred-only edge (hang-hunt, 2026-07-08)
+
+Boot's slot-state restore only runs when a persisted alive bitmap exists; an engine whose
+only slots are deferred (alive bitmap absent/empty on disk) never loads the deferred map
+into staging on reopen — activation silently never runs for those entries. Edge case (real
+deployments always have alive slots) but a latent trap for tests and tiny indexes; found
+while building the boot-hang repro (PR #300 works around it). Fix candidate: load the
+deferred map unconditionally, not inside the alive-bitmap branch (concurrent_engine boot
+restore path).
