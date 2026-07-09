@@ -28,10 +28,20 @@ against live PG 16 + mock engine: commit-fill delivers the gap row, rollback pro
 without POSTing, trimmed-table boot seed. The SQL scripts are semantics demos only.
 
 **Residual risk accepted:** during a gap hold, rows beyond the gap apply to the engine
-before the gap row (absolute ops converge). A genuinely stuck writer txn holds the cursor
-indefinitely — delivery continues (posted set); alert-only, observable via "ALERT — cursor
-held" log lines. Sidecar has no metrics endpoint for a gauge — log-based for now.
-Requires PG >= 13 (`pg_current_snapshot`); prod CNPG is 16.
+before the gap row (absolute ops converge; the reorder window is unbounded if the writer
+txn is stuck, not ≤60s). A genuinely stuck writer txn holds the cursor indefinitely —
+delivery of already-visible rows continues ONLY within the first `batch_limit` (5000) ids
+above the held cursor; once the backlog exceeds that, NEW ops stop flowing until the gap
+resolves (minutes into a long hold at prod volume). **Runbook:** remedy for a wedged
+writer is `pg_terminate_backend(<pid>)` on the PG side — NEVER a manual cursor bump,
+which deliberately reproduces the original data loss. For an oversized hole (>100k ids,
+e.g. a rolled-back bulk txn): verify it is rollback/trim, then manually advance the
+cursor past it. Alert-only observability via "ALERT — cursor held" log lines (sidecar has
+no metrics endpoint). Boot at cursor==0 seeds to MIN(id)-1; if txns are in flight at seed
+time a boot guard pins the durable cursor at 0 until they finish, then sweeps late
+commits below the seed (re-review N1). Requires PG >= 13 (`pg_current_snapshot`); prod
+CNPG is 16. Merge-gate script is NOT in CI (needs docker) — run it manually before
+touching ops_poller.rs; listed in the release playbook.
 Detection tooling: lossless trap trigger `bitdex_trap_lossless` on BitdexOps (prod,
 2026-07-09) captures every queryOpSet emission inside the inserting txn — skip rate is now
 measurable (captured fan-outs >5min old vs engine applied-state).

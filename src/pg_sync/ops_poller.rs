@@ -82,6 +82,24 @@ struct PollerState {
     /// Ids proven rolled-back; treated as consumed when walking the
     /// frontier. Pruned once the cursor passes them.
     dead_ids: BTreeSet<i64>,
+    /// Boot-seed guard (re-review N1): a cursor==0 boot seeded to MIN(id)-1
+    /// while transactions were in flight. One of them may hold an
+    /// allocated-but-invisible id BELOW the seed (sequence head near MIN
+    /// after trim), which we cannot enumerate. Until every boot-time txn
+    /// finishes, the DURABLE cursor stays at 0 — the cleanup trigger's
+    /// threshold is MIN(cursors), so nothing below the seed can be deleted —
+    /// while `state.cursor` serves as the in-memory read anchor and advances
+    /// normally. On release: one-shot sweep of `id <= seed` for late
+    /// commits, POST them, then persist the anchor. A crash during the guard
+    /// re-boots from durable 0 and re-derives everything — at-least-once.
+    boot_guard: Option<BootGuard>,
+    /// Rate limit for the oversized-hole alert (re-review N3a).
+    last_oversized_alert: Option<Instant>,
+}
+
+struct BootGuard {
+    seed: i64,
+    xips: Vec<i64>,
 }
 
 /// Frontier walk result.
@@ -148,29 +166,13 @@ pub async fn run_ops_poller(
     eprintln!("BitDex is healthy.");
 
     // Read initial cursor from PG
-    let mut cursor: i64 = read_cursor_from_pg(pool, cursor_name)
+    let durable: i64 = read_cursor_from_pg(pool, cursor_name)
         .await
         .unwrap_or(0);
-    if cursor == 0 {
-        // Fresh replica against a cleanup-trimmed table: the hole between 0
-        // and MIN(id) is trim, not in-flight transactions. Seed below the
-        // first real row so the frontier walk starts from data.
-        if let Ok(min_id) = get_min_ops_id(pool).await {
-            if min_id > 1 {
-                eprintln!("Ops poller: cursor at 0, seeding to MIN(id)-1 = {}", min_id - 1);
-                cursor = min_id - 1;
-            }
-        }
-    }
-    let mut state = PollerState {
-        cursor,
-        posted_ids: BTreeSet::new(),
-        gap: None,
-        dead_ids: BTreeSet::new(),
-    };
+    let mut state = init_state(pool, cursor_name, durable).await;
     eprintln!(
         "Ops poller started (interval={}ms, batch_limit={}, cursor_name={}, starting_cursor={})",
-        poll_interval.as_millis(), batch_limit, cursor_name, cursor
+        poll_interval.as_millis(), batch_limit, cursor_name, state.cursor
     );
 
     let mut ticker = interval(poll_interval);
@@ -210,6 +212,70 @@ pub async fn run_ops_poller(
     }
 }
 
+/// Build the initial poller state from the durable cursor (testable boot
+/// seed — re-review N5).
+///
+/// A durable cursor of 0 against a cleanup-trimmed table means the hole
+/// between 0 and MIN(id) is mostly trim — seed the read anchor to MIN(id)-1
+/// instead of walking it. But "mostly" is not "entirely": a transaction in
+/// flight RIGHT NOW can hold an allocated-but-invisible id below MIN when the
+/// sequence head sits near MIN (re-review N1). Those ids cannot be
+/// enumerated (invisible), so when any transactions are in flight the seed
+/// carries a BootGuard: the durable cursor stays at 0 (freezing the cleanup
+/// threshold) until they all finish, then a one-shot sweep below the seed
+/// picks up late commits.
+async fn init_state(pool: &PgPool, cursor_name: &str, durable: i64) -> PollerState {
+    let mut state = PollerState {
+        cursor: durable,
+        posted_ids: BTreeSet::new(),
+        gap: None,
+        dead_ids: BTreeSet::new(),
+        boot_guard: None,
+        last_oversized_alert: None,
+    };
+    if durable != 0 {
+        return state;
+    }
+    let Ok(min_id) = get_min_ops_id(pool).await else {
+        return state;
+    };
+    if min_id <= 1 {
+        return state;
+    }
+    let seed = min_id - 1;
+    match snapshot_xips(pool).await {
+        Ok(xips) if xips.is_empty() => {
+            // No transaction can hold an invisible id — the hole is pure trim.
+            eprintln!("Ops poller: cursor at 0, seeding to MIN(id)-1 = {seed} (no txns in flight)");
+            state.cursor = seed;
+        }
+        Ok(xips) => {
+            // The pin only freezes cleanup if OUR cursor row exists — a fresh
+            // replica has none, and MIN(last_outbox_id) ignores absent rows.
+            if let Err(e) = super::queries::upsert_cursor(pool, cursor_name, 0).await {
+                eprintln!(
+                    "Ops poller: failed to pin cursor row at 0 ({e}); not seeding \
+                     (walking from 0 instead)"
+                );
+                return state;
+            }
+            eprintln!(
+                "Ops poller: cursor at 0, seeding read anchor to {seed} with boot guard — \
+                 {} txn(s) in flight may hold ids below the seed; durable cursor pinned at 0 \
+                 until they finish",
+                xips.len()
+            );
+            state.cursor = seed;
+            state.boot_guard = Some(BootGuard { seed, xips });
+        }
+        Err(e) => {
+            // Can't prove safety — walk from 0 (oversized guard will hold).
+            eprintln!("Ops poller: snapshot_xips failed at boot seed ({e}); not seeding");
+        }
+    }
+    state
+}
+
 /// Single poll + process cycle.
 async fn poll_and_process(
     pool: &PgPool,
@@ -219,7 +285,42 @@ async fn poll_and_process(
     state: &mut PollerState,
     replica_id: Option<&str>,
 ) -> Result<usize, String> {
-    // Fetch ops after the durable cursor. While a gap is pending this re-reads
+    // ── Boot-guard resolution (re-review N1) ──
+    // While active, the durable cursor is pinned at 0 (see advance_cursor_
+    // safe), freezing the cleanup threshold so nothing below the seed can be
+    // deleted. Once every boot-time txn has finished, any of their commits
+    // below the seed are now visible: rewind the read anchor beneath the
+    // lowest one and let the normal path deliver them.
+    if let Some(bg) = &state.boot_guard {
+        match gap_status(pool, &bg.xips, &BTreeSet::new()).await {
+            Ok((true, _)) => {
+                let seed = bg.seed;
+                if let Ok(min_id) = get_min_ops_id(pool).await {
+                    if min_id <= seed {
+                        eprintln!(
+                            "Ops poller: boot guard released — late commit(s) below seed \
+                             {seed} detected, rewinding read anchor to {}",
+                            min_id - 1
+                        );
+                        state.cursor = state.cursor.min(min_id - 1);
+                        // Re-reads may re-POST rows pruned from posted_ids —
+                        // at-least-once, absorbed downstream.
+                        state.posted_ids.clear();
+                    } else {
+                        eprintln!(
+                            "Ops poller: boot guard released — no late commits below seed {seed}"
+                        );
+                    }
+                    state.boot_guard = None;
+                }
+                // On get_min_ops_id error: keep the guard, retry next cycle.
+            }
+            Ok((false, _)) => {} // boot-time txns still running — hold
+            Err(e) => eprintln!("Ops poller: boot-guard check failed ({e}), holding"),
+        }
+    }
+
+    // Fetch ops after the read anchor. While a gap is pending this re-reads
     // rows already POSTed — required, because the gap can only fill in behind
     // them (the newly visible row must then POST too).
     let rows = poll_ops_from_cursor(pool, state.cursor, batch_limit)
@@ -257,7 +358,9 @@ async fn poll_and_process(
                     g.last_alert = Instant::now();
                     eprintln!(
                         "Ops poller: ALERT — cursor held {}s behind {} unresolved id(s) \
-                         (first: {:?}); long-running writer txn still open",
+                         (first: {:?}); long-running writer txn still open. New-op \
+                         delivery stalls once the backlog exceeds batch_limit; remedy is \
+                         pg_terminate_backend on the writer, NEVER a manual cursor bump",
                         g.seen_at.elapsed().as_secs(),
                         g.missing.len(),
                         g.missing.iter().next()
@@ -275,10 +378,16 @@ async fn poll_and_process(
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let frontier = compute_frontier(state.cursor, &ids, &state.dead_ids);
     let safe_id = frontier.safe_id;
-    if frontier.oversized {
+    if frontier.oversized
+        && state
+            .last_oversized_alert
+            .map_or(true, |t| t.elapsed() > GAP_ALERT_AFTER)
+    {
+        state.last_oversized_alert = Some(Instant::now());
         eprintln!(
             "Ops poller: ALERT — hole above id {safe_id} exceeds {GAP_SET_LIMIT} ids; \
-             holding cursor (trimmed table or cursor reset?)"
+             holding cursor (trimmed table or cursor reset?). Recovery: verify the hole \
+             is a rollback/trim, then manually advance the cursor past it."
         );
     }
     let known: BTreeSet<i64> = state.gap.as_ref().map(|g| g.missing.clone()).unwrap_or_default();
@@ -403,10 +512,13 @@ async fn poll_and_process(
     Ok(total_rows)
 }
 
-/// Advance the durable cursor to `safe_id` (never past an unresolved gap,
-/// never backwards). The bitdex_cursors upsert also fires the cleanup
-/// trigger, so a cursor that outran an invisible row would let cleanup delete
-/// it — this is the single choke point that prevents that.
+/// Advance the read anchor to `safe_id` (never past an unresolved gap, never
+/// backwards) and persist it as the durable cursor. The bitdex_cursors
+/// upsert also fires the cleanup trigger, so a cursor that outran an
+/// invisible row would let cleanup delete it — this is the single choke
+/// point that prevents that. While a boot guard is active the durable cursor
+/// stays pinned at 0 (only the in-memory anchor moves): persisting anything
+/// higher would unfreeze cleanup below the seed (re-review N1).
 async fn advance_cursor_safe(
     pool: &PgPool,
     cursor_name: &str,
@@ -416,9 +528,11 @@ async fn advance_cursor_safe(
     if safe_id <= state.cursor {
         return Ok(());
     }
-    super::queries::upsert_cursor(pool, cursor_name, safe_id)
-        .await
-        .map_err(|e| format!("upsert_cursor: {e}"))?;
+    if state.boot_guard.is_none() {
+        super::queries::upsert_cursor(pool, cursor_name, safe_id)
+            .await
+            .map_err(|e| format!("upsert_cursor: {e}"))?;
+    }
     state.cursor = safe_id;
     Ok(())
 }
@@ -642,6 +756,8 @@ mod pg_integration_tests {
             posted_ids: BTreeSet::new(),
             gap: None,
             dead_ids: BTreeSet::new(),
+            boot_guard: None,
+            last_oversized_alert: None,
         }
     }
 
@@ -771,8 +887,8 @@ mod pg_integration_tests {
     }
 
     /// Fresh replica against a trimmed table: boot seed jumps the cursor to
-    /// MIN(id)-1 instead of walking a giant hole. (Covers review finding 5's
-    /// boot regression.)
+    /// MIN(id)-1 instead of walking a giant hole — exercising the REAL
+    /// `init_state` (review finding 5 + re-review N5).
     #[tokio::test]
     #[ignore = "needs live PG via SKIP_RACE_PG_URL (tests/integration/run-skip-race-rust.sh)"]
     async fn trimmed_table_boot_seed() {
@@ -784,18 +900,70 @@ mod pg_integration_tests {
             .await
             .unwrap();
         insert_op(&pool, 777).await; // id 5000001
-        let min_id = get_min_ops_id(&pool).await.unwrap();
-        assert_eq!(min_id, 5_000_001);
-        // run_ops_poller's seed logic: cursor 0 → MIN(id)-1.
-        let seeded = if min_id > 1 { min_id - 1 } else { 0 };
         let (port, bodies) = mock_engine();
         let client = BitdexClient::new(&format!("http://127.0.0.1:{port}/api/indexes/t"));
-        let mut state = fresh_state();
-        state.cursor = seeded;
-        state.posted_ids = BTreeSet::new();
+        let mut state = init_state(&pool, "itest", 0).await;
+        assert_eq!(state.cursor, 5_000_000, "seed to MIN(id)-1");
+        assert!(state.boot_guard.is_none(), "idle test PG: no in-flight txns, no guard");
         poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
         assert_eq!(posted_entities(&bodies), vec![777]);
         assert_eq!(state.cursor, 5_000_001);
+        assert_eq!(durable_cursor(&pool).await, 5_000_001);
+    }
+
+    /// Re-review N1: booting while a transaction holds an allocated-but-
+    /// invisible id BELOW MIN(visible). The seed must carry a boot guard —
+    /// durable cursor pinned at 0 (cleanup frozen) — and after the txn
+    /// commits, the below-seed row must be delivered.
+    #[tokio::test]
+    #[ignore = "needs live PG via SKIP_RACE_PG_URL (tests/integration/run-skip-race-rust.sh)"]
+    async fn boot_seed_guards_inflight_txn_below_min() {
+        let url = std::env::var("SKIP_RACE_PG_URL").unwrap();
+        let pool = PgPool::connect(&url).await.unwrap();
+        setup(&pool).await;
+        // Build: visible id 3, invisible id 2 (in-flight), id 1 trimmed.
+        insert_op(&pool, 1).await; // id 1
+        let mut txn = pool.begin().await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO "BitdexOps" (entity_id, ops)
+               VALUES (29674681, '[{"op":"set","field":"publishedAt","value":1}]'::jsonb)"#,
+        )
+        .execute(&mut *txn) // id 2, uncommitted
+        .await
+        .unwrap();
+        insert_op(&pool, 555).await; // id 3
+        sqlx::query(r#"DELETE FROM "BitdexOps" WHERE id = 1"#) // trim
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (port, bodies) = mock_engine();
+        let client = BitdexClient::new(&format!("http://127.0.0.1:{port}/api/indexes/t"));
+        let mut state = init_state(&pool, "itest", 0).await;
+        assert_eq!(state.cursor, 2, "seed = MIN(visible)-1");
+        assert!(state.boot_guard.is_some(), "in-flight txn must trigger the guard");
+        assert_eq!(durable_cursor(&pool).await, 0, "durable cursor pinned at 0");
+
+        // While the txn is open: id 3 delivered, durable stays pinned.
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(posted_entities(&bodies), vec![555]);
+        assert_eq!(durable_cursor(&pool).await, 0);
+
+        // Txn commits — id 2 appears BELOW the seed. Guard releases, anchor
+        // rewinds, the row is delivered, then the durable cursor catches up.
+        txn.commit().await.unwrap();
+        let mut delivered = false;
+        for _ in 0..20 {
+            poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+            if posted_entities(&bodies).contains(&29674681) && state.cursor == 3 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(delivered, "below-seed late commit must be delivered (old code lost it)");
+        assert!(state.boot_guard.is_none());
+        assert_eq!(durable_cursor(&pool).await, 3);
     }
 }
 
