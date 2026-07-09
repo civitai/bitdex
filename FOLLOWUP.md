@@ -114,3 +114,16 @@ deployments always have alive slots) but a latent trap for tests and tiny indexe
 while building the boot-hang repro (PR #300 works around it). Fix candidate: load the
 deferred map unconditionally, not inside the alive-bitmap branch (concurrent_engine boot
 restore path).
+
+## Sweep operational findings (v1.1.33 backfill, 2026-07-08)
+
+Sweep enabled in prod (600s/20k via PATCH, both pods) and healing 56-116 slots/pass in
+<400ms. Two small gaps found in operation:
+1. **max_page_size clamps the sweep window**: the sweep passes sweep_limit (20k) as the
+   query limit, but execute_query caps results at max_page_size (prod: 200) — each pass only
+   examines the top-200 feed-relevant shadow-false candidates. Fix: sweep should paginate
+   via cursor or bypass the page cap (it is an internal maintenance query).
+2. **healed-count is not a backlog gauge**: a just-published post whose deferred activation
+   hasn't fired yet (≤90s window) appears as a healable candidate — the sweep races the
+   normal path (benign, idempotent) and inflates "healed". Backlog sizing needs a direct
+   measure (PG-vs-bitmap count on the replica), not this counter.
