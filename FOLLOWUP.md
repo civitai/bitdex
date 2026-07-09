@@ -1,5 +1,19 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Desc tie-band pagination — FIXED in PR #304 (2026-07-09 night)
+
+Core sort bug, present since the bifurcation engine: descending keyset pagination dropped
+the remainder of every tied-value band straddling a page boundary (bifurcate tail-take
+ascending vs (value desc, slot desc) contract used by order_results + cursor resume).
+Masqueraded for months as: top-200 feed misses, "time-bucket membership churn", and — per
+review — a slice of historical shadow-comparator divergence and dup/gap reports, because
+the CACHE-HIT paths (sorted-keys/simple-sort) already used the correct contract, so
+cache-hit and cache-miss pages returned DIFFERENT slots for the same query+cursor on tied
+bands. Deploy note: shadow-vs-Meili divergence will SHIFT on the release (tie order now
+consistent, likely closer to Meili recency tiebreak) — expected, not a regression.
+Follow-up (non-blocking): engine-level E2E sweep alternating cache-hit/cache-miss pages to
+pin cross-path tie consistency.
+
 ## Ops-poller cursor skip on out-of-order commits — FIX IN PR (this branch, 2026-07-09)
 
 **Root cause of the residual ~1% publish-weighted loss** (specimen: post 29674681's publish
