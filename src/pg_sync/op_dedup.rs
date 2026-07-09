@@ -81,7 +81,20 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
     // Key: (field, value_as_string), Value: net count (+1 for add, -1 for remove)
     let mut multi_value_net: HashMap<(String, String), i64> = HashMap::new();
 
-    // Track queryOpSet by query string (last wins)
+    // Track queryOpSet by query string — MERGE nested ops, never last-wins.
+    //
+    // Every Post fan-out carries the identical query string ("postId eq X"),
+    // and one user action (e.g. scheduling a post) can update the Post row
+    // more than once inside a single poller/WAL batch. The old wholesale
+    // last-wins here silently DISCARDED the earlier fan-out's nested ops —
+    // if the first update carried `Set publishedAt=Tf` and the second only
+    // `Set availability` (publishedAt unchanged emits nothing under
+    // IS DISTINCT FROM), the publish op evaporated before the engine ever
+    // saw it: total per-post publish no-op, ~7% of scheduled posts, the
+    // last surviving member of the 2026-07 fan-out loss family. Nested ops
+    // are concatenated in arrival order and deduped with the same per-field
+    // LIFO rules as entity ops, so same-field conflicts still resolve
+    // last-wins per FIELD — never per fan-out.
     let mut query_ops: HashMap<Option<String>, Vec<Op>> = HashMap::new();
 
     for op in all_ops {
@@ -104,7 +117,10 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
                 *multi_value_net.entry(key).or_insert(0) += 1;
             }
             Op::QueryOpSet { ref query, ops: ref nested_ops } => {
-                query_ops.insert(query.clone(), nested_ops.clone());
+                query_ops
+                    .entry(query.clone())
+                    .or_default()
+                    .extend(nested_ops.iter().cloned());
             }
             Op::Delete => unreachable!("handled above"),
             Op::Alive => {} // Signal-only, no dedup needed
@@ -137,9 +153,12 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
         }
     }
 
-    // QueryOpSets: last query string wins
-    for (query, nested) in query_ops {
-        ops.push(Op::QueryOpSet { query, ops: nested });
+    // QueryOpSets: one per query string, nested ops merged + field-deduped.
+    for (query, mut nested) in query_ops {
+        dedup_entity_ops(&mut nested);
+        if !nested.is_empty() {
+            ops.push(Op::QueryOpSet { query, ops: nested });
+        }
     }
 }
 
@@ -269,6 +288,63 @@ mod tests {
         let has_set = batch[0].ops.iter().any(|op| matches!(op, Op::Set { field, .. } if field == "nsfwLevel"));
         assert!(has_remove, "remove should survive");
         assert!(has_set, "set should survive");
+    }
+
+    /// Regression (2026-07-09, the last fan-out loss survivor): two fan-outs
+    /// for the SAME entity + query in one batch must MERGE their nested ops —
+    /// the old wholesale last-wins discarded the earlier fan-out's ops. Kill
+    /// shape: schedule action = Post update A (Set publishedAt) then update B
+    /// (Set availability, publishedAt unchanged so not re-emitted) in one
+    /// poller batch → publishedAt evaporated → total per-post publish no-op
+    /// (~7% of scheduled posts; specimens 29651562/29651617/29651221/
+    /// 29666515/29666636/29666669).
+    #[test]
+    fn test_query_op_set_same_query_merges_disjoint_fields() {
+        let mut batch = vec![entity(100, vec![
+            Op::QueryOpSet {
+                query: Some("postId eq 100".into()),
+                ops: vec![Op::Set { field: "publishedAt".into(), value: json!(1783571340) }],
+            },
+            Op::QueryOpSet {
+                query: Some("postId eq 100".into()),
+                ops: vec![Op::Set { field: "availability".into(), value: json!("Public") }],
+            },
+        ])];
+        dedup_ops(&mut batch);
+        let qops: Vec<_> = batch[0].ops.iter()
+            .filter(|op| matches!(op, Op::QueryOpSet { .. }))
+            .collect();
+        assert_eq!(qops.len(), 1, "same query string must collapse to ONE fan-out");
+        if let Op::QueryOpSet { ops, .. } = &qops[0] {
+            let has_pub = ops.iter().any(|o| matches!(o, Op::Set { field, .. } if field == "publishedAt"));
+            let has_avail = ops.iter().any(|o| matches!(o, Op::Set { field, .. } if field == "availability"));
+            assert!(has_pub, "publishedAt Set must SURVIVE the merge (was discarded pre-fix)");
+            assert!(has_avail, "availability Set must survive too");
+        }
+    }
+
+    /// Same-field conflicts across merged fan-outs still resolve last-wins —
+    /// per FIELD, not per fan-out (preserves the old test's intent).
+    #[test]
+    fn test_query_op_set_same_query_same_field_last_wins() {
+        let mut batch = vec![entity(100, vec![
+            Op::QueryOpSet {
+                query: Some("postId eq 100".into()),
+                ops: vec![Op::Set { field: "publishedAt".into(), value: json!(111) }],
+            },
+            Op::QueryOpSet {
+                query: Some("postId eq 100".into()),
+                ops: vec![Op::Set { field: "publishedAt".into(), value: json!(222) }],
+            },
+        ])];
+        dedup_ops(&mut batch);
+        if let Some(Op::QueryOpSet { ops, .. }) = batch[0].ops.iter().find(|op| matches!(op, Op::QueryOpSet { .. })) {
+            let sets: Vec<_> = ops.iter().filter(|o| matches!(o, Op::Set { field, .. } if field == "publishedAt")).collect();
+            assert_eq!(sets.len(), 1);
+            if let Op::Set { value, .. } = sets[0] {
+                assert_eq!(*value, json!(222), "later fan-out's value wins per-field");
+            }
+        } else { panic!("queryOpSet missing"); }
     }
 
     #[test]
