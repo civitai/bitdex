@@ -1,5 +1,28 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Ops-poller cursor skip on out-of-order commits — FIX IN PR (this branch, 2026-07-09)
+
+**Root cause of the residual ~1% publish-weighted loss** (specimen: post 29674681's publish
+fan-out; also explains bitdex-0/bitdex-1 divergence — per-pod cursors skip independently).
+BIGSERIAL ids are allocated at INSERT but visible at COMMIT; the poller read
+`WHERE id > cursor` and advanced the cursor to the max VISIBLE id, silently passing rows
+from still-open transactions (publishing = the longest transactions in the product). The
+bitdex_cursors cleanup trigger then deleted the skipped row — evidence destroyed.
+Deterministic repro: `tests/integration/skip-race-repro.sh` (fails on old semantics) /
+`skip-race-fixed.sh` (passes with the fix).
+
+**Fix** (`fix/ops-poller-skip-race`): gap-aware frontier walk — the durable cursor never
+passes an allocated-but-invisible id. Rows beyond a gap still POST immediately
+(`posted_hwm`); re-delivery after restart is absorbed by the WAL reader's LIFO dedup. Gap
+resolution: commit fills it (normal, seconds), or every txn in flight at first sight has
+finished → rollback, skip (snapshot-xip membership check), or 60s hard timeout.
+
+**Residual risk accepted:** during a gap hold, rows beyond the gap apply to the engine
+before the gap row — out-of-order WITHIN a ≤60s window (absolute ops make this converge).
+Detection tooling: lossless trap trigger `bitdex_trap_lossless` on BitdexOps (prod,
+2026-07-09) captures every queryOpSet emission inside the inserting txn — skip rate is now
+measurable (captured fan-outs >5min old vs engine applied-state).
+
 ## LCS dictionary durability hole — FIX IN PR (this branch, 2026-07-08)
 
 **Status: interim fix implemented** (`fix/dict-durability`): atomic tmp+fsync+rename in
