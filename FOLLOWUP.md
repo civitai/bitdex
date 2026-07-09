@@ -114,3 +114,24 @@ deployments always have alive slots) but a latent trap for tests and tiny indexe
 while building the boot-hang repro (PR #300 works around it). Fix candidate: load the
 deferred map unconditionally, not inside the alive-bitmap branch (concurrent_engine boot
 restore path).
+
+## Fan-out total no-op — ROOT-CAUSED + FIXED (2026-07-09, fix/fanout-dedup-collapse)
+
+The last surviving fan-out loss class (~3% of publishes; ALL scheduled posts — minute-
+boundary publishedAt): `op_dedup.rs` deduped queryOpSets by (entity, query string) with
+wholesale LAST-WINS. Every Post fan-out shares the identical query ("postId eq X"), so when
+one user action produced two Post updates inside a single poller/WAL batch (schedule sets
+publishedAt=Tf; a second update carries only availability — unchanged publishedAt emits
+nothing under IS DISTINCT FROM), the LATER fan-out silently discarded the publish Set.
+Nothing deferred → and PG emits NOTHING at go-live for scheduled posts (confirmed live:
+post 29666669's Tf passed with zero BitdexOps rows) → permanently invisible.
+
+Evidence chain: pre-go-live predictor (pending scheduled posts whose image docs lack
+doc.publishedAt=Tf) found 29666669 40 minutes before its Tf and correctly prophesied the
+loss; unit + E2E repros fail on the old dedup and pass with the fix (nested ops now MERGE
+per query string and dedup per-FIELD, preserving last-wins per field). Both dedup layers
+(ops_poller pre-send + WAL reader pre-apply) share this helper — one fix covers both.
+
+Backfill after deploy: stuck scheduled posts enumerable via bitmap-vs-PG (isPublished
+false + PG published, publishedAt % 60 == 0 dominant); pre-go-live pending posts self-heal
+if rescheduled, else need the same re-emit.
