@@ -39,7 +39,11 @@ e.g. a rolled-back bulk txn): verify it is rollback/trim, then manually advance 
 cursor past it. Alert-only observability via "ALERT — cursor held" log lines (sidecar has
 no metrics endpoint). Boot at cursor==0 seeds to MIN(id)-1; if txns are in flight at seed
 time a boot guard pins the durable cursor at 0 until they finish, then sweeps late
-commits below the seed (re-review N1). Requires PG >= 13 (`pg_current_snapshot`); prod
+commits below the seed (re-review N1). If a replica dies PERMANENTLY while pinned, its
+0-value bitdex_cursors row freezes cleanup table-wide — unexplained BitdexOps growth +
+a 0-valued cursor row from a dead replica means: delete that stale row (pre-existing
+stale-cursor-row class; live-replica guard windows are bounded by the longest boot-time
+txn). Requires PG >= 13 (`pg_current_snapshot`); prod
 CNPG is 16. Merge-gate script is NOT in CI (needs docker) — run it manually before
 touching ops_poller.rs; listed in the release playbook.
 Detection tooling: lossless trap trigger `bitdex_trap_lossless` on BitdexOps (prod,
