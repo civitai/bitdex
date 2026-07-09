@@ -285,17 +285,28 @@ impl SortField {
             );
         }
 
-        // After all layers, if we still need more slots, take them from remaining
+        // After all layers, if we still need more slots, take them from
+        // remaining — a band of slots with EQUAL sort values. The slots taken
+        // MUST be the ones that sort FIRST under the tie order the rest of
+        // the pipeline uses, or keyset pagination silently drops the rest of
+        // the band: `order_results_with_layers` breaks ties by slot id
+        // (descending: higher slot first) and `apply_cursor_filter_with_layers`
+        // resumes a descending cursor at `slot_id < cursor.slot_id`. Taking
+        // the ASCENDING end here made a descending page end on the band's
+        // MINIMUM slot id, so the resume found nothing below it and the whole
+        // band remainder vanished from every feed sweep (prod 2026-07-09:
+        // top-reacted images with tied reactionCount at page boundaries
+        // disappeared from paginated enumeration; bands of thousands at
+        // rc 0-2 were each truncated to one page).
         if remaining_limit > 0 && !remaining.is_empty() {
-            // remaining slots all have equal sort values at this point;
-            // take up to remaining_limit from them
-            let mut taken = 0;
-            for slot in remaining.iter() {
-                if taken >= remaining_limit {
-                    break;
+            if descending {
+                for slot in remaining.iter().rev().take(remaining_limit) {
+                    result.insert(slot);
                 }
-                result.insert(slot);
-                taken += 1;
+            } else {
+                for slot in remaining.iter().take(remaining_limit) {
+                    result.insert(slot);
+                }
             }
         }
 
@@ -705,6 +716,107 @@ impl Default for SortIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION (prod 2026-07-09): descending keyset pagination silently
+    /// dropped the remainder of every tied-value band that straddled a page
+    /// boundary. `bifurcate_with_layers` took the tie-band tail in ASCENDING
+    /// slot order while the ordering stage emits descending ties by
+    /// DESCENDING slot id and the cursor resume keeps `slot_id < cursor` —
+    /// so the page ended on the band's minimum slot and the resume found
+    /// nothing. Prod effect: top-reacted feed images with tied
+    /// reactionCounts vanished from paginated sweeps (bands of thousands at
+    /// rc 0-2 truncated to one page; page-end cursor sequence showed zero
+    /// repeated sort values). Paginating any tie band wider than the page
+    /// size must enumerate EVERY slot exactly once.
+    #[test]
+    fn test_descending_pagination_enumerates_full_tie_band() {
+        let mut sf = SortField::new(make_config("reactionCount"));
+        let mut candidates = RoaringBitmap::new();
+        // 30 slots with value 50 (the wide tie band), plus sentinels above
+        // and below to make the band interior to the enumeration.
+        for slot in 100..130 {
+            sf.insert(slot, 50);
+            candidates.insert(slot);
+        }
+        sf.insert(50, 99); // sorts first (desc)
+        candidates.insert(50);
+        sf.insert(200, 1); // sorts last
+        candidates.insert(200);
+
+        // Paginate with a page size smaller than the band.
+        let mut seen = Vec::new();
+        let mut cursor: Option<(u64, u32)> = None;
+        loop {
+            let page = sf.top_n(&candidates, 7, true, cursor);
+            if page.is_empty() {
+                break;
+            }
+            seen.extend_from_slice(&page);
+            let last = *page.last().unwrap();
+            cursor = Some((sf.reconstruct_value(last) as u64, last));
+            if page.len() < 7 {
+                break;
+            }
+        }
+
+        let mut sorted_seen = seen.clone();
+        sorted_seen.sort_unstable();
+        sorted_seen.dedup();
+        assert_eq!(
+            seen.len(),
+            sorted_seen.len(),
+            "pagination must not emit duplicates"
+        );
+        let mut expected: Vec<u32> = (100..130).collect();
+        expected.push(50);
+        expected.push(200);
+        expected.sort_unstable();
+        assert_eq!(
+            sorted_seen, expected,
+            "every tied slot must be enumerated exactly once across pages"
+        );
+    }
+
+    /// Ascending twin of the tie-band pagination regression — the ascending
+    /// path took the correct end already; pin it so a symmetric refactor
+    /// can't break it.
+    #[test]
+    fn test_ascending_pagination_enumerates_full_tie_band() {
+        let mut sf = SortField::new(make_config("reactionCount"));
+        let mut candidates = RoaringBitmap::new();
+        for slot in 100..130 {
+            sf.insert(slot, 50);
+            candidates.insert(slot);
+        }
+        sf.insert(50, 1); // sorts first (asc)
+        candidates.insert(50);
+        sf.insert(200, 99); // sorts last
+        candidates.insert(200);
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<(u64, u32)> = None;
+        loop {
+            let page = sf.top_n(&candidates, 7, false, cursor);
+            if page.is_empty() {
+                break;
+            }
+            seen.extend_from_slice(&page);
+            let last = *page.last().unwrap();
+            cursor = Some((sf.reconstruct_value(last) as u64, last));
+            if page.len() < 7 {
+                break;
+            }
+        }
+        let mut sorted_seen = seen.clone();
+        sorted_seen.sort_unstable();
+        sorted_seen.dedup();
+        assert_eq!(seen.len(), sorted_seen.len());
+        let mut expected: Vec<u32> = (100..130).collect();
+        expected.push(50);
+        expected.push(200);
+        expected.sort_unstable();
+        assert_eq!(sorted_seen, expected);
+    }
 
     fn make_config(name: &str) -> SortFieldConfig {
         SortFieldConfig {
