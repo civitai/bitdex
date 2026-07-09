@@ -1,5 +1,55 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Ops-poller cursor skip on out-of-order commits — FIX IN PR (this branch, 2026-07-09)
+
+**Root cause of the residual ~1% publish-weighted loss** (specimen: post 29674681's publish
+fan-out; also explains bitdex-0/bitdex-1 divergence — per-pod cursors skip independently).
+BIGSERIAL ids are allocated at INSERT but visible at COMMIT; the poller read
+`WHERE id > cursor` and advanced the cursor to the max VISIBLE id, silently passing rows
+from still-open transactions (publishing = the longest transactions in the product). The
+bitdex_cursors cleanup trigger then deleted the skipped row — evidence destroyed.
+Deterministic repro: `tests/integration/skip-race-repro.sh` (fails on old semantics) /
+`skip-race-fixed.sh` (passes with the fix).
+
+**Fix** (`fix/ops-poller-skip-race`, reworked after adversarial review REJECT — 3 blockers
+in the first cut, all closed): gap-aware frontier walk — the durable cursor never passes an
+allocated-but-invisible id. Rows beyond a gap still POST immediately, tracked as a per-id
+`posted_ids` SET (a high-water mark silently drops the gap row when it fills by commit —
+review finding 1). An id leaves the missing set ONLY by turning visible (commit → POSTs) or
+by the ATOMIC finished-and-still-invisible check (`gap_status`, one statement = one
+snapshot; separate checks reintroduce the race — finding 2). There is NO time-based skip: a
+held gap alerts every 60s but never skips (a slower-than-timeout txn is exactly the row
+being protected — finding 3). Multi-id holes resolve as one set under one snapshot
+(finding 5); cursor==0 boots seed to MIN(id)-1 against trimmed tables; >100k holes flag
+oversized and hold.
+
+**Merge gate:** `tests/integration/run-skip-race-rust.sh` — REAL `poll_and_process`
+against live PG 16 + mock engine: commit-fill delivers the gap row, rollback proven dead
+without POSTing, trimmed-table boot seed. The SQL scripts are semantics demos only.
+
+**Residual risk accepted:** during a gap hold, rows beyond the gap apply to the engine
+before the gap row (absolute ops converge; the reorder window is unbounded if the writer
+txn is stuck, not ≤60s). A genuinely stuck writer txn holds the cursor indefinitely —
+delivery of already-visible rows continues ONLY within the first `batch_limit` (5000) ids
+above the held cursor; once the backlog exceeds that, NEW ops stop flowing until the gap
+resolves (minutes into a long hold at prod volume). **Runbook:** remedy for a wedged
+writer is `pg_terminate_backend(<pid>)` on the PG side — NEVER a manual cursor bump,
+which deliberately reproduces the original data loss. For an oversized hole (>100k ids,
+e.g. a rolled-back bulk txn): verify it is rollback/trim, then manually advance the
+cursor past it. Alert-only observability via "ALERT — cursor held" log lines (sidecar has
+no metrics endpoint). Boot at cursor==0 seeds to MIN(id)-1; if txns are in flight at seed
+time a boot guard pins the durable cursor at 0 until they finish, then sweeps late
+commits below the seed (re-review N1). If a replica dies PERMANENTLY while pinned, its
+0-value bitdex_cursors row freezes cleanup table-wide — unexplained BitdexOps growth +
+a 0-valued cursor row from a dead replica means: delete that stale row (pre-existing
+stale-cursor-row class; live-replica guard windows are bounded by the longest boot-time
+txn). Requires PG >= 13 (`pg_current_snapshot`); prod
+CNPG is 16. Merge-gate script is NOT in CI (needs docker) — run it manually before
+touching ops_poller.rs; listed in the release playbook.
+Detection tooling: lossless trap trigger `bitdex_trap_lossless` on BitdexOps (prod,
+2026-07-09) captures every queryOpSet emission inside the inserting txn — skip rate is now
+measurable (captured fan-outs >5min old vs engine applied-state).
+
 ## LCS dictionary durability hole — FIX IN PR (this branch, 2026-07-08)
 
 **Status: interim fix implemented** (`fix/dict-durability`): atomic tmp+fsync+rename in
