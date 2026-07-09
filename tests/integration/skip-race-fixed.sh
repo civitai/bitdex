@@ -1,5 +1,8 @@
 #!/bin/sh
-# PASSING half of the gate: same out-of-order-commit scenario as skip_repro.sh,
+# SEMANTICS DEMO ONLY — not the merge gate. This re-implements the frontier
+# walk in SQL and does not exercise the shipped Rust (no posted_ids, no gap
+# lifecycle, no xips). The merge gate is run-skip-race-rust.sh, which runs the
+# REAL poll_and_process. Same out-of-order-commit scenario as skip-race-repro.sh,
 # but the poller advances its cursor with the gap-aware frontier walk
 # (compute_safe_frontier semantics from the fix): the durable cursor holds
 # below an allocated-but-invisible id; rows beyond the gap still POST.

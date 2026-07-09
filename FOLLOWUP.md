@@ -11,14 +11,27 @@ bitdex_cursors cleanup trigger then deleted the skipped row — evidence destroy
 Deterministic repro: `tests/integration/skip-race-repro.sh` (fails on old semantics) /
 `skip-race-fixed.sh` (passes with the fix).
 
-**Fix** (`fix/ops-poller-skip-race`): gap-aware frontier walk — the durable cursor never
-passes an allocated-but-invisible id. Rows beyond a gap still POST immediately
-(`posted_hwm`); re-delivery after restart is absorbed by the WAL reader's LIFO dedup. Gap
-resolution: commit fills it (normal, seconds), or every txn in flight at first sight has
-finished → rollback, skip (snapshot-xip membership check), or 60s hard timeout.
+**Fix** (`fix/ops-poller-skip-race`, reworked after adversarial review REJECT — 3 blockers
+in the first cut, all closed): gap-aware frontier walk — the durable cursor never passes an
+allocated-but-invisible id. Rows beyond a gap still POST immediately, tracked as a per-id
+`posted_ids` SET (a high-water mark silently drops the gap row when it fills by commit —
+review finding 1). An id leaves the missing set ONLY by turning visible (commit → POSTs) or
+by the ATOMIC finished-and-still-invisible check (`gap_status`, one statement = one
+snapshot; separate checks reintroduce the race — finding 2). There is NO time-based skip: a
+held gap alerts every 60s but never skips (a slower-than-timeout txn is exactly the row
+being protected — finding 3). Multi-id holes resolve as one set under one snapshot
+(finding 5); cursor==0 boots seed to MIN(id)-1 against trimmed tables; >100k holes flag
+oversized and hold.
+
+**Merge gate:** `tests/integration/run-skip-race-rust.sh` — REAL `poll_and_process`
+against live PG 16 + mock engine: commit-fill delivers the gap row, rollback proven dead
+without POSTing, trimmed-table boot seed. The SQL scripts are semantics demos only.
 
 **Residual risk accepted:** during a gap hold, rows beyond the gap apply to the engine
-before the gap row — out-of-order WITHIN a ≤60s window (absolute ops make this converge).
+before the gap row (absolute ops converge). A genuinely stuck writer txn holds the cursor
+indefinitely — delivery continues (posted set); alert-only, observable via "ALERT — cursor
+held" log lines. Sidecar has no metrics endpoint for a gauge — log-based for now.
+Requires PG >= 13 (`pg_current_snapshot`); prod CNPG is 16.
 Detection tooling: lossless trap trigger `bitdex_trap_lossless` on BitdexOps (prod,
 2026-07-09) captures every queryOpSet emission inside the inserting txn — skip rate is now
 measurable (captured fan-outs >5min old vs engine applied-state).

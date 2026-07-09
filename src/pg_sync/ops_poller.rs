@@ -22,11 +22,17 @@ use super::bitdex_client::BitdexClient;
 use super::op_dedup::dedup_ops;
 use super::ops::{EntityOps, Op, OpsBatch, SyncMeta};
 
-/// How long a frontier gap may stay unresolved before it is declared a
-/// rolled-back insert and skipped. This is the fallback only — the normal
-/// resolution path is the in-flight-transaction check, which settles as soon
-/// as the transactions that were running when the gap appeared finish.
-const GAP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a gap may stay unresolved before the poller starts alerting.
+/// A held gap is NEVER skipped on time — a transaction slower than any
+/// timeout is exactly the row this machinery exists to protect. The only way
+/// an id is declared dead is the atomic finished-and-still-invisible check
+/// (`gap_status`), which is definitionally a rollback.
+const GAP_ALERT_AFTER: Duration = Duration::from_secs(60);
+
+/// Upper bound on tracked missing ids. A hole this large is not a rolled-back
+/// transaction — it's a trimmed table or an operator cursor reset. Hold the
+/// cursor and alert instead of building a multi-million-entry set.
+const GAP_SET_LIMIT: usize = 100_000;
 
 /// Row from BitdexOps table.
 #[derive(Debug, sqlx::FromRow)]
@@ -36,59 +42,90 @@ struct OpsRow {
     ops: sqlx::types::Json<Vec<Op>>,
 }
 
-/// The lowest sequence-allocated id above the cursor that is not yet visible.
+/// Sequence-allocated ids above the cursor that are not yet visible.
 ///
 /// BIGSERIAL ids are handed out at INSERT time but rows only become visible at
 /// COMMIT, so a long transaction's row can commit AFTER a later-id row from a
 /// quick transaction. Advancing the cursor to the max VISIBLE id silently
 /// skips the still-invisible row forever, and the bitdex_cursors cleanup
-/// trigger then deletes it (repro: skip_repro.sh; prod specimen: post
-/// 29674681's publish fan-out, 2026-07-09). The durable cursor must hold
-/// below a gap until it either fills in (commit) or is proven a rollback.
+/// trigger then deletes it (repro: tests/integration/skip-race-repro.sh; prod
+/// specimen: post 29674681's publish fan-out, 2026-07-09). The durable cursor
+/// must hold below a gap until it fills in (commit) or is PROVEN a rollback.
 struct GapInfo {
-    first_missing: i64,
-    seen_at: Instant,
-    /// Backend txids in flight when the gap was first observed. The inserting
-    /// transaction is necessarily among them (its row exists but is
-    /// invisible), so once ALL of them have finished and the row is still
-    /// invisible, the insert was rolled back and the id is safe to skip.
+    /// Every id in (cursor, max seen] that was allocated but not visible when
+    /// last checked. One rolled-back transaction can hold many.
+    missing: BTreeSet<i64>,
+    /// Backend txids in flight when the missing set was (last) recorded. Each
+    /// missing id's inserting transaction is either among them or has since
+    /// committed (in which case the id turns visible and leaves the set) —
+    /// so once ALL of them finished AND an id is still invisible, that insert
+    /// rolled back. Both facts are checked in ONE statement (one snapshot) in
+    /// `gap_status`; checking them separately re-opens the race this fixes.
     xips: Vec<i64>,
+    seen_at: Instant,
+    last_alert: Instant,
 }
 
 /// Poller cursor state. The durable cursor never passes an unresolved gap;
-/// rows beyond a gap are still POSTed immediately (tracked by `posted_hwm`)
+/// rows beyond a gap still POST immediately (tracked per-id in `posted_ids`)
 /// and may re-POST after a restart — the same at-least-once semantics as
 /// crash recovery, absorbed by the WAL reader's LIFO dedup.
 struct PollerState {
     cursor: i64,
-    posted_hwm: i64,
+    /// Ids POSTed but not yet passed by the durable cursor. A plain
+    /// high-water mark cannot represent "posted" here: a gap row that fills
+    /// in by commit appears BELOW the mark and would be silently dropped
+    /// (review 2026-07-09 finding 1). Pruned as the cursor advances, so it
+    /// stays bounded by the held window.
+    posted_ids: BTreeSet<i64>,
     gap: Option<GapInfo>,
-    /// Ids declared rolled-back; treated as consumed when walking the
+    /// Ids proven rolled-back; treated as consumed when walking the
     /// frontier. Pruned once the cursor passes them.
     dead_ids: BTreeSet<i64>,
 }
 
-/// Walk ids (sorted ascending, all > cursor) from `cursor + 1` and return
-/// `(safe_id, first_missing)`: the highest id the durable cursor may advance
-/// to without passing an unexplained hole, and the first missing id if any.
-/// `dead_ids` are ids proven rolled back — they count as present.
-fn compute_safe_frontier(
-    cursor: i64,
-    ids: &[i64],
-    dead_ids: &BTreeSet<i64>,
-) -> (i64, Option<i64>) {
+/// Frontier walk result.
+struct Frontier {
+    /// Highest id the durable cursor may advance to without passing an
+    /// unexplained hole.
+    safe_id: i64,
+    /// Every unexplained hole in (cursor, max id], capped at GAP_SET_LIMIT.
+    missing: Vec<i64>,
+    /// Hole exceeded GAP_SET_LIMIT — trimmed table / operator reset, not a
+    /// transaction. Hold and alert; never enumerate or skip.
+    oversized: bool,
+}
+
+/// Walk ids (sorted ascending, all > cursor) from `cursor + 1`. `dead_ids`
+/// are ids proven rolled back — they count as present.
+fn compute_frontier(cursor: i64, ids: &[i64], dead_ids: &BTreeSet<i64>) -> Frontier {
+    let mut missing = Vec::new();
+    let mut safe = None;
     let mut expected = cursor + 1;
     for &id in ids {
+        // Bail before enumerating a pathological hole one id at a time.
+        if (id - expected) as usize > GAP_SET_LIMIT + dead_ids.len() {
+            return Frontier {
+                safe_id: safe.unwrap_or(expected - 1),
+                missing,
+                oversized: true,
+            };
+        }
         while expected < id {
-            if dead_ids.contains(&expected) {
-                expected += 1;
-            } else {
-                return (expected - 1, Some(expected));
+            if !dead_ids.contains(&expected) {
+                if safe.is_none() {
+                    safe = Some(expected - 1);
+                }
+                if missing.len() >= GAP_SET_LIMIT {
+                    return Frontier { safe_id: safe.unwrap_or(cursor), missing, oversized: true };
+                }
+                missing.push(expected);
             }
+            expected += 1;
         }
         expected = id + 1;
     }
-    (expected - 1, None)
+    Frontier { safe_id: safe.unwrap_or(expected - 1), missing, oversized: false }
 }
 
 /// Run the V2 ops poller loop. Runs forever until cancelled.
@@ -111,12 +148,23 @@ pub async fn run_ops_poller(
     eprintln!("BitDex is healthy.");
 
     // Read initial cursor from PG
-    let cursor: i64 = read_cursor_from_pg(pool, cursor_name)
+    let mut cursor: i64 = read_cursor_from_pg(pool, cursor_name)
         .await
         .unwrap_or(0);
+    if cursor == 0 {
+        // Fresh replica against a cleanup-trimmed table: the hole between 0
+        // and MIN(id) is trim, not in-flight transactions. Seed below the
+        // first real row so the frontier walk starts from data.
+        if let Ok(min_id) = get_min_ops_id(pool).await {
+            if min_id > 1 {
+                eprintln!("Ops poller: cursor at 0, seeding to MIN(id)-1 = {}", min_id - 1);
+                cursor = min_id - 1;
+            }
+        }
+    }
     let mut state = PollerState {
         cursor,
-        posted_hwm: cursor,
+        posted_ids: BTreeSet::new(),
         gap: None,
         dead_ids: BTreeSet::new(),
     };
@@ -172,8 +220,8 @@ async fn poll_and_process(
     replica_id: Option<&str>,
 ) -> Result<usize, String> {
     // Fetch ops after the durable cursor. While a gap is pending this re-reads
-    // rows already POSTed (id <= posted_hwm) — required, because the gap can
-    // only fill in behind them.
+    // rows already POSTed — required, because the gap can only fill in behind
+    // them (the newly visible row must then POST too).
     let rows = poll_ops_from_cursor(pool, state.cursor, batch_limit)
         .await
         .map_err(|e| format!("poll_ops: {e}"))?;
@@ -182,59 +230,118 @@ async fn poll_and_process(
         return Ok(0);
     }
 
-    // Gap accounting BEFORE advancing anything.
-    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let (mut safe_id, mut first_missing) =
-        compute_safe_frontier(state.cursor, &ids, &state.dead_ids);
-    match (&state.gap, first_missing) {
-        (Some(g), Some(fm)) if g.first_missing == fm => {
-            // Same frontier gap still open: resolved as a rollback once every
-            // transaction that was in flight at first sight has finished (the
-            // inserting txn was necessarily among them), or on timeout.
-            let expired = g.seen_at.elapsed() > GAP_TIMEOUT;
-            if expired || xips_all_finished(pool, &g.xips).await {
-                if expired {
+    // ── Gap resolution BEFORE advancing anything ──
+    // An id leaves the missing set only by turning visible (commit — it then
+    // POSTs like any row) or by the atomic finished-and-still-invisible check
+    // (rollback — it joins dead_ids). There is NO time-based skip: a slower-
+    // than-timeout transaction is exactly the row this protects.
+    if let Some(g) = &mut state.gap {
+        match gap_status(pool, &g.xips, &g.missing).await {
+            Ok((all_finished, still_invisible)) => {
+                g.missing = still_invisible; // visible ids re-enter via `rows`
+                if g.missing.is_empty() {
+                    state.gap = None;
+                } else if all_finished {
+                    // Every txn that could own these inserts finished, and the
+                    // ids are STILL invisible (same snapshot) — rolled back.
                     eprintln!(
-                        "Ops poller: gap at id {fm} unresolved after {}s — declaring rolled back",
-                        GAP_TIMEOUT.as_secs()
+                        "Ops poller: {} missing id(s) proven rolled back (first: {:?})",
+                        g.missing.len(),
+                        g.missing.iter().next()
+                    );
+                    state.dead_ids.append(&mut g.missing);
+                    state.gap = None;
+                } else if g.seen_at.elapsed() > GAP_ALERT_AFTER
+                    && g.last_alert.elapsed() > GAP_ALERT_AFTER
+                {
+                    g.last_alert = Instant::now();
+                    eprintln!(
+                        "Ops poller: ALERT — cursor held {}s behind {} unresolved id(s) \
+                         (first: {:?}); long-running writer txn still open",
+                        g.seen_at.elapsed().as_secs(),
+                        g.missing.len(),
+                        g.missing.iter().next()
                     );
                 }
-                state.dead_ids.insert(fm);
-                state.gap = None;
-                let (s, f) = compute_safe_frontier(state.cursor, &ids, &state.dead_ids);
-                safe_id = s;
-                first_missing = f;
+            }
+            Err(e) => {
+                // Err on the held side: keep the gap, retry next cycle.
+                eprintln!("Ops poller: gap_status failed ({e}), holding");
             }
         }
-        _ => {}
     }
-    match first_missing {
-        Some(fm) => {
-            if state.gap.as_ref().map(|g| g.first_missing) != Some(fm) {
-                // New frontier gap: capture the in-flight snapshot now.
-                let xips = snapshot_xips(pool).await.unwrap_or_default();
+
+    // ── Frontier walk + new-hole accounting ──
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let frontier = compute_frontier(state.cursor, &ids, &state.dead_ids);
+    let safe_id = frontier.safe_id;
+    if frontier.oversized {
+        eprintln!(
+            "Ops poller: ALERT — hole above id {safe_id} exceeds {GAP_SET_LIMIT} ids; \
+             holding cursor (trimmed table or cursor reset?)"
+        );
+    }
+    let known: BTreeSet<i64> = state.gap.as_ref().map(|g| g.missing.clone()).unwrap_or_default();
+    let new_holes: Vec<i64> = frontier
+        .missing
+        .iter()
+        .copied()
+        .filter(|m| !known.contains(m))
+        .collect();
+    if !new_holes.is_empty() && !frontier.oversized {
+        // Snapshot the in-flight txns for the new holes. On error do NOT
+        // record them — an empty/partial xip list could later prove a live
+        // transaction "finished". The cursor still holds (safe_id is
+        // independent); recording retries next cycle.
+        match snapshot_xips(pool).await {
+            Ok(xips) => {
                 eprintln!(
-                    "Ops poller: holding cursor at {safe_id} — id {fm} allocated but not \
-                     yet visible ({} txns in flight)",
+                    "Ops poller: holding cursor at {safe_id} — {} id(s) allocated but not \
+                     yet visible (first: {}, {} txns in flight)",
+                    new_holes.len(),
+                    new_holes[0],
                     xips.len()
                 );
-                state.gap = Some(GapInfo { first_missing: fm, seen_at: Instant::now(), xips });
+                match &mut state.gap {
+                    Some(g) => {
+                        g.missing.extend(new_holes);
+                        // Union: resolution must now wait for the freshest
+                        // snapshot too — conservative, never premature.
+                        for x in xips {
+                            if !g.xips.contains(&x) {
+                                g.xips.push(x);
+                            }
+                        }
+                    }
+                    None => {
+                        state.gap = Some(GapInfo {
+                            missing: new_holes.into_iter().collect(),
+                            xips,
+                            seen_at: Instant::now(),
+                            last_alert: Instant::now(),
+                        });
+                    }
+                }
             }
+            Err(e) => eprintln!("Ops poller: snapshot_xips failed ({e}), holding"),
         }
-        None => state.gap = None,
     }
     state.dead_ids = state.dead_ids.split_off(&(state.cursor + 1));
+    state.posted_ids = state.posted_ids.split_off(&(state.cursor + 1));
 
-    // POST only rows not already sent this lifetime.
-    let rows: Vec<OpsRow> = rows.into_iter().filter(|r| r.id > state.posted_hwm).collect();
+    // POST rows not already sent this lifetime — per-id set membership, NOT a
+    // high-water mark: a gap row that fills in by commit sits below the mark.
+    let rows: Vec<OpsRow> =
+        rows.into_iter().filter(|r| !state.posted_ids.contains(&r.id)).collect();
     if rows.is_empty() {
         // Nothing new to send; the durable cursor may still advance (e.g. a
-        // gap just resolved behind already-POSTed rows).
+        // hole was proven rolled back behind already-POSTed rows).
         advance_cursor_safe(pool, cursor_name, safe_id, state).await?;
         return Ok(0);
     }
 
     let max_id = rows.iter().map(|r| r.id).max().unwrap_or(state.cursor);
+    let sent_ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let total_rows = rows.len();
 
     // Convert to EntityOps
@@ -262,9 +369,9 @@ async fn poll_and_process(
     dedup_ops(&mut batch);
 
     if batch.is_empty() {
-        // All ops cancelled out — still advance the durable cursor (to the
-        // safe frontier only, never past a gap).
-        state.posted_hwm = state.posted_hwm.max(max_id);
+        // All ops cancelled out — mark consumed and advance the durable
+        // cursor (to the safe frontier only, never past a gap).
+        state.posted_ids.extend(sent_ids);
         advance_cursor_safe(pool, cursor_name, safe_id, state).await?;
         return Ok(total_rows);
     }
@@ -283,13 +390,14 @@ async fn poll_and_process(
         }),
     };
 
-    // POST to BitDex
+    // POST to BitDex. On failure nothing is marked posted — the whole window
+    // re-reads next cycle (at-least-once, absorbed by WAL LIFO dedup).
     client
         .post_ops(&ops_batch)
         .await
         .map_err(|e| format!("post_ops: {e}"))?;
 
-    state.posted_hwm = state.posted_hwm.max(max_id);
+    state.posted_ids.extend(sent_ids);
     advance_cursor_safe(pool, cursor_name, safe_id, state).await?;
 
     Ok(total_rows)
@@ -326,26 +434,34 @@ async fn snapshot_xips(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
-/// True when none of `xips` is still in flight, i.e. none appears in the
-/// CURRENT snapshot's xip list (a txid leaves the list the moment it commits
-/// or aborts, and can never re-enter). Membership is checked against the
-/// live list rather than `pg_xact_status`, which raises errors for txids it
-/// cannot resolve. On query error, err on the safe side: still in flight
-/// (the GAP_TIMEOUT fallback bounds the wait).
-async fn xips_all_finished(pool: &PgPool, xips: &[i64]) -> bool {
-    if xips.is_empty() {
-        return true;
-    }
-    let row: Result<(bool,), _> = sqlx::query_as(
-        r#"SELECT NOT EXISTS (
-             SELECT 1
-             FROM (SELECT pg_snapshot_xip(pg_current_snapshot())::text::bigint AS x) cur
-             WHERE cur.x = ANY($1::bigint[]))"#,
+/// Atomic gap check: in ONE statement (= one READ COMMITTED snapshot) report
+/// (a) whether every recorded in-flight txid has finished (none appears in
+/// the current xip list — a txid leaves it on commit/abort, never re-enters)
+/// and (b) which of the missing ids are STILL invisible. Both must come from
+/// the same snapshot: checked separately, a transaction committing between
+/// the two reads gets its id declared dead while its row sits committed on
+/// disk (review 2026-07-09 finding 2 — the original bug, reintroduced).
+async fn gap_status(
+    pool: &PgPool,
+    xips: &[i64],
+    missing: &BTreeSet<i64>,
+) -> Result<(bool, BTreeSet<i64>), sqlx::Error> {
+    let missing_vec: Vec<i64> = missing.iter().copied().collect();
+    let row: (bool, Vec<i64>) = sqlx::query_as(
+        r#"SELECT
+             NOT EXISTS (
+               SELECT 1
+               FROM (SELECT pg_snapshot_xip(pg_current_snapshot())::text::bigint AS x) cur
+               WHERE cur.x = ANY($1::bigint[])),
+             ARRAY(SELECT m FROM unnest($2::bigint[]) m
+                   WHERE NOT EXISTS (SELECT 1 FROM "BitdexOps" b WHERE b.id = m)
+                   ORDER BY m)"#,
     )
     .bind(xips)
+    .bind(&missing_vec)
     .fetch_one(pool)
-    .await;
-    row.map(|r| r.0).unwrap_or(false)
+    .await?;
+    Ok((row.0, row.1.into_iter().collect()))
 }
 
 #[cfg(test)]
@@ -356,14 +472,19 @@ mod tests {
         ids.iter().copied().collect()
     }
 
+    fn frontier(cursor: i64, ids: &[i64], dead_ids: &[i64]) -> (i64, Vec<i64>, bool) {
+        let f = compute_frontier(cursor, ids, &dead(dead_ids));
+        (f.safe_id, f.missing, f.oversized)
+    }
+
     #[test]
     fn contiguous_ids_advance_to_max() {
-        assert_eq!(compute_safe_frontier(5, &[6, 7, 8], &dead(&[])), (8, None));
+        assert_eq!(frontier(5, &[6, 7, 8], &[]), (8, vec![], false));
     }
 
     #[test]
     fn empty_batch_holds_cursor() {
-        assert_eq!(compute_safe_frontier(5, &[], &dead(&[])), (5, None));
+        assert_eq!(frontier(5, &[], &[]), (5, vec![], false));
     }
 
     /// The skip-race shape: a long transaction holds id 6 uncommitted while
@@ -372,33 +493,309 @@ mod tests {
     /// (specimen: post 29674681's publish fan-out).
     #[test]
     fn gap_at_frontier_holds_cursor() {
-        assert_eq!(compute_safe_frontier(5, &[7], &dead(&[])), (5, Some(6)));
+        assert_eq!(frontier(5, &[7], &[]), (5, vec![6], false));
     }
 
     #[test]
-    fn gap_mid_batch_advances_to_gap_edge() {
-        assert_eq!(compute_safe_frontier(5, &[6, 7, 9, 10], &dead(&[])), (7, Some(8)));
+    fn gap_mid_batch_advances_to_gap_edge_and_collects_all_holes() {
+        assert_eq!(frontier(5, &[6, 7, 9, 10, 13], &[]), (7, vec![8, 11, 12], false));
     }
 
     #[test]
     fn dead_id_bridges_gap() {
-        assert_eq!(compute_safe_frontier(5, &[7], &dead(&[6])), (7, None));
+        assert_eq!(frontier(5, &[7], &[6]), (7, vec![], false));
     }
 
     #[test]
     fn dead_id_bridges_to_next_gap() {
-        assert_eq!(compute_safe_frontier(5, &[7, 10], &dead(&[6])), (7, Some(8)));
+        assert_eq!(frontier(5, &[7, 10], &[6]), (7, vec![8, 9], false));
     }
 
+    /// A whole rolled-back multi-row transaction resolves in ONE declaration
+    /// — the missing set carries every hole, not just the first (review
+    /// 2026-07-09 finding 5).
     #[test]
-    fn multi_id_rollback_needs_each_declared() {
-        assert_eq!(compute_safe_frontier(5, &[9], &dead(&[6])), (6, Some(7)));
-        assert_eq!(compute_safe_frontier(5, &[9], &dead(&[6, 7, 8])), (9, None));
+    fn multi_id_hole_collected_at_once() {
+        assert_eq!(frontier(5, &[9], &[]), (5, vec![6, 7, 8], false));
+        assert_eq!(frontier(5, &[9], &[6, 7, 8]), (9, vec![], false));
     }
 
     #[test]
     fn gap_immediately_after_cursor_with_multiple_rows() {
-        assert_eq!(compute_safe_frontier(10, &[12, 13], &dead(&[])), (10, Some(11)));
+        assert_eq!(frontier(10, &[12, 13], &[]), (10, vec![11], false));
+    }
+
+    /// Trimmed-table / cursor-reset hole: don't enumerate millions of ids —
+    /// flag oversized and hold.
+    #[test]
+    fn pathological_hole_flags_oversized() {
+        let f = compute_frontier(0, &[10_000_000], &BTreeSet::new());
+        assert!(f.oversized);
+        assert_eq!(f.safe_id, 0);
+        assert!(f.missing.len() <= GAP_SET_LIMIT);
+    }
+
+    /// Review finding 1 regression (state-machine level): after a gap fills
+    /// in by COMMIT, the newly visible row must not be filtered as already
+    /// posted. posted_ids is a set of ids actually sent — the gap row (6) is
+    /// absent from it even though 7 (a higher id) was sent earlier.
+    #[test]
+    fn commit_filled_gap_row_is_not_marked_posted() {
+        let mut posted = BTreeSet::new();
+        // Cycle 1: gap at 6, row 7 visible and POSTed.
+        posted.insert(7_i64);
+        // Cycle 2: txn committed, SELECT returns [6, 7].
+        let visible = [6_i64, 7];
+        let to_post: Vec<i64> =
+            visible.iter().copied().filter(|id| !posted.contains(id)).collect();
+        assert_eq!(to_post, vec![6], "gap row must POST after commit fill-in");
+        let f = compute_frontier(5, &visible, &BTreeSet::new());
+        assert_eq!((f.safe_id, f.missing), (7, vec![]));
+    }
+}
+
+/// Integration tests exercising the REAL `poll_and_process` against a live
+/// PostgreSQL and a mock engine endpoint. These are the merge gate for the
+/// skip-race fix — the SQL simulation scripts demonstrate semantics only
+/// (review 2026-07-09 finding 6).
+///
+/// Run: tests/integration/run-skip-race-rust.sh (starts a throwaway PG 16
+/// container, sets SKIP_RACE_PG_URL, runs `cargo test ... -- --ignored`).
+#[cfg(test)]
+mod pg_integration_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal HTTP responder standing in for the BitDex /ops endpoint:
+    /// answers 200 to everything, records request bodies.
+    fn mock_engine() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                // Read headers, then exactly Content-Length body bytes.
+                let body = loop {
+                    match s.read(&mut tmp) {
+                        Ok(0) => break String::new(),
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) =
+                                buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                                let clen = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                let mut body = buf[pos + 4..].to_vec();
+                                while body.len() < clen {
+                                    match s.read(&mut tmp) {
+                                        Ok(0) => break,
+                                        Ok(n) => body.extend_from_slice(&tmp[..n]),
+                                        Err(_) => break,
+                                    }
+                                }
+                                break String::from_utf8_lossy(&body).to_string();
+                            }
+                        }
+                        Err(_) => break String::new(),
+                    }
+                };
+                if !body.is_empty() {
+                    captured.lock().unwrap().push(body);
+                }
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                );
+            }
+        });
+        (port, bodies)
+    }
+
+    async fn setup(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"DROP TABLE IF EXISTS "BitdexOps" CASCADE;
+               DROP TABLE IF EXISTS bitdex_cursors CASCADE;"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(super::super::queries::SETUP_V2_SQL)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn fresh_state() -> PollerState {
+        PollerState {
+            cursor: 0,
+            posted_ids: BTreeSet::new(),
+            gap: None,
+            dead_ids: BTreeSet::new(),
+        }
+    }
+
+    async fn insert_op(pool: &PgPool, entity: i64) {
+        sqlx::query(
+            r#"INSERT INTO "BitdexOps" (entity_id, ops)
+               VALUES ($1, '[{"op":"set","field":"publishedAt","value":1}]'::jsonb)"#,
+        )
+        .bind(entity)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn posted_entities(bodies: &Arc<Mutex<Vec<String>>>) -> Vec<i64> {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                serde_json::from_str::<serde_json::Value>(b)
+                    .ok()
+                    .and_then(|v| {
+                        v["ops"].as_array().map(|ops| {
+                            ops.iter()
+                                .filter_map(|e| e["entity_id"].as_i64())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    async fn durable_cursor(pool: &PgPool) -> i64 {
+        read_cursor_from_pg(pool, "itest").await.unwrap_or(0)
+    }
+
+    /// The prod bug end-to-end: long txn's row (id 1) invisible while id 2 is
+    /// consumed; cursor must HOLD; after commit the gap row must be POSTed
+    /// and only then may the cursor pass it.
+    #[tokio::test]
+    #[ignore = "needs live PG via SKIP_RACE_PG_URL (tests/integration/run-skip-race-rust.sh)"]
+    async fn gap_filled_by_commit_delivers_gap_row() {
+        let url = std::env::var("SKIP_RACE_PG_URL").unwrap();
+        let pool = PgPool::connect(&url).await.unwrap();
+        setup(&pool).await;
+        let (port, bodies) = mock_engine();
+        let client = BitdexClient::new(&format!("http://127.0.0.1:{port}/api/indexes/t"));
+        let mut state = fresh_state();
+
+        // Long publish txn: INSERT id 1, hold open.
+        let mut txn = pool.begin().await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO "BitdexOps" (entity_id, ops)
+               VALUES (29674681, '[{"op":"set","field":"publishedAt","value":1}]'::jsonb)"#,
+        )
+        .execute(&mut *txn)
+        .await
+        .unwrap();
+        // Quick op: id 2, committed.
+        insert_op(&pool, 555).await;
+
+        // Cycle 1: only id 2 visible → POST 555, HOLD cursor at 0.
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(posted_entities(&bodies), vec![555]);
+        assert_eq!(state.cursor, 0, "durable cursor must hold below the gap");
+        assert_eq!(durable_cursor(&pool).await, 0);
+
+        // Cycles while txn still open: no time-based skip, still held.
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(posted_entities(&bodies), vec![555], "no duplicate POST while held");
+
+        // Publish txn commits — gap fills in.
+        txn.commit().await.unwrap();
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(
+            posted_entities(&bodies),
+            vec![555, 29674681],
+            "gap row must POST after commit (review finding 1)"
+        );
+        assert_eq!(state.cursor, 2, "cursor passes the gap only after delivery");
+        assert_eq!(durable_cursor(&pool).await, 2);
+    }
+
+    /// A rolled-back insert must be proven dead (atomic finished+invisible
+    /// check) and skipped — without ever being POSTed.
+    #[tokio::test]
+    #[ignore = "needs live PG via SKIP_RACE_PG_URL (tests/integration/run-skip-race-rust.sh)"]
+    async fn gap_from_rollback_is_proven_dead_and_skipped() {
+        let url = std::env::var("SKIP_RACE_PG_URL").unwrap();
+        let pool = PgPool::connect(&url).await.unwrap();
+        setup(&pool).await;
+        let (port, bodies) = mock_engine();
+        let client = BitdexClient::new(&format!("http://127.0.0.1:{port}/api/indexes/t"));
+        let mut state = fresh_state();
+
+        let mut txn = pool.begin().await.unwrap();
+        sqlx::query(r#"INSERT INTO "BitdexOps" (entity_id, ops) VALUES (111, '[]'::jsonb)"#)
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        insert_op(&pool, 555).await;
+
+        // Cycle 1: gap recorded, cursor held.
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(state.cursor, 0);
+
+        // The long txn ROLLS BACK — id 1 will never appear.
+        txn.rollback().await.unwrap();
+
+        // Within a few cycles the atomic check proves the rollback and the
+        // cursor passes the dead id. (>1 cycle allowed: other concurrent
+        // txns on the test server can keep the snapshot busy briefly.)
+        let mut passed = false;
+        for _ in 0..20 {
+            poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+            if state.cursor >= 2 {
+                passed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(passed, "cursor must pass a proven-rollback id");
+        assert_eq!(posted_entities(&bodies), vec![555], "dead id must never POST");
+    }
+
+    /// Fresh replica against a trimmed table: boot seed jumps the cursor to
+    /// MIN(id)-1 instead of walking a giant hole. (Covers review finding 5's
+    /// boot regression.)
+    #[tokio::test]
+    #[ignore = "needs live PG via SKIP_RACE_PG_URL (tests/integration/run-skip-race-rust.sh)"]
+    async fn trimmed_table_boot_seed() {
+        let url = std::env::var("SKIP_RACE_PG_URL").unwrap();
+        let pool = PgPool::connect(&url).await.unwrap();
+        setup(&pool).await;
+        sqlx::raw_sql(r#"SELECT setval('"BitdexOps_id_seq"', 5000000)"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_op(&pool, 777).await; // id 5000001
+        let min_id = get_min_ops_id(&pool).await.unwrap();
+        assert_eq!(min_id, 5_000_001);
+        // run_ops_poller's seed logic: cursor 0 → MIN(id)-1.
+        let seeded = if min_id > 1 { min_id - 1 } else { 0 };
+        let (port, bodies) = mock_engine();
+        let client = BitdexClient::new(&format!("http://127.0.0.1:{port}/api/indexes/t"));
+        let mut state = fresh_state();
+        state.cursor = seeded;
+        state.posted_ids = BTreeSet::new();
+        poll_and_process(&pool, &client, 100, "itest", &mut state, None).await.unwrap();
+        assert_eq!(posted_entities(&bodies), vec![777]);
+        assert_eq!(state.cursor, 5_000_001);
     }
 }
 
@@ -472,4 +869,15 @@ async fn get_max_ops_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
             .fetch_one(pool)
             .await?;
     Ok(row.0.unwrap_or(0))
+}
+
+/// Get the current min ops ID (boot seed for a zero cursor against a
+/// cleanup-trimmed table). Returns 1 when the table is empty so the seed
+/// stays at 0.
+async fn get_min_ops_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (Option<i64>,) =
+        sqlx::query_as(r#"SELECT MIN(id) FROM "BitdexOps""#)
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0.unwrap_or(1))
 }
