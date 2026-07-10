@@ -28,7 +28,7 @@ use crate::unified_cache::{
     evaluate_filter_work, evaluate_sort_work,
 };
 use crate::shard_store_bitmap::{
-    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
+    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp,
 };
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 /// Bridge for passing Prometheus metric handles from the server layer into
@@ -1398,6 +1398,30 @@ impl ConcurrentEngine {
             let flush_alive_store = alive_store.clone();
             let flush_filter_store = filter_store.clone();
             let flush_sort_store = sort_store.clone();
+            // Packed-format sort ops store (fix 2026-07-10, restart data loss):
+            // sort opslog appends previously targeted the LEGACY per-layer
+            // shard files, but `load_sort_layers` prefers the PACKED per-field
+            // shard whenever it exists (the merge thread writes it) and never
+            // reads the legacy appends — so every sort op since the last
+            // merge-persist silently vanished at boot. WAL replay masked the
+            // loss for WAL-backed writes; deferred-activation replay ops have
+            // no WAL entry and were PERMANENTLY lost on every pod restart
+            // (prod: entire activation cohorts with sortAt/publishedAt/
+            // existedAt layers zeroed — 23 of Day's top-200 on 2026-07-10,
+            // plus the 1,278-post "doc-ok-bitmap-missing" backfill class).
+            // Appends now target the same packed file the loader reads.
+            let flush_packed_sort_store = sort_store.as_ref().and_then(|ss| {
+                match crate::shard_store_bitmap::PackedSortBitmapStore::new(
+                    ss.root().to_path_buf(),
+                    crate::shard_store_bitmap::SortFieldShard,
+                ) {
+                    Ok(ps) => Some(Arc::new(ps)),
+                    Err(e) => {
+                        eprintln!("flush: packed sort store init failed: {e}");
+                        None
+                    }
+                }
+            });
             let flush_meta_store = meta_store.clone();
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
@@ -2684,35 +2708,48 @@ impl ConcurrentEngine {
                                     }
                                 }
 
-                                let sort_set: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
-                                    .sort_set_entries()
-                                    .iter()
-                                    .map(|(sgk, slots)| (
-                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
-                                        BitmapOp::BatchSet { bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                let sort_clr: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
-                                    .sort_clear_entries()
-                                    .iter()
-                                    .map(|(sgk, slots)| (
-                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
-                                        BitmapOp::BatchClear { bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                let sort_total = sort_set.len() + sort_clr.len();
-                                if sort_total >= par_iter_min {
-                                    sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
-                                        |(shard_key, op)| {
-                                            if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
-                                                eprintln!("flush: sort op failed: {e}");
+                                // Sort ops: append to the PACKED per-field shard —
+                                // the file `load_sort_layers` actually reads at boot.
+                                // Legacy per-layer appends were dead writes (see
+                                // flush_packed_sort_store construction above).
+                                // Grouped per field: one file open per field per
+                                // cycle instead of one per (field × layer).
+                                let _ = &ss_; // legacy handle retained for snapshot writes elsewhere
+                                if let Some(ref pss) = flush_packed_sort_store {
+                                    use crate::shard_store_bitmap::{SortFieldShardKey, SortLayerOp};
+                                    let mut by_field: HashMap<Arc<str>, Vec<SortLayerOp>> =
+                                        HashMap::new();
+                                    for (sgk, slots) in coalescer.sort_set_entries() {
+                                        by_field.entry(Arc::clone(&sgk.field)).or_default().push(
+                                            SortLayerOp::BatchSet {
+                                                bit_position: sgk.bit_layer as u8,
+                                                slots: slots.clone(),
+                                            },
+                                        );
+                                    }
+                                    for (sgk, slots) in coalescer.sort_clear_entries() {
+                                        by_field.entry(Arc::clone(&sgk.field)).or_default().push(
+                                            SortLayerOp::BatchClear {
+                                                bit_position: sgk.bit_layer as u8,
+                                                slots: slots.clone(),
+                                            },
+                                        );
+                                    }
+                                    let fields: Vec<(Arc<str>, Vec<SortLayerOp>)> =
+                                        by_field.into_iter().collect();
+                                    if fields.len() >= par_iter_min {
+                                        fields.into_par_iter().for_each(|(field, ops)| {
+                                            let key = SortFieldShardKey { field: field.to_string() };
+                                            if let Err(e) = pss.append_ops_opts(&key, &ops, false) {
+                                                eprintln!("flush: packed sort op failed: {e}");
                                             }
-                                        },
-                                    );
-                                } else {
-                                    for (shard_key, op) in sort_set.into_iter().chain(sort_clr.into_iter()) {
-                                        if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
-                                            eprintln!("flush: sort op failed: {e}");
+                                        });
+                                    } else {
+                                        for (field, ops) in fields {
+                                            let key = SortFieldShardKey { field: field.to_string() };
+                                            if let Err(e) = pss.append_ops_opts(&key, &ops, false) {
+                                                eprintln!("flush: packed sort op failed: {e}");
+                                            }
                                         }
                                     }
                                 }
@@ -14194,7 +14231,7 @@ mod tests {
         // 500 in binary: bit 8 (256), bit 7 (128), bit 6 (64), bit 5 (32),
         // bit 4 (16), bit 2 (4) = 0b111110100
         // At least bit 8 should be set for slot 1
-        let layer_key = SortLayerShardKey {
+        let layer_key = crate::shard_store_bitmap::SortLayerShardKey {
             field: "reactionCount".to_string(),
             bit_position: 8,
         };

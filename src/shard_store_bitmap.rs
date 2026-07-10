@@ -460,10 +460,16 @@ pub enum SortLayerOp {
     SetBit { bit_position: u8, slot: u32 },
     /// Clear a slot bit from a specific layer's bitmap.
     ClearBit { bit_position: u8, slot: u32 },
+    /// Set many slot bits on a specific layer's bitmap (flush opslog batches).
+    BatchSet { bit_position: u8, slots: Vec<u32> },
+    /// Clear many slot bits from a specific layer's bitmap.
+    BatchClear { bit_position: u8, slots: Vec<u32> },
 }
 
 const SORT_LAYER_OP_SET: u8 = 0x21;
 const SORT_LAYER_OP_CLEAR: u8 = 0x22;
+const SORT_LAYER_OP_BATCH_SET: u8 = 0x23;
+const SORT_LAYER_OP_BATCH_CLEAR: u8 = 0x24;
 
 // ---------------------------------------------------------------------------
 // SortFieldSnapshotCodec
@@ -607,6 +613,22 @@ impl OpCodec for SortLayerOpCodec {
                 buf.push(*bit_position);
                 buf.extend_from_slice(&slot.to_le_bytes());
             }
+            SortLayerOp::BatchSet { bit_position, slots } => {
+                buf.push(SORT_LAYER_OP_BATCH_SET);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+                for slot in slots {
+                    buf.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
+            SortLayerOp::BatchClear { bit_position, slots } => {
+                buf.push(SORT_LAYER_OP_BATCH_CLEAR);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+                for slot in slots {
+                    buf.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -626,6 +648,28 @@ impl OpCodec for SortLayerOpCodec {
         match tag {
             SORT_LAYER_OP_SET => Ok(SortLayerOp::SetBit { bit_position, slot }),
             SORT_LAYER_OP_CLEAR => Ok(SortLayerOp::ClearBit { bit_position, slot }),
+            SORT_LAYER_OP_BATCH_SET | SORT_LAYER_OP_BATCH_CLEAR => {
+                // [tag][bit][u32 count][count x u32 slots] — `slot` above decoded
+                // the count field.
+                let count = slot as usize;
+                let need = 6 + count * 4;
+                if bytes.len() < need {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated sort layer batch op",
+                    ));
+                }
+                let mut slots = Vec::with_capacity(count);
+                for i in 0..count {
+                    let off = 6 + i * 4;
+                    slots.push(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+                }
+                if tag == SORT_LAYER_OP_BATCH_SET {
+                    Ok(SortLayerOp::BatchSet { bit_position, slots })
+                } else {
+                    Ok(SortLayerOp::BatchClear { bit_position, slots })
+                }
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown sort layer op tag: 0x{:02x}", other),
@@ -643,6 +687,22 @@ impl OpCodec for SortLayerOpCodec {
             SortLayerOp::ClearBit { bit_position, slot } => {
                 if let Some(bm) = snapshot.layers.get_mut(bit_position) {
                     bm.remove(*slot);
+                }
+            }
+            SortLayerOp::BatchSet { bit_position, slots } => {
+                let bm = snapshot
+                    .layers
+                    .entry(*bit_position)
+                    .or_insert_with(RoaringBitmap::new);
+                for slot in slots {
+                    bm.insert(*slot);
+                }
+            }
+            SortLayerOp::BatchClear { bit_position, slots } => {
+                if let Some(bm) = snapshot.layers.get_mut(bit_position) {
+                    for slot in slots {
+                        bm.remove(*slot);
+                    }
                 }
             }
         }
