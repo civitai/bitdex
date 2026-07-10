@@ -246,7 +246,10 @@ fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClau
                 if ctx.always_snap {
                     // Always snap to nearest bucket for safety — returns the smallest
                     // bucket that covers the requested duration, or the largest bucket.
-                    let duration_secs = ctx.now_secs.saturating_sub(*ts as u64);
+                    // ts unit-normalized (see ts_to_secs): a millisecond timestamp
+                    // here used to saturate the duration to 0 and pin EVERY window
+                    // to the smallest bucket.
+                    let duration_secs = ctx.now_secs.saturating_sub(ts_to_secs(*ts) as u64);
                     let bucket_name = manager.snap_nearest(duration_secs);
                     if let Some(bucket) = manager.get_bucket(bucket_name) {
                         FilterClause::BucketBitmap {
@@ -287,6 +290,24 @@ fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClau
     }
 }
 
+/// Normalize a filter timestamp to SECONDS. The bucketed filter field is
+/// millisecond-typed in the civitai schema (`sortAtUnix` — that's what feed
+/// queries send), while `ctx.now_secs` is seconds. Before this existed,
+/// `now_secs.saturating_sub(ts_ms)` saturated to duration 0 for EVERY
+/// millisecond timestamp, so `snap_nearest(0)` substituted the SMALLEST
+/// bucket — every wide-window feed query (7d/30d/1y) silently served 24h of
+/// content (prod, found 2026-07-10 during zero-misses verification; masked
+/// because 24h feeds — the hot path — were accidentally correct).
+/// Discriminator: 1e11 seconds = year 5138, 1e11 ms = 1973 — unambiguous for
+/// any real timestamp in either unit.
+fn ts_to_secs(ts: i64) -> i64 {
+    if ts > 100_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
+}
+
 /// Try to snap a `Gt/Gte(field, ts)` to a bucket bitmap.
 /// Returns `Some(BucketBitmap { ... })` if snapping succeeds, `None` otherwise.
 fn try_snap_to_bucket(
@@ -295,8 +316,8 @@ fn try_snap_to_bucket(
     ctx: &BucketSnapContext<'_>,
 ) -> Option<FilterClause> {
     let manager = ctx.managers.get(field)?;
-    // duration = now - ts (the window the filter requests)
-    let duration_secs = ctx.now_secs.saturating_sub(ts as u64);
+    // duration = now - ts (the window the filter requests), ts unit-normalized
+    let duration_secs = ctx.now_secs.saturating_sub(ts_to_secs(ts) as u64);
     let bucket_name = manager.snap_duration(duration_secs, ctx.tolerance_pct)?;
     let bucket = manager.get_bucket(bucket_name)?;
     Some(FilterClause::BucketBitmap {
@@ -389,6 +410,55 @@ mod tests {
             }
             other => panic!("expected BucketBitmap, got {:?}", other),
         }
+    }
+
+    /// REGRESSION (prod 2026-07-10): the bucketed filter field is
+    /// millisecond-typed (`sortAtUnix` — what feed queries actually send),
+    /// but the snap duration was computed as `now_SECS - ts_MS`, which
+    /// saturates to 0 for every ms timestamp — so `snap_nearest(0)` pinned
+    /// EVERY window to the smallest bucket. Week/Month/Year feeds silently
+    /// served 24h of content (196-200 of each site top-200 missing); the 24h
+    /// window was accidentally correct, masking it. A ms timestamp for a 7d
+    /// window must snap to the 7d bucket.
+    #[test]
+    fn test_snap_gte_millisecond_timestamp_snaps_by_real_duration() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAtUnix".to_string(), &mgr);
+        let ctx = make_ctx(&managers, now);
+
+        // 7d window expressed in MILLISECONDS: (now - 590000s) * 1000.
+        let ts_ms = ((now - 590_000) * 1000) as i64;
+        let clauses =
+            vec![FilterClause::Gte("sortAtUnix".to_string(), Value::Integer(ts_ms))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+        assert!(
+            matches!(&snapped[0], FilterClause::BucketBitmap { bucket_name, .. } if bucket_name == "7d"),
+            "ms timestamp for a 7d window must snap to 7d, got {:?}",
+            snapped[0]
+        );
+
+        // Out-of-tolerance ms duration → always_snap picks smallest COVERING
+        // bucket (7d for a 200000s window), not the smallest bucket overall.
+        let ts_ms2 = ((now - 200_000) * 1000) as i64;
+        let clauses2 =
+            vec![FilterClause::Gt("sortAtUnix".to_string(), Value::Integer(ts_ms2))];
+        let snapped2 = snap_range_clauses(&clauses2, &ctx);
+        assert!(
+            matches!(&snapped2[0], FilterClause::BucketBitmap { bucket_name, .. } if bucket_name == "7d"),
+            "ms timestamp outside tolerance must snap by real duration, got {:?}",
+            snapped2[0]
+        );
+    }
+
+    /// Seconds timestamps are passed through unchanged by the unit
+    /// normalization (1e11s = year 5138 — unreachable).
+    #[test]
+    fn test_ts_to_secs_units() {
+        assert_eq!(ts_to_secs(1_700_000_000), 1_700_000_000); // seconds unchanged
+        assert_eq!(ts_to_secs(1_700_000_000_000), 1_700_000_000); // ms → s
+        assert_eq!(ts_to_secs(0), 0);
     }
 
     #[test]
