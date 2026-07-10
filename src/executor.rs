@@ -669,6 +669,11 @@ impl<'a> QueryExecutor<'a> {
                 if let Some(tb) = &self.time_buckets {
                     if field == tb.field_name() {
                         if let Some(threshold) = value_to_bitmap_key(value) {
+                            // Unit-normalize: the bucketed field is ms-typed
+                            // (sortAtUnix); a raw ms threshold saturated the
+                            // duration to 0 so this fast path never engaged
+                            // and fell to range_scan (#305 review F1).
+                            let threshold = crate::query::ts_secs_u64(threshold);
                             let duration = self.now_unix.saturating_sub(threshold);
                             if let Some(bucket_name) = tb.snap_duration(duration, 0.10) {
                                 if let Some(bucket) = tb.get_bucket(bucket_name) {
@@ -698,6 +703,13 @@ impl<'a> QueryExecutor<'a> {
                 if let Some(tb) = &self.time_buckets {
                     if field == tb.field_name() {
                         if let Some(threshold) = value_to_bitmap_key(value) {
+                            // Unit-normalize FIRST (#305 review F1): a raw ms
+                            // threshold (~1.7e12) always compared >= now_unix
+                            // (seconds, ~1.7e9), so the future-threshold fast
+                            // path below returned the ENTIRE ALIVE SET for
+                            // every millisecond Lt/Lte — the upper bound of a
+                            // closed window was silently discarded.
+                            let threshold = crate::query::ts_secs_u64(threshold);
                             // Fast path: threshold in the future → all alive slots satisfy
                             // Lt/Lte because every stored timestamp is ≤ now < threshold.
                             if threshold >= self.now_unix {
@@ -1795,6 +1807,50 @@ mod tests {
         assert!(!result.contains(3), "slot 3 is within 24h, should not appear in Lt result");
         assert!(result.contains(4), "slot 4 is older than 24h, should appear in Lt result");
         assert!(result.contains(5), "slot 5 is older than 24h, should appear in Lt result");
+    }
+
+    /// REGRESSION (#305 review F1): a MILLISECOND Lt threshold on the
+    /// bucketed field compared raw against `now_unix` (seconds), so the
+    /// future-threshold fast path returned the ENTIRE ALIVE SET — the upper
+    /// bound of every ms closed window (Gte(start) AND Lt(end)) was silently
+    /// discarded. An ms threshold must behave exactly like its seconds twin.
+    #[test]
+    fn test_lt_millisecond_threshold_not_treated_as_future() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+        let mut slots = SlotAllocator::new();
+        slots.alive_insert_bulk(1u32..=5);
+        slots.merge_alive();
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // Same 24h-ago threshold as the seconds test, expressed in ms.
+        let threshold_ms = ((now - 86400) * 1000) as i64;
+        let clause = FilterClause::Lt("sortAt".to_string(), Value::Integer(threshold_ms));
+        let result = executor.evaluate_clause(&clause).unwrap();
+        assert!(
+            !result.contains(1) && !result.contains(2) && !result.contains(3),
+            "ms Lt must exclude in-window slots — returning them means the \
+             future-threshold fast path swallowed the bound (got {result:?})"
+        );
+        assert!(result.contains(4) && result.contains(5), "older slots must match ms Lt");
+
+        // And the Gt/Gte side: ms threshold engages the bucket fast path
+        // with the real duration (24h bucket = slots 1,2,3).
+        let clause2 = FilterClause::Gte("sortAt".to_string(), Value::Integer(threshold_ms));
+        let r2 = executor.evaluate_clause(&clause2).unwrap();
+        assert!(r2.contains(1) && r2.contains(2) && r2.contains(3));
+        assert!(!r2.contains(4) && !r2.contains(5));
     }
 
     #[test]
