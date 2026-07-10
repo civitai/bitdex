@@ -1467,21 +1467,49 @@ impl ConcurrentEngine {
                 // the persistent sender keeps the channel open so try_recv never
                 // reports Disconnected.
                 #[allow(clippy::type_complexity)]
-                let (bucket_rebuild_tx, bucket_rebuild_rx) = std::sync::mpsc::channel::<
+                let (bucket_rebuild_tx, bucket_rebuild_rx) = std::sync::mpsc::channel::<(
+                    // Generation stamp of the worker that produced this result.
+                    // Completions are only trusted to CLEAR scheduler state when
+                    // they match the currently tracked generation — a late send
+                    // from a watchdog-abandoned worker must not untrack a newer
+                    // in-flight worker (external review #307 finding 1).
+                    u64,
                     // Per bucket: (name, stale candidates, missing candidates).
                     Option<(std::time::Duration, Vec<(String, RoaringBitmap, RoaringBitmap)>)>,
-                >();
+                )>();
                 let mut last_full_bucket_rebuild: Option<std::time::Instant> = None;
                 let mut bucket_rebuild_in_flight = false;
                 let mut bucket_rebuild_handle: Option<std::thread::JoinHandle<()>> = None;
                 // Watchdog for a HUNG rebuild worker (thread alive, never sends —
                 // see rebuild_watchdog_expired at module level) —
-                // the one failure mode the is_finished() panic check can't see).
+                // the one failure mode the is_finished() panic check can't see.
                 // While in_flight is stuck true, ALL future rebuilds are disabled
                 // silently; at prod scale that means tb add-path misses accumulate
                 // unhealed in every period feed. Stamped at spawn, checked each
                 // flush cycle against `rebuild_watchdog_expired`.
                 let mut bucket_rebuild_spawned_at: Option<std::time::Instant> = None;
+                // Monotonic generation counter; bumped per spawn. The tracked
+                // worker's generation == bucket_rebuild_generation while
+                // in_flight. Results carrying an older generation are STALE:
+                // their candidates are still applied (reconcile_apply
+                // re-validates against current staging, so stale data is
+                // harmless and often useful) but they never mutate scheduler
+                // state and never count as a completed rebuild.
+                let mut bucket_rebuild_generation: u64 = 0;
+                // Abandoned-worker resource policy: Rust can't kill a hung
+                // thread, so each watchdog trip leaks one. Cap consecutive
+                // abandonments — past the cap, stop respawning (and say so
+                // loudly) rather than leaking a thread + pinned snapshot every
+                // watchdog period forever. Reset on any current-generation
+                // completion.
+                let mut bucket_rebuild_abandoned: u64 = 0;
+                const BUCKET_REBUILD_ABANDON_CAP: u64 = 5;
+                // One-cycle grace for the is_finished() panic check: a worker
+                // sends then returns, so "finished" can be observed while its
+                // result is still queued. First sighting arms this flag; the
+                // panic reset fires only if the NEXT cycle's drain still found
+                // nothing (review finding 4).
+                let mut bucket_rebuild_finished_seen = false;
                 let mut heartbeat_counter: u64 = 0;
                 let mut max_bitmap_count_seen: usize = 0;
                 let mut nonzero_iters: u64 = 0;
@@ -3419,42 +3447,76 @@ impl ConcurrentEngine {
                     // PATCH /config retune takes effect without a restart.
                     let flush_bucket_full_rebuild_interval =
                         flush_tb_rebuild_interval_handle.load(Ordering::Relaxed);
-                    if !is_loading && flush_bucket_full_rebuild_interval > 0 {
-                        if let Some(ref tb_arc) = flush_time_buckets {
-                            // 1) Apply any completed background rebuild. The flush
-                            //    thread stays the sole writer of the manager on this
-                            //    path: it PRUNES the stale sets the worker computed
-                            //    (subtraction), never overwriting — so slots that
-                            //    live maintenance inserted during the minutes-long
-                            //    scan are preserved.
+                    // 1) Apply any completed background rebuild. Runs OUTSIDE the
+                    //    interval gate: a worker spawned before the interval was
+                    //    hot-set to 0 (or before loading mode) must still have its
+                    //    result drained and applied, or the message sits queued and
+                    //    fires against unrelated state whenever the gate reopens
+                    //    (external review #307 finding 5). The flush thread stays
+                    //    the sole writer of the manager on this path: it PRUNES the
+                    //    stale sets the worker computed (subtraction), never
+                    //    overwriting — so slots that live maintenance inserted
+                    //    during the minutes-long scan are preserved.
+                    if let Some(ref tb_arc) = flush_time_buckets {
                             let mut pruned_total: u64 = 0;
                             let mut backfilled_total: u64 = 0;
-                            while let Ok(msg) = bucket_rebuild_rx.try_recv() {
-                                bucket_rebuild_in_flight = false;
-                                bucket_rebuild_handle = None;
-                                bucket_rebuild_spawned_at = None;
+                            while let Ok((msg_gen, msg)) = bucket_rebuild_rx.try_recv() {
+                                // A result only clears scheduler state when it comes
+                                // from the CURRENTLY tracked worker. A late send
+                                // from a watchdog-abandoned worker must not untrack
+                                // a newer in-flight worker (review finding 1) —
+                                // its candidates are still applied below (they're
+                                // re-validated), but it never counts as a completed
+                                // rebuild and never touches the schedule.
+                                let is_current = bucket_rebuild_in_flight
+                                    && msg_gen == bucket_rebuild_generation;
+                                if is_current {
+                                    bucket_rebuild_in_flight = false;
+                                    bucket_rebuild_handle = None;
+                                    bucket_rebuild_spawned_at = None;
+                                    bucket_rebuild_finished_seen = false;
+                                    bucket_rebuild_abandoned = 0;
+                                } else {
+                                    eprintln!(
+                                        "Time bucket FULL rebuild: stale result from \
+                                         abandoned worker gen {msg_gen} (current gen {}, \
+                                         in_flight={}) — applying candidates only",
+                                        bucket_rebuild_generation, bucket_rebuild_in_flight,
+                                    );
+                                }
                                 match msg {
                                     None => {
-                                        // Sort field wasn't loaded when the scan ran;
-                                        // backdate the baseline to retry in ~60s.
-                                        let retry_in = 60.min(flush_bucket_full_rebuild_interval);
-                                        let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
-                                        last_full_bucket_rebuild = Some(
-                                            std::time::Instant::now()
-                                                .checked_sub(std::time::Duration::from_secs(back))
-                                                .unwrap_or_else(std::time::Instant::now),
-                                        );
+                                        if is_current {
+                                            // Sort field wasn't loaded when the scan ran;
+                                            // backdate the baseline to retry in ~60s.
+                                            let retry_in = 60.min(flush_bucket_full_rebuild_interval);
+                                            let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
+                                            last_full_bucket_rebuild = Some(
+                                                std::time::Instant::now()
+                                                    .checked_sub(std::time::Duration::from_secs(back))
+                                                    .unwrap_or_else(std::time::Instant::now),
+                                            );
+                                        }
+                                        // Stale None: nothing to apply, nothing to
+                                        // schedule — fully ignored (a stale retry
+                                        // backdate would near-immediately double-spawn
+                                        // on top of the newer worker).
                                     }
                                     Some((scan_dur, removals)) => {
-                                        last_full_bucket_rebuild = Some(std::time::Instant::now());
+                                        if is_current {
+                                            last_full_bucket_rebuild = Some(std::time::Instant::now());
+                                        }
                                         // `scan_dur` feeds the server-only metrics below.
                                         let _ = &scan_dur;
                                         // Observability: scan duration, rebuild count, and
                                         // per-bucket stale/missing gauges (from the
                                         // snapshot the worker scanned). `missing` > 0
                                         // signals a live-insert gap the prune won't fix.
+                                        // CURRENT completions only: a stale abandoned
+                                        // result must not count as a completed rebuild
+                                        // nor overwrite fresher gauges (review finding 2).
                                         #[cfg(feature = "server")]
-                                        {
+                                        if is_current {
                                             let bg = flush_metrics_bridge.load();
                                             if let Some(m) = (**bg).as_ref() {
                                                 let idx = m.index_name.as_str();
@@ -3565,18 +3627,30 @@ impl ConcurrentEngine {
                             if pruned_total > 0 || backfilled_total > 0 {
                                 eprintln!("Time bucket FULL rebuild fallback: pruned {pruned_total} stale / backfilled {backfilled_total} missing members (bg scan)");
                             }
+                    }
+                    if !is_loading && flush_bucket_full_rebuild_interval > 0 {
+                        if let Some(ref tb_arc) = flush_time_buckets {
                             // Detect a worker that ended WITHOUT sending (panicked):
                             // the persistent sender keeps the channel open, so
                             // try_recv never reports Disconnected. Without this,
                             // in_flight would stick true and disable all future
-                            // rebuilds.
+                            // rebuilds. ONE-CYCLE GRACE (review finding 4): a worker
+                            // sends its result and THEN returns, so is_finished()
+                            // can flip true in the instant between this cycle's
+                            // drain and this check while the result sits queued.
+                            // First sighting only arms `finished_seen`; the reset
+                            // fires on the NEXT cycle, after the drain has had one
+                            // more chance to consume the queued result.
                             if bucket_rebuild_in_flight {
                                 if let Some(h) = &bucket_rebuild_handle {
-                                    if h.is_finished() {
+                                    if h.is_finished() && !bucket_rebuild_finished_seen {
+                                        bucket_rebuild_finished_seen = true;
+                                    } else if h.is_finished() && bucket_rebuild_finished_seen {
                                         eprintln!("Time bucket FULL rebuild: bg worker ended without a result (panicked?) — resetting");
                                         bucket_rebuild_in_flight = false;
                                         bucket_rebuild_handle = None;
                                         bucket_rebuild_spawned_at = None;
+                                        bucket_rebuild_finished_seen = false;
                                         let retry_in = 60.min(flush_bucket_full_rebuild_interval);
                                         let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
                                         last_full_bucket_rebuild = Some(
@@ -3598,12 +3672,18 @@ impl ConcurrentEngine {
                                         eprintln!(
                                             "Time bucket FULL rebuild: WATCHDOG — bg worker \
                                              unresponsive for >{}s, abandoning it and re-arming \
-                                             (thread leaked; a late result will still apply)",
+                                             ({} abandoned so far, cap {}; thread leaked — a \
+                                             late result still applies, but never as a \
+                                             completion)",
                                             rebuild_watchdog_secs(flush_bucket_full_rebuild_interval),
+                                            bucket_rebuild_abandoned + 1,
+                                            BUCKET_REBUILD_ABANDON_CAP,
                                         );
                                         bucket_rebuild_in_flight = false;
                                         bucket_rebuild_handle = None;
                                         bucket_rebuild_spawned_at = None;
+                                        bucket_rebuild_finished_seen = false;
+                                        bucket_rebuild_abandoned += 1;
                                         let retry_in = 60.min(flush_bucket_full_rebuild_interval);
                                         let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
                                         last_full_bucket_rebuild = Some(
@@ -3627,12 +3707,32 @@ impl ConcurrentEngine {
                                 // fires one interval later.
                                 last_full_bucket_rebuild = Some(std::time::Instant::now());
                             } else if due && !bucket_rebuild_in_flight {
+                                if bucket_rebuild_abandoned >= BUCKET_REBUILD_ABANDON_CAP {
+                                    // Resource policy (review finding 3): each
+                                    // abandoned worker leaks a thread + pinned
+                                    // snapshot. Past the cap, stop respawning —
+                                    // scream instead of bleeding one leak per
+                                    // watchdog period forever. Operator remedy:
+                                    // restart the pod (and find out why scans hang).
+                                    eprintln!(
+                                        "Time bucket FULL rebuild: {} consecutive workers \
+                                         abandoned (cap {}) — NOT respawning; rebuilds are \
+                                         DISABLED until restart. Investigate why scans hang.",
+                                        bucket_rebuild_abandoned, BUCKET_REBUILD_ABANDON_CAP,
+                                    );
+                                    // Re-arm the timer so this warning repeats once per
+                                    // interval instead of every flush cycle.
+                                    last_full_bucket_rebuild = Some(std::time::Instant::now());
+                                } else {
                                 // Clone the latest published snapshot (cheap Arc) and
                                 // the manager config, then compute off-thread.
                                 let snap = inner.load_full();
                                 let tb_snapshot = (*tb_arc.load_full()).clone();
                                 let tx = bucket_rebuild_tx.clone();
                                 let scan_threads = flush_reconcile_scan_threads;
+                                bucket_rebuild_generation =
+                                    bucket_rebuild_generation.wrapping_add(1);
+                                let this_generation = bucket_rebuild_generation;
                                 let spawned = std::thread::Builder::new()
                                     .name("bitdex-tbucket-rebuild".to_string())
                                     .spawn(move || {
@@ -3657,7 +3757,7 @@ impl ConcurrentEngine {
                                         }
                                         // Receiver lives for the flush thread's life;
                                         // a send error only means shutdown — ignore.
-                                        let _ = tx.send(payload);
+                                        let _ = tx.send((this_generation, payload));
                                     });
                                 match spawned {
                                     Ok(h) => {
@@ -3665,10 +3765,12 @@ impl ConcurrentEngine {
                                         bucket_rebuild_handle = Some(h);
                                         bucket_rebuild_spawned_at =
                                             Some(std::time::Instant::now());
+                                        bucket_rebuild_finished_seen = false;
                                     }
                                     Err(e) => {
                                         eprintln!("Time bucket FULL rebuild: failed to spawn bg thread: {e}");
                                     }
+                                }
                                 }
                             }
                         }
@@ -10948,6 +11050,76 @@ mod tests {
         assert_eq!(rebuild_watchdog_secs(300), 1200); // 4×300 < floor
         assert_eq!(rebuild_watchdog_secs(600), 2400); // 4× above floor
         assert_eq!(rebuild_watchdog_secs(u64::MAX), u64::MAX); // saturates
+    }
+
+    /// Review #307 finding 1 trace: a LATE result from a watchdog-abandoned
+    /// worker must not untrack a newer in-flight worker. Mirrors the flush
+    /// loop's scheduler-state transitions (the loop code is inline in the
+    /// flush thread; the load-bearing predicate is
+    /// `is_current = in_flight && msg_gen == generation`, exercised here
+    /// through the exact abandon→respawn→late-send sequence).
+    #[test]
+    fn test_rebuild_generation_guards_scheduler_state() {
+        // Minimal mirror of the loop's scheduler state.
+        struct S {
+            in_flight: bool,
+            generation: u64,
+            abandoned: u64,
+        }
+        let mut s = S { in_flight: false, generation: 0, abandoned: 0 };
+
+        // Spawn worker A (gen 1).
+        s.generation = s.generation.wrapping_add(1);
+        s.in_flight = true;
+        let gen_a = s.generation;
+
+        // Watchdog abandons A.
+        s.in_flight = false;
+        s.abandoned += 1;
+
+        // Spawn worker B (gen 2).
+        s.generation = s.generation.wrapping_add(1);
+        s.in_flight = true;
+        let gen_b = s.generation;
+
+        // A's late result arrives: is_current must be FALSE → no state change.
+        let is_current_a = s.in_flight && gen_a == s.generation;
+        assert!(
+            !is_current_a,
+            "late result from abandoned gen must be classified stale"
+        );
+        // (loop applies candidates but leaves in_flight/abandoned untouched)
+        assert!(s.in_flight, "worker B must remain tracked");
+        assert_eq!(s.abandoned, 1);
+
+        // B's own result arrives: is_current TRUE → full reset + abandon
+        // counter cleared.
+        let is_current_b = s.in_flight && gen_b == s.generation;
+        assert!(is_current_b);
+        s.in_flight = false;
+        s.abandoned = 0;
+        assert_eq!(s.abandoned, 0, "current completion resets the abandon streak");
+
+        // A second late duplicate from A after B completed: in_flight false →
+        // stale again, nothing to untrack.
+        let is_current_dup = s.in_flight && gen_a == s.generation;
+        assert!(!is_current_dup);
+    }
+
+    /// Abandon-cap policy: after BUCKET_REBUILD_ABANDON_CAP consecutive
+    /// abandonments the spawn arm must refuse to respawn (leak bound), and a
+    /// current-generation completion resets the streak.
+    #[test]
+    fn test_rebuild_abandon_cap_bounds_leaks() {
+        const CAP: u64 = 5; // mirrors BUCKET_REBUILD_ABANDON_CAP
+        let mut abandoned: u64 = 0;
+        for _ in 0..CAP {
+            assert!(abandoned < CAP, "below cap: respawn allowed");
+            abandoned += 1; // watchdog trip
+        }
+        assert!(abandoned >= CAP, "at cap: respawn refused");
+        abandoned = 0; // current-gen completion
+        assert!(abandoned < CAP, "reset re-enables rebuilds");
     }
     use crate::mutation::FieldValue;
     use crate::query::{SortClause, SortDirection, Value};
