@@ -3503,6 +3503,32 @@ impl ConcurrentEngine {
                                         // on top of the newer worker).
                                     }
                                     Some((scan_dur, removals)) => {
+                                        // Loading mode: scheduler state was already
+                                        // classified/cleared above (that part must
+                                        // always run — review #307 F1/F5), but the
+                                        // candidate APPLY touches staging.sorts /
+                                        // staging.slots and mutates tb_arc, which is
+                                        // off-limits during bulk load (round-2 review
+                                        // N1). Drop the payload and backdate the
+                                        // schedule so a fresh rebuild runs shortly
+                                        // after loading exits — the dropped scan is
+                                        // stale against a bulk-loaded index anyway.
+                                        if is_loading {
+                                            eprintln!(
+                                                "Time bucket FULL rebuild: result arrived during \
+                                                 loading mode — dropped (will rescan after load)"
+                                            );
+                                            if is_current {
+                                                let retry_in = 60.min(flush_bucket_full_rebuild_interval.max(1));
+                                                let back = flush_bucket_full_rebuild_interval.saturating_sub(retry_in);
+                                                last_full_bucket_rebuild = Some(
+                                                    std::time::Instant::now()
+                                                        .checked_sub(std::time::Duration::from_secs(back))
+                                                        .unwrap_or_else(std::time::Instant::now),
+                                                );
+                                            }
+                                            continue;
+                                        }
                                         if is_current {
                                             last_full_bucket_rebuild = Some(std::time::Instant::now());
                                         }
