@@ -182,6 +182,26 @@ impl VersionedBitmap {
         }
     }
 
+    /// Return the fully fused bitmap as an `Arc` — a refcount bump of the base
+    /// when clean (zero copy), one materialized merge when dirty. Unlike
+    /// `fused_cow`, the result is OWNED and shareable: callers can cache it
+    /// and hand it to many readers without re-fusing per call. Building block
+    /// of the per-snapshot fused-layer cache (`SortField::fused_layers`) that
+    /// replaced per-query `fused_cow` materialization — under production load
+    /// every query against a dirty layer paid a full base clone (2026-07-10
+    /// memory incident: ~22Gi of per-query fuse churn on the wide-window
+    /// serving pod).
+    pub fn fused_arc(&self) -> Arc<RoaringBitmap> {
+        if self.diff.is_empty() {
+            Arc::clone(&self.base)
+        } else {
+            let mut result = self.base.as_ref().clone();
+            result |= &self.diff.sets;
+            result -= &self.diff.clears;
+            Arc::new(result)
+        }
+    }
+
     /// Access the base bitmap directly. Sort layers always use merged bases.
     pub fn base(&self) -> &Arc<RoaringBitmap> {
         &self.base

@@ -1,7 +1,7 @@
 use ahash::AHashMap as HashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use roaring::RoaringBitmap;
 
@@ -23,7 +23,6 @@ use crate::versioned_bitmap::VersionedBitmap;
 /// Bit layers use VersionedBitmap for diff-based mutation with eager merge.
 /// Mutations write to the diff layer; eager merge compacts diffs before
 /// readers see them, so sort traversal always reads clean bases.
-#[derive(Clone)]
 pub struct SortField {
     /// One bitmap per bit position. Index 0 = LSB, index 31 = MSB (for 32-bit).
     bit_layers: Vec<VersionedBitmap>,
@@ -31,6 +30,43 @@ pub struct SortField {
     num_bits: usize,
     /// Field configuration.
     config: SortFieldConfig,
+    /// Lazily-built fused view of every bit layer, shared across ALL queries
+    /// against this SortField instance (2026-07-10 memory incident fix).
+    ///
+    /// Why this is safe: SortIndex wraps every SortField in an Arc and routes
+    /// ALL mutation through `Arc::make_mut` (`get_field_mut`/`fields_mut`).
+    /// When a published snapshot shares the field, staging's first mutation
+    /// clones it — the snapshot's instance is frozen for its lifetime, so a
+    /// fused view built against it can never go stale. Two backstops make
+    /// the invariant unconditional rather than architectural: (1) `Clone`
+    /// resets the cache (the make_mut clone starts cold), and (2) every
+    /// `&mut self` method that touches `bit_layers` calls
+    /// `invalidate_fused()` (covers same-instance mutation when staging is
+    /// the sole owner, e.g. loading mode). MODULE RULE: never touch
+    /// `bit_layers` mutably except through those methods — a new helper
+    /// that writes layers directly MUST call `invalidate_fused()` or a
+    /// frozen fused view will serve stale order until the next snapshot.
+    ///
+    /// Before this cache, `top_n` called `fused_cow()` on all layers PER
+    /// QUERY, and a dirty layer (reactionCount is perpetually dirty between
+    /// targeted compactions — the metrics poller writes continuously) paid a
+    /// full base clone each time: ~22Gi of steady-state allocation churn on
+    /// the wide-window serving pod. Now the fuse cost is paid once per
+    /// field per published snapshot; clean layers are refcount bumps.
+    fused_cache: Mutex<Option<Arc<Vec<Arc<RoaringBitmap>>>>>,
+}
+
+impl Clone for SortField {
+    fn clone(&self) -> Self {
+        Self {
+            bit_layers: self.bit_layers.clone(),
+            num_bits: self.num_bits,
+            config: self.config.clone(),
+            // The clone exists to be MUTATED (Arc::make_mut path) — start
+            // cold so a stale fused view can never survive into it.
+            fused_cache: Mutex::new(None),
+        }
+    }
 }
 
 impl SortField {
@@ -43,7 +79,51 @@ impl SortField {
             bit_layers,
             num_bits,
             config,
+            fused_cache: Mutex::new(None),
         }
+    }
+
+    /// Drop the cached fused view. Must be called by every `&mut self`
+    /// method that changes any bit layer — exclusive access makes this a
+    /// lock-free `get_mut`.
+    fn invalidate_fused(&mut self) {
+        *self
+            .fused_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The fused (base + diff) view of every bit layer, built at most once
+    /// per SortField instance and shared by all queries against it.
+    ///
+    /// Clean layers cost an Arc refcount bump; dirty layers are materialized
+    /// exactly once. The build runs under the cache lock deliberately:
+    /// concurrent first-queries against a fresh snapshot serialize on the
+    /// fuse instead of each materializing their own multi-hundred-MB copy —
+    /// the thundering herd IS the memory incident this fixes. Waiters pay
+    /// ~the same wall time they would have paid fusing privately, minus the
+    /// allocation. LOCK DISCIPLINE: the critical section must stay
+    /// allocation-only — `fused_arc` takes no locks and must never grow a
+    /// callback/lazy-load path that could re-enter this field's cache
+    /// (self-deadlock). Poison is deliberately swallowed (into_inner): the
+    /// cache is either None or a fully-assigned Arc, so a panicking peer
+    /// cannot leave partial state.
+    fn fused_layers(&self) -> Arc<Vec<Arc<RoaringBitmap>>> {
+        let mut guard = self
+            .fused_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fused) = guard.as_ref() {
+            return Arc::clone(fused);
+        }
+        let fused = Arc::new(
+            self.bit_layers
+                .iter()
+                .map(|vb| vb.fused_arc())
+                .collect::<Vec<_>>(),
+        );
+        *guard = Some(Arc::clone(&fused));
+        fused
     }
 
     /// Get the field name.
@@ -58,6 +138,7 @@ impl SortField {
 
     /// Insert a value for a slot. Sets the appropriate bits in each layer's diff.
     pub fn insert(&mut self, slot: u32, value: u32) {
+        self.invalidate_fused();
         for bit in 0..self.num_bits {
             if (value >> bit) & 1 == 1 {
                 self.bit_layers[bit].insert(slot);
@@ -67,6 +148,7 @@ impl SortField {
 
     /// Remove a slot from all bit layers. Used by autovac.
     pub fn remove(&mut self, slot: u32) {
+        self.invalidate_fused();
         for layer in &mut self.bit_layers {
             layer.remove(slot);
         }
@@ -77,6 +159,7 @@ impl SortField {
     /// Uses `old_value` to decide insert vs remove (data-driven, not state-driven),
     /// so this works correctly even when bit layers are unloaded.
     pub fn update(&mut self, slot: u32, old_value: u32, new_value: u32) {
+        self.invalidate_fused();
         let diff = old_value ^ new_value;
         for bit in 0..self.num_bits {
             if (diff >> bit) & 1 == 1 {
@@ -93,6 +176,7 @@ impl SortField {
 
     /// Bulk-set a bit layer for multiple slots. Slots should be sorted for performance.
     pub fn set_layer_bulk(&mut self, bit: usize, slots: impl IntoIterator<Item = u32>) {
+        self.invalidate_fused();
         if let Some(layer) = self.bit_layers.get_mut(bit) {
             layer.insert_bulk(slots);
         }
@@ -101,6 +185,7 @@ impl SortField {
     /// OR a RoaringBitmap directly into a bit layer's base.
     /// Bypasses the diff layer for maximum bulk-load throughput.
     pub fn or_layer(&mut self, bit: usize, bitmap: &RoaringBitmap) {
+        self.invalidate_fused();
         if let Some(layer) = self.bit_layers.get_mut(bit) {
             layer.or_into_base(bitmap);
         }
@@ -108,6 +193,7 @@ impl SortField {
 
     /// Bulk-clear a bit layer for multiple slots.
     pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
+        self.invalidate_fused();
         if let Some(layer) = self.bit_layers.get_mut(bit) {
             for &slot in slots {
                 layer.remove(slot);
@@ -159,11 +245,15 @@ impl SortField {
         }
 
         let t_start = std::time::Instant::now();
-        let layers: Vec<Cow<'_, RoaringBitmap>> = self
-            .bit_layers
-            .iter()
-            .map(|vb| vb.fused_cow())
-            .collect();
+        // Fused view from the per-snapshot cache: built once per SortField
+        // instance, an Arc bump on every subsequent query. Replaces the
+        // per-query fused_cow materialization that cloned every dirty
+        // layer's full base per query (2026-07-10 memory incident). The
+        // Cow::Borrowed wrappers borrow from `fused`, which the traversal
+        // helpers below already accept — zero signature churn downstream.
+        let fused = self.fused_layers();
+        let layers: Vec<Cow<'_, RoaringBitmap>> =
+            fused.iter().map(|arc| Cow::Borrowed(arc.as_ref())).collect();
         let t_fuse = t_start.elapsed();
 
         // Apply cursor filtering if present
@@ -483,6 +573,7 @@ impl SortField {
 
     /// Merge all bit layers, compacting diffs into bases.
     pub fn merge_all(&mut self) {
+        self.invalidate_fused();
         for layer in &mut self.bit_layers {
             layer.merge();
         }
@@ -495,6 +586,7 @@ impl SortField {
 
     /// Merge only dirty bit layers (those with pending diffs).
     pub fn merge_dirty(&mut self) {
+        self.invalidate_fused();
         let total_start = std::time::Instant::now();
         let mut per_layer_us: Vec<(usize, u128, u128, u128, u64, u64, u64)> = Vec::new();
         // (bit, clone_us, set_us, sub_us, base_card_before, sets_card, clears_card)
@@ -560,6 +652,7 @@ impl SortField {
     /// dominant cause of the cross-pod bucket-count divergence observed at
     /// the same WAL cursor in production.
     pub fn load_layers(&mut self, layers: Vec<RoaringBitmap>) {
+        self.invalidate_fused();
         for (i, bm) in layers.into_iter().enumerate() {
             if i < self.bit_layers.len() {
                 self.bit_layers[i].replace_base_preserve_diff(bm);
@@ -590,14 +683,37 @@ impl SortField {
     /// The diff layers are preserved so mutations can accumulate
     /// while the sort field is not in memory.
     pub fn clear_bases_and_unload(&mut self) {
+        self.invalidate_fused();
         for layer in &mut self.bit_layers {
             layer.clear_base_and_unload();
         }
     }
 
-    /// Return the serialized byte size of all bit layer bitmaps.
+    /// Return the serialized byte size of all bit layer bitmaps, INCLUDING
+    /// bytes retained by the fused cache (review #306 finding 8: memory
+    /// accounting that can't see the cache under-reports after warmup).
     pub fn bitmap_bytes(&self) -> usize {
-        self.bit_layers.iter().map(|bm| bm.bitmap_bytes()).sum()
+        self.bit_layers.iter().map(|bm| bm.bitmap_bytes()).sum::<usize>()
+            + self.fused_cache_bytes()
+    }
+
+    /// Bytes RETAINED by the fused cache beyond the layer bases: counts only
+    /// dirty-layer materializations — clean layers share the base Arc, and
+    /// counting those would double-report the base.
+    pub fn fused_cache_bytes(&self) -> usize {
+        let guard = self
+            .fused_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(fused) => fused
+                .iter()
+                .zip(self.bit_layers.iter())
+                .filter(|(arc, vb)| !Arc::ptr_eq(arc, vb.base()))
+                .map(|(arc, _)| arc.serialized_size() as usize)
+                .sum(),
+            None => 0,
+        }
     }
 }
 
@@ -716,6 +832,122 @@ impl Default for SortIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generation isolation for the per-snapshot fused-layer cache
+    /// (2026-07-10 memory incident fix), exercised through the EXACT prod
+    /// sharing mechanics: SortIndex's Arc-per-field + Arc::make_mut CoW.
+    /// A snapshot that fused its view before staging mutated must keep
+    /// serving ITS OWN values from the SAME cached Arc, while staging's
+    /// make_mut clone starts cold and fuses the new state.
+    #[test]
+    fn fused_cache_snapshot_isolation_across_make_mut() {
+        let mut staging = SortIndex::new();
+        staging.add_field(make_config("reactionCount"));
+        // Dirty-layer state: inserts land in the diff (no merge).
+        staging.get_field_mut("reactionCount").unwrap().insert(1, 5);
+
+        // "Publish": snapshot clones the index — Arc refcount bump only.
+        let snapshot = staging.clone();
+        let snap_field = snapshot.get_field("reactionCount").unwrap();
+
+        // First query against the snapshot builds + caches the fused view.
+        let mut cands = RoaringBitmap::new();
+        cands.insert(1);
+        assert_eq!(snap_field.top_n(&cands, 10, true, None), vec![1]);
+        let fused_a = snap_field.fused_layers();
+        assert!(fused_a[0].contains(1), "bit0 of 5 set");
+
+        // Staging mutates AFTER the snapshot fused: refcount > 1 forces
+        // make_mut to clone; the snapshot's instance is frozen.
+        staging
+            .get_field_mut("reactionCount")
+            .unwrap()
+            .update(1, 5, 2);
+
+        // Snapshot: same cached Arc, same old values.
+        let fused_a2 = snap_field.fused_layers();
+        assert!(
+            Arc::ptr_eq(&fused_a, &fused_a2),
+            "snapshot's cache must be untouched by staging mutation"
+        );
+        assert_eq!(snap_field.reconstruct_value(1), 5);
+
+        // Staging: new value, cold cache (Clone reset), fresh fuse.
+        let staged_field = staging.get_field("reactionCount").unwrap();
+        assert_eq!(staged_field.reconstruct_value(1), 2);
+        let fused_b = staged_field.fused_layers();
+        assert!(
+            !Arc::ptr_eq(&fused_a, &fused_b),
+            "staging must not inherit the pre-mutation fused view"
+        );
+        assert!(!fused_b[0].contains(1), "bit0 of 2 clear");
+        assert!(fused_b[1].contains(1), "bit1 of 2 set");
+    }
+
+    /// Review #306 required-change: EVERY mutating method must invalidate
+    /// the fused cache — one case per method so a dropped hook fails by name.
+    #[test]
+    fn fused_cache_invalidated_by_every_mutator() {
+        fn fresh() -> SortField {
+            let mut sf = SortField::new(make_config("f"));
+            sf.insert(1, 5);
+            sf
+        }
+        let cases: Vec<(&str, Box<dyn Fn(&mut SortField)>)> = vec![
+            ("insert", Box::new(|sf: &mut SortField| sf.insert(2, 9))),
+            ("remove", Box::new(|sf: &mut SortField| sf.remove(1))),
+            ("update", Box::new(|sf: &mut SortField| sf.update(1, 5, 2))),
+            ("set_layer_bulk", Box::new(|sf: &mut SortField| sf.set_layer_bulk(0, [7u32]))),
+            ("or_layer", Box::new(|sf: &mut SortField| {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(9);
+                sf.or_layer(0, &bm);
+            })),
+            ("clear_layer_bulk", Box::new(|sf: &mut SortField| sf.clear_layer_bulk(0, &[1]))),
+            ("merge_all", Box::new(|sf: &mut SortField| sf.merge_all())),
+            ("merge_dirty", Box::new(|sf: &mut SortField| sf.merge_dirty())),
+            ("load_layers", Box::new(|sf: &mut SortField| {
+                sf.load_layers(vec![RoaringBitmap::new()])
+            })),
+            ("clear_bases_and_unload", Box::new(|sf: &mut SortField| {
+                sf.clear_bases_and_unload()
+            })),
+        ];
+        for (name, mutate) in cases {
+            let mut sf = fresh();
+            let before = sf.fused_layers();
+            mutate(&mut sf);
+            let after = sf.fused_layers();
+            assert!(
+                !Arc::ptr_eq(&before, &after),
+                "{name} must invalidate the fused cache"
+            );
+        }
+    }
+
+    /// Sole-owner mutation (loading mode / bulk load: refcount == 1, no
+    /// make_mut clone) must invalidate the cache on the SAME instance —
+    /// backstop (2) in the fused_cache doc comment.
+    #[test]
+    fn fused_cache_invalidated_by_in_place_mutation() {
+        let mut sf = SortField::new(make_config("reactionCount"));
+        sf.insert(1, 5);
+        let f1 = sf.fused_layers();
+        assert!(f1[0].contains(1) && f1[2].contains(1)); // 5 = 0b101
+
+        sf.update(1, 5, 2); // in place — no Arc, no Clone
+        let f2 = sf.fused_layers();
+        assert!(!Arc::ptr_eq(&f1, &f2), "in-place mutation must invalidate");
+        assert!(!f2[0].contains(1) && f2[1].contains(1)); // 2 = 0b010
+
+        // merge_dirty (targeted compaction) must also invalidate: it moves
+        // diff bits into the base, so a stale fused view would double-apply.
+        let f3 = sf.fused_layers();
+        sf.merge_dirty();
+        let f4 = sf.fused_layers();
+        assert!(!Arc::ptr_eq(&f3, &f4), "merge_dirty must invalidate");
+        assert_eq!(sf.reconstruct_value(1), 2);
+    }
 
     /// REGRESSION (prod 2026-07-09): descending keyset pagination silently
     /// dropped the remainder of every tied-value band that straddled a page
