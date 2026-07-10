@@ -308,6 +308,19 @@ fn ts_to_secs(ts: i64) -> i64 {
     }
 }
 
+/// u64 twin of [`ts_to_secs`] for the executor's bitmap-key thresholds
+/// (executor.rs C3 Gt/Gte/Lt/Lte paths on the bucketed field — same units
+/// bug, same normalization; review #305 F1). Microsecond senders (none
+/// known) would still land at duration≈0 → smallest bucket, the original
+/// bug shape — the two REAL units (s, ms) are what this disambiguates.
+pub(crate) fn ts_secs_u64(ts: u64) -> u64 {
+    if ts > 100_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
+}
+
 /// Try to snap a `Gt/Gte(field, ts)` to a bucket bitmap.
 /// Returns `Some(BucketBitmap { ... })` if snapping succeeds, `None` otherwise.
 fn try_snap_to_bucket(

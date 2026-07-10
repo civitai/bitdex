@@ -211,7 +211,11 @@ pub fn snap_clause_key(
             if field == tb.field_name() =>
         {
             let threshold = match value {
-                Value::Integer(v) => Some(*v as u64),
+                // Unit-normalized (#305 review F2): raw ms saturated the
+                // duration to 0 here. Dead code today (live cache keys come
+                // from post-snap BucketBitmap bucket_name), fixed so it can't
+                // be resurrected with the bug intact.
+                Value::Integer(v) => Some(crate::query::ts_secs_u64(*v as u64)),
                 _ => None,
             }?;
             let duration = now_unix.saturating_sub(threshold);
@@ -226,7 +230,8 @@ pub fn snap_clause_key(
             if field == tb.field_name() =>
         {
             let threshold = match value {
-                Value::Integer(v) => Some(*v as u64),
+                // Unit-normalized (#305 review F2) — see the Gte arm.
+                Value::Integer(v) => Some(crate::query::ts_secs_u64(*v as u64)),
                 _ => None,
             }?;
             let duration = threshold.saturating_sub(now_unix);
