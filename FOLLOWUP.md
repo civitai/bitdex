@@ -243,3 +243,18 @@ MITIGATED by design: the #291 overdue-deferred sweep (10-min cadence, 200/batch)
 shadow-false candidates — observed healing live ("healed 69 of 200"). Code fix wanted:
 derive isPublished shadow on the fresh-insert op path, same as deferred replay. Verify
 with: per-post `postId Eq` vs `postId Eq AND isPublished Eq true` deficit probe.
+
+## bitdex-1 boot-replay skip-watermark drops inserts (2026-07-13 nuke, OPEN BUG)
+
+After the full nuke, bitdex-1 (second pod, dumped mid-churn) is missing images
+structurally (285 of 443 window posts have fewer alive images than PG; docs absent).
+Discriminator: WAL reader skips — bitdex-1 total skipped=9,614 vs bitdex-0's 146.
+Hypothesis (counters consistent): boot replay's re-delivery dedup/watermark treats ops
+with created_at between the CSV COPY snapshot and load completion as "covered by the
+dump" and skips them — but the CSV predates them, so inserts in that gap vanish.
+bitdex-0 unaffected because its churn ops arrived live AFTER load (not via replay).
+Impact: standby-only (bitdex-0 verified clean 5/443 residual = live churn). Fix: skip
+watermark must be the COPY snapshot time, not load completion — then re-nuke bitdex-1.
+Victim enumeration recipe: per-post PG image count vs `postId Eq` total_matched over
+the boot window. isPublished shadow-false sub-class heals via #291 sweep + wave-2 nudge
+(healed tonight: bitdex-0 30/30 posts, bitdex-1 5/6 shadow-only).
