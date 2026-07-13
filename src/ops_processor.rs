@@ -2335,6 +2335,216 @@ mod tests {
         panic!("slot {slot} never became alive within {timeout_ms}ms");
     }
 
+    /// PROD REPRO (2026-07-10, layer-zero hunt): an ALIVE draft image re-deferred
+    /// by a future-publishedAt fan-out, then activated at Tf. The re-defer path
+    /// (mutation.rs [2.5]) clears every filter/sort bit from the old doc;
+    /// activation replay (diff_document(None, stored_doc)) must restore ALL of
+    /// them. Prod victims (23 of Day's top-200, e.g. slot 136273661 / post
+    /// 29693453, fan-out [remove publishedAt(null), set publishedAt(future)])
+    /// ended with filters restored but sortAt/publishedAt/existedAt layers = 0.
+    #[test]
+    fn test_redefer_then_activation_restores_sort_layers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docstore_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+
+        let mut config = test_config();
+        config.storage.bitmap_path = Some(bitmap_path);
+        // Keep the merge thread from persisting snapshots before the restart
+        // phase: the opslog must be the ONLY durability path — exactly the
+        // prod window where activation replay ops lived only in (dead)
+        // legacy per-layer appends. 45s > test runtime-to-drop; NOT huge,
+        // because engine shutdown joins the merge thread mid-sleep (a 1h
+        // interval hangs drop for an hour).
+        config.merge_interval_ms = 45_000;
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "sortAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: Some(crate::config::ComputedField {
+                op: crate::config::ComputedOp::Greatest,
+                source_fields: vec!["existedAt".into(), "publishedAt".into()],
+            }),
+        });
+        config.deferred_alive = Some(crate::config::DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+            sweep_interval_secs: 0,
+            sweep_limit: 20_000,
+        });
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let image_slot: u32 = 7;
+        let post_id: i64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let t_existed = now - 3600;
+        let t_pub_future = now + 3; // activates ~3s in
+
+        // 1) Draft image insert (server-shaped): alive, existedAt set, no pub.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: image_slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(post_id) },
+                Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                Op::Set { field: "existedAt".into(), value: json!(t_existed) },
+            ],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, image_slot, 5_000);
+        assert_eq!(
+            sort_layer_value(&engine, "sortAt", image_slot),
+            Some(t_existed as u32),
+            "draft insert must set sortAt layers to existedAt"
+        );
+
+        // 2) Post schedules publish in the future → fan-out re-defers the
+        //    ALIVE image (exact captured prod shape: remove(null) + set(T)).
+        let mut sink2 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: post_id,
+            creates_slot: false,
+            ops: vec![Op::QueryOpSet {
+                query: Some(format!("postId eq {post_id}")),
+                ops: vec![
+                    Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+                    Op::Set { field: "publishedAt".into(), value: json!(t_pub_future) },
+                ],
+            }],
+        }];
+        let (applied2, _, errors2) =
+            apply_ops_batch(&mut sink2, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        assert_eq!((applied2, errors2), (1, 0), "fan-out must match the image");
+        crate::ingester::BitmapSink::flush(&mut sink2).unwrap();
+        dw2.flush();
+
+        // 3) Wait until PAST Tf, then for the activation replay to land: the
+        //    publishedAt layer flipping to T is the replay's own write, so
+        //    polling it (not sortAt, which holds existedAt bits from the
+        //    insert) is the correct convergence signal.
+        std::thread::sleep(std::time::Duration::from_secs((t_pub_future - now + 2) as u64));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if sort_layer_value(&engine, "publishedAt", image_slot).unwrap_or(0) != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(engine.is_slot_alive(image_slot), "slot must be alive after Tf");
+
+        // 4) Post-activation: filters AND all sort layers must be restored.
+        let expected_sort = t_pub_future.max(t_existed) as u32;
+        assert_eq!(
+            sort_layer_value(&engine, "publishedAt", image_slot),
+            Some(t_pub_future as u32),
+            "activation replay must restore publishedAt layers"
+        );
+        assert_eq!(
+            sort_layer_value(&engine, "existedAt", image_slot),
+            Some(t_existed as u32),
+            "activation replay must restore existedAt layers"
+        );
+        assert_eq!(
+            sort_layer_value(&engine, "sortAt", image_slot),
+            Some(expected_sort),
+            "activation replay must restore computed sortAt layers (prod victims read 0)"
+        );
+
+        // 5) RESTART: activation-replay ops have NO WAL entry — the shard
+        //    opslog is their ONLY durability. Pre-fix, sort ops were appended
+        //    to legacy per-layer files that `load_sort_layers` never reads
+        //    when the packed shard exists, so every pod restart permanently
+        //    zeroed the layers of everything activated since the last merge
+        //    persist (prod 2026-07-10: whole activation cohorts, 8/8 at
+        //    Tf=11:26Z; post-restart cohorts 5/5 clean).
+        let config2 = engine.config().clone();
+        drop(engine);
+        let engine2 = ConcurrentEngine::new_with_path(config2, &docstore_path).unwrap();
+        assert!(engine2.is_slot_alive(image_slot), "slot alive after restart");
+        assert_eq!(
+            sort_layer_value(&engine2, "publishedAt", image_slot),
+            Some(t_pub_future as u32),
+            "publishedAt layers must survive restart (pre-fix: zeroed)"
+        );
+        assert_eq!(
+            sort_layer_value(&engine2, "existedAt", image_slot),
+            Some(t_existed as u32),
+            "existedAt layers must survive restart (pre-fix: zeroed)"
+        );
+        assert_eq!(
+            sort_layer_value(&engine2, "sortAt", image_slot),
+            Some(expected_sort),
+            "computed sortAt layers must survive restart (pre-fix: zeroed)"
+        );
+    }
+
+    /// Read a slot's sort-layer value the way queries see it: a sorted
+    /// single-slot query whose page cursor carries the reconstructed value.
+    fn sort_layer_value(engine: &ConcurrentEngine, field: &str, slot: u32) -> Option<u32> {
+        let query = crate::query::BitdexQuery {
+            filters: vec![crate::query::FilterClause::Eq(
+                "postId".to_string(),
+                crate::query::Value::Integer(100),
+            )],
+            sort: Some(crate::query::SortClause {
+                field: field.to_string(),
+                direction: crate::query::SortDirection::Asc,
+            }),
+            limit: 50,
+            offset: None,
+            cursor: None,
+            skip_cache: true,
+        };
+        let mut cursor = None;
+        for _ in 0..10 {
+            let mut q = query.clone();
+            q.limit = 1;
+            q.cursor = cursor;
+            let res = engine.execute_query(&q).ok()?;
+            if res.ids.is_empty() {
+                return None;
+            }
+            let cur = res.cursor?;
+            if res.ids[0] as u32 == slot {
+                return Some(cur.sort_value as u32);
+            }
+            cursor = Some(crate::query::CursorPosition {
+                sort_value: cur.sort_value,
+                slot_id: cur.slot_id,
+            });
+        }
+        None
+    }
+
     fn test_config() -> Config {
         let mut config = Config::default();
         config.filter_fields = vec![

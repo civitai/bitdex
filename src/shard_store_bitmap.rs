@@ -460,10 +460,16 @@ pub enum SortLayerOp {
     SetBit { bit_position: u8, slot: u32 },
     /// Clear a slot bit from a specific layer's bitmap.
     ClearBit { bit_position: u8, slot: u32 },
+    /// Set many slot bits on a specific layer's bitmap (flush opslog batches).
+    BatchSet { bit_position: u8, slots: Vec<u32> },
+    /// Clear many slot bits from a specific layer's bitmap.
+    BatchClear { bit_position: u8, slots: Vec<u32> },
 }
 
 const SORT_LAYER_OP_SET: u8 = 0x21;
 const SORT_LAYER_OP_CLEAR: u8 = 0x22;
+const SORT_LAYER_OP_BATCH_SET: u8 = 0x23;
+const SORT_LAYER_OP_BATCH_CLEAR: u8 = 0x24;
 
 // ---------------------------------------------------------------------------
 // SortFieldSnapshotCodec
@@ -607,6 +613,22 @@ impl OpCodec for SortLayerOpCodec {
                 buf.push(*bit_position);
                 buf.extend_from_slice(&slot.to_le_bytes());
             }
+            SortLayerOp::BatchSet { bit_position, slots } => {
+                buf.push(SORT_LAYER_OP_BATCH_SET);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+                for slot in slots {
+                    buf.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
+            SortLayerOp::BatchClear { bit_position, slots } => {
+                buf.push(SORT_LAYER_OP_BATCH_CLEAR);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+                for slot in slots {
+                    buf.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -626,6 +648,28 @@ impl OpCodec for SortLayerOpCodec {
         match tag {
             SORT_LAYER_OP_SET => Ok(SortLayerOp::SetBit { bit_position, slot }),
             SORT_LAYER_OP_CLEAR => Ok(SortLayerOp::ClearBit { bit_position, slot }),
+            SORT_LAYER_OP_BATCH_SET | SORT_LAYER_OP_BATCH_CLEAR => {
+                // [tag][bit][u32 count][count x u32 slots] — `slot` above decoded
+                // the count field.
+                let count = slot as usize;
+                let need = 6 + count * 4;
+                if bytes.len() < need {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated sort layer batch op",
+                    ));
+                }
+                let mut slots = Vec::with_capacity(count);
+                for i in 0..count {
+                    let off = 6 + i * 4;
+                    slots.push(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+                }
+                if tag == SORT_LAYER_OP_BATCH_SET {
+                    Ok(SortLayerOp::BatchSet { bit_position, slots })
+                } else {
+                    Ok(SortLayerOp::BatchClear { bit_position, slots })
+                }
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown sort layer op tag: 0x{:02x}", other),
@@ -643,6 +687,22 @@ impl OpCodec for SortLayerOpCodec {
             SortLayerOp::ClearBit { bit_position, slot } => {
                 if let Some(bm) = snapshot.layers.get_mut(bit_position) {
                     bm.remove(*slot);
+                }
+            }
+            SortLayerOp::BatchSet { bit_position, slots } => {
+                let bm = snapshot
+                    .layers
+                    .entry(*bit_position)
+                    .or_insert_with(RoaringBitmap::new);
+                for slot in slots {
+                    bm.insert(*slot);
+                }
+            }
+            SortLayerOp::BatchClear { bit_position, slots } => {
+                if let Some(bm) = snapshot.layers.get_mut(bit_position) {
+                    for slot in slots {
+                        bm.remove(*slot);
+                    }
                 }
             }
         }
@@ -1265,6 +1325,16 @@ impl SortBitmapStore {
     /// Encodes all layers into a single `sort/{field}.shard` file using
     /// the SortFieldSnapshotCodec packed format (index + packed bitmaps).
     pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
+        // Serialize against append_packed_sort_ops (review #308 B3): the
+        // atomic-rename rewrite would silently swallow an append landing
+        // between our read of the old file and the rename. Both paths take
+        // the canonical per-field lock (bit_position 0 on THE shared store
+        // instance — flush and merge hold Arc clones of the same store).
+        let field_lock = self.shard_lock(&SortLayerShardKey {
+            field: field.to_string(),
+            bit_position: 0,
+        });
+        let _guard = field_lock.write();
         let shard_path = self.root().join("sort").join(format!("{}.shard", field));
 
         // Encode packed snapshot directly from layer refs
@@ -1283,6 +1353,204 @@ impl SortBitmapStore {
             flags: 0,
         };
         crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[], crate::shard_store::ShardRewriteSource::Snapshot)
+    }
+
+    /// Append sort-layer ops to the PACKED per-field shard — the file
+    /// `load_sort_layers` actually reads at boot (fix 2026-07-10: appends
+    /// previously went to the legacy per-layer files, which the loader
+    /// ignores whenever a packed shard exists; non-WAL-backed ops — deferred
+    /// activation replay — were permanently lost on every restart).
+    ///
+    /// Locking: canonical per-field lock (bit_position 0) on THIS store
+    /// instance, shared with `write_sort_layers` (merge thread holds an Arc
+    /// clone of the same store), closing the append-vs-atomic-rewrite lost-
+    /// append window (review #308 B3).
+    ///
+    /// Cold create (review #308 B2): if no packed shard exists but legacy
+    /// per-layer shards do (a deployment that never wrote packed), creating
+    /// an empty-snapshot packed file would SHADOW the full legacy bitmaps at
+    /// the next boot. Migrate first: materialize the packed snapshot from
+    /// the legacy layers, then append.
+    pub fn append_packed_sort_ops(
+        &self,
+        field: &str,
+        num_bits: usize,
+        ops: &[SortLayerOp],
+        fsync: bool,
+    ) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let shard_path = self.root().join("sort").join(format!("{}.shard", field));
+
+        // Legacy migration read happens BEFORE taking the canonical field
+        // lock: `self.read()` acquires the per-shard lock for each legacy
+        // key, and bit_position 0's key IS the canonical field lock —
+        // reading it while holding the write guard self-deadlocks
+        // (parking_lot RwLock is not reentrant). Nothing writes the legacy
+        // per-layer files anymore (this fix routed all sort appends here),
+        // so the pre-lock read cannot go stale; the cold-create check is
+        // re-evaluated under the lock so a racing cold-creator is benign.
+        let legacy_layers: Option<Vec<RoaringBitmap>> =
+            if !shard_path.exists() || !crate::shard_store::is_valid_shard_file(&shard_path) {
+                let mut layers: Vec<RoaringBitmap> = Vec::with_capacity(num_bits);
+                let mut any_legacy = false;
+                for bit in 0..num_bits {
+                    let key = SortLayerShardKey {
+                        field: field.to_string(),
+                        bit_position: bit as u8,
+                    };
+                    match self.read(&key)? {
+                        Some(bm) => {
+                            any_legacy = true;
+                            layers.push(bm);
+                        }
+                        None => layers.push(RoaringBitmap::new()),
+                    }
+                }
+                any_legacy.then_some(layers)
+            } else {
+                None
+            };
+
+        let field_lock = self.shard_lock(&SortLayerShardKey {
+            field: field.to_string(),
+            bit_position: 0,
+        });
+        let _guard = field_lock.write();
+
+        if !shard_path.exists() || !crate::shard_store::is_valid_shard_file(&shard_path) {
+            if let Some(parent) = shard_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut snapshot_bytes = Vec::new();
+            if let Some(layers) = &legacy_layers {
+                SortFieldSnapshotCodec::encode_from_layers(
+                    layers.iter().enumerate().map(|(i, bm)| (i as u8, bm)),
+                    &mut snapshot_bytes,
+                );
+            }
+            let header = crate::shard_store::ShardHeader {
+                version: crate::shard_store::SHARD_VERSION,
+                ops_section_offset: crate::shard_store::HEADER_SIZE as u64
+                    + snapshot_bytes.len() as u64,
+                snapshot_len: snapshot_bytes.len() as u32,
+                ops_count: 0,
+                flags: 0,
+            };
+            crate::shard_store::write_shard_file_atomic(
+                &shard_path,
+                &header,
+                &snapshot_bytes,
+                &[],
+                crate::shard_store::ShardRewriteSource::ColdCreate,
+            )?;
+        }
+
+        let mut ops_buf = Vec::new();
+        for op in ops {
+            crate::shard_store::write_op_entry::<SortLayerOpCodec>(op, &mut ops_buf);
+        }
+        crate::shard_store::append_ops_to_shard_opts(
+            &shard_path,
+            &ops_buf,
+            ops.len() as u32,
+            fsync,
+        )
+    }
+
+    /// Compact the packed per-field shard when its ops tail exceeds
+    /// `threshold`: fold snapshot+ops into a fresh snapshot (ops reset).
+    /// The merge thread calls this per configured sort field each dirty
+    /// cycle — without it the packed ops tail (now the ONLY sort op
+    /// destination) grows unboundedly and boot replay degrades (review
+    /// #308 F6). Runs entirely under the canonical per-field lock shared
+    /// with `write_sort_layers` and `append_packed_sort_ops`.
+    pub fn compact_packed_sort_if_needed(
+        &self,
+        field: &str,
+        bits: usize,
+        threshold: u64,
+    ) -> io::Result<bool> {
+        if threshold == 0 {
+            return Ok(false);
+        }
+        let shard_path = self.root().join("sort").join(format!("{}.shard", field));
+        if !shard_path.exists() {
+            return Ok(false);
+        }
+        // Cheap header peek outside the lock; re-checked under it. Reads
+        // ONLY the 28-byte header — the packed shard itself can be hundreds
+        // of MB and this runs per sort field per merge dirty cycle.
+        let ops_count = {
+            use std::io::Read;
+            let mut header_buf = [0u8; crate::shard_store::HEADER_SIZE];
+            let mut f = std::fs::File::open(&shard_path)?;
+            f.read_exact(&mut header_buf)?;
+            crate::shard_store::ShardHeader::decode(&header_buf)?.ops_count as u64
+        };
+        if ops_count < threshold {
+            return Ok(false);
+        }
+        let field_lock = self.shard_lock(&SortLayerShardKey {
+            field: field.to_string(),
+            bit_position: 0,
+        });
+        let _guard = field_lock.write();
+        // Re-read under the lock (an append/rewrite may have raced the peek).
+        let data = std::fs::read(&shard_path)?;
+        let header = crate::shard_store::ShardHeader::decode(&data)?;
+        if (header.ops_count as u64) < threshold {
+            return Ok(false);
+        }
+        let snap_start = crate::shard_store::HEADER_SIZE;
+        let snap_end = snap_start + header.snapshot_len as usize;
+        // A truncated file (crash mid-append, disk corruption) must abort
+        // this field's compaction with an error, not panic the merge thread
+        // on an out-of-bounds slice.
+        if data.len() < snap_end || (data.len() as u64) < header.ops_section_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "packed sort shard '{}' truncated: {} bytes, header claims snapshot end {} / ops offset {}",
+                    field, data.len(), snap_end, header.ops_section_offset
+                ),
+            ));
+        }
+        let mut snap = if header.snapshot_len > 0 {
+            SortFieldSnapshotCodec::decode(&data[snap_start..snap_end])?
+        } else {
+            SortFieldSnapshot::new()
+        };
+        if header.ops_count > 0 {
+            let ops_data = &data[header.ops_section_offset as usize..];
+            for op in crate::shard_store::read_op_entries_pub::<SortLayerOpCodec>(ops_data) {
+                SortLayerOpCodec::apply(&mut snap, &op);
+            }
+        }
+        let mut snapshot_bytes = Vec::new();
+        SortFieldSnapshotCodec::encode_from_layers(
+            (0..bits).filter_map(|bit| {
+                snap.layers.get(&(bit as u8)).map(|bm| (bit as u8, bm))
+            }),
+            &mut snapshot_bytes,
+        );
+        let new_header = crate::shard_store::ShardHeader {
+            version: crate::shard_store::SHARD_VERSION,
+            ops_section_offset: crate::shard_store::HEADER_SIZE as u64
+                + snapshot_bytes.len() as u64,
+            snapshot_len: snapshot_bytes.len() as u32,
+            ops_count: 0,
+            flags: 0,
+        };
+        crate::shard_store::write_shard_file_atomic(
+            &shard_path,
+            &new_header,
+            &snapshot_bytes,
+            &[],
+            crate::shard_store::ShardRewriteSource::Snapshot,
+        )?;
+        Ok(true)
     }
 
     /// Pre-create the sort directory.
@@ -2049,5 +2317,97 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].field, "reactionCount");
         assert_eq!(keys[1].field, "sortAt");
+    }
+
+    /// #308 gate (store level): packed appends survive a full
+    /// append → compact → reload cycle with exact values, including a
+    /// same-batch clear+set conflict on one (layer, slot). Boot replays ops
+    /// in append order; the flush appends clears FIRST (mirroring the
+    /// in-memory coalescer where the set wins), so the reloaded bit must be
+    /// SET.
+    #[test]
+    fn test_packed_sort_append_compact_reload_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SortBitmapStore::new(dir.path().to_path_buf(), SortLayerShard).unwrap();
+        // value 5 (bits 0,2) for slot 7 via batch sets
+        store
+            .append_packed_sort_ops(
+                "sortAt",
+                8,
+                &[
+                    SortLayerOp::BatchSet { bit_position: 0, slots: vec![7] },
+                    SortLayerOp::BatchSet { bit_position: 2, slots: vec![7] },
+                ],
+                false,
+            )
+            .unwrap();
+        // transition to value 6 (bits 1,2): clears FIRST (coalescer contract),
+        // including a deliberate clear+set conflict on bit 1 to pin ordering.
+        store
+            .append_packed_sort_ops(
+                "sortAt",
+                8,
+                &[
+                    SortLayerOp::BatchClear { bit_position: 0, slots: vec![7] },
+                    SortLayerOp::BatchClear { bit_position: 1, slots: vec![7] },
+                    SortLayerOp::BatchSet { bit_position: 1, slots: vec![7] },
+                    SortLayerOp::BatchSet { bit_position: 2, slots: vec![7] },
+                ],
+                false,
+            )
+            .unwrap();
+        let read_value = |st: &SortBitmapStore| -> u32 {
+            let layers = st.load_sort_layers("sortAt", 8).unwrap().unwrap();
+            let mut v = 0u32;
+            for (bit, bm) in layers.iter().enumerate() {
+                if bm.contains(7) {
+                    v |= 1 << bit;
+                }
+            }
+            v
+        };
+        assert_eq!(read_value(&store), 6, "pre-compaction reload");
+        // Force compaction (threshold 1 <= 6 ops) and re-verify.
+        assert!(store.compact_packed_sort_if_needed("sortAt", 8, 1).unwrap());
+        assert_eq!(read_value(&store), 6, "post-compaction reload");
+        // Fresh store instance = boot.
+        let store2 = SortBitmapStore::new(dir.path().to_path_buf(), SortLayerShard).unwrap();
+        assert_eq!(read_value(&store2), 6, "post-restart reload");
+    }
+
+    /// #308 review B2: a deployment with LEGACY per-layer sort data but no
+    /// packed shard must not have its data shadowed when the first packed
+    /// append cold-creates the file — the cold path migrates legacy layers
+    /// into the packed snapshot first.
+    #[test]
+    fn test_packed_cold_create_migrates_legacy_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SortBitmapStore::new(dir.path().to_path_buf(), SortLayerShard).unwrap();
+        // Legacy state: slot 3 has value 4 (bit 2) via the legacy write path.
+        let mut bm = RoaringBitmap::new();
+        bm.insert(3);
+        store
+            .write_snapshot(
+                &SortLayerShardKey { field: "sortAt".into(), bit_position: 2 },
+                &bm,
+            )
+            .unwrap();
+        assert!(
+            !dir.path().join("sort").join("sortAt.shard").exists(),
+            "no packed shard yet"
+        );
+        // First packed append (slot 9, bit 0) cold-creates the packed shard.
+        store
+            .append_packed_sort_ops(
+                "sortAt",
+                8,
+                &[SortLayerOp::BatchSet { bit_position: 0, slots: vec![9] }],
+                false,
+            )
+            .unwrap();
+        // Packed load must contain BOTH the migrated legacy bit and the new op.
+        let layers = store.load_sort_layers("sortAt", 8).unwrap().unwrap();
+        assert!(layers[2].contains(3), "legacy bit migrated, not shadowed");
+        assert!(layers[0].contains(9), "new append applied");
     }
 }

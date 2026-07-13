@@ -28,7 +28,7 @@ use crate::unified_cache::{
     evaluate_filter_work, evaluate_sort_work,
 };
 use crate::shard_store_bitmap::{
-    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
+    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp,
 };
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 /// Bridge for passing Prometheus metric handles from the server layer into
@@ -1398,6 +1398,23 @@ impl ConcurrentEngine {
             let flush_alive_store = alive_store.clone();
             let flush_filter_store = filter_store.clone();
             let flush_sort_store = sort_store.clone();
+            // Sort ops append target (fix 2026-07-10, restart data loss): sort
+            // opslog appends previously targeted the LEGACY per-layer shard
+            // files, but `load_sort_layers` prefers the PACKED per-field shard
+            // whenever it exists (the merge thread writes it) and never reads
+            // the legacy appends — so every sort op since the last merge
+            // persist silently vanished at boot. WAL replay masked the loss
+            // for WAL-backed writes; deferred-activation replay ops have no
+            // WAL entry and were PERMANENTLY lost on every pod restart (prod:
+            // whole activation cohorts with sortAt/publishedAt/existedAt
+            // layers zeroed). Appends now go through
+            // `SortBitmapStore::append_packed_sort_ops` — same instance and
+            // per-field lock as the merge thread's `write_sort_layers`.
+            let flush_sort_field_bits: HashMap<String, usize> = config
+                .sort_fields
+                .iter()
+                .map(|sc| (sc.name.clone(), sc.bits as usize))
+                .collect();
             let flush_meta_store = meta_store.clone();
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
@@ -2720,36 +2737,55 @@ impl ConcurrentEngine {
                                     }
                                 }
 
-                                let sort_set: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
-                                    .sort_set_entries()
-                                    .iter()
-                                    .map(|(sgk, slots)| (
-                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
-                                        BitmapOp::BatchSet { bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                let sort_clr: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
-                                    .sort_clear_entries()
-                                    .iter()
-                                    .map(|(sgk, slots)| (
-                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
-                                        BitmapOp::BatchClear { bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                let sort_total = sort_set.len() + sort_clr.len();
-                                if sort_total >= par_iter_min {
-                                    sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
-                                        |(shard_key, op)| {
-                                            if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
-                                                eprintln!("flush: sort op failed: {e}");
-                                            }
-                                        },
-                                    );
-                                } else {
-                                    for (shard_key, op) in sort_set.into_iter().chain(sort_clr.into_iter()) {
-                                        if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
-                                            eprintln!("flush: sort op failed: {e}");
+                                // Sort ops: append to the PACKED per-field shard —
+                                // the file `load_sort_layers` reads at boot (legacy
+                                // per-layer appends were dead writes; see the
+                                // flush_sort_field_bits comment above). Grouped per
+                                // field, ONE file open per field per cycle.
+                                //
+                                // ORDER (review #308 B1): boot replays ops in append
+                                // order, and the in-memory coalescer applies clears
+                                // BEFORE sets (set wins on a same-cycle conflict for
+                                // one (layer, slot) — e.g. two value transitions for
+                                // a slot in one batch). Append clears first so the
+                                // reloaded state matches memory.
+                                {
+                                    use crate::shard_store_bitmap::SortLayerOp;
+                                    let mut by_field: HashMap<Arc<str>, Vec<SortLayerOp>> =
+                                        HashMap::new();
+                                    for (sgk, slots) in coalescer.sort_clear_entries() {
+                                        by_field.entry(Arc::clone(&sgk.field)).or_default().push(
+                                            SortLayerOp::BatchClear {
+                                                bit_position: sgk.bit_layer as u8,
+                                                slots: slots.clone(),
+                                            },
+                                        );
+                                    }
+                                    for (sgk, slots) in coalescer.sort_set_entries() {
+                                        by_field.entry(Arc::clone(&sgk.field)).or_default().push(
+                                            SortLayerOp::BatchSet {
+                                                bit_position: sgk.bit_layer as u8,
+                                                slots: slots.clone(),
+                                            },
+                                        );
+                                    }
+                                    let fields: Vec<(Arc<str>, Vec<SortLayerOp>)> =
+                                        by_field.into_iter().collect();
+                                    let append_one = |(field, ops): &(Arc<str>, Vec<SortLayerOp>)| {
+                                        let bits = flush_sort_field_bits
+                                            .get(field.as_ref())
+                                            .copied()
+                                            .unwrap_or(32);
+                                        if let Err(e) =
+                                            ss_.append_packed_sort_ops(field, bits, ops, false)
+                                        {
+                                            eprintln!("flush: packed sort op failed: {e}");
                                         }
+                                    };
+                                    if fields.len() >= par_iter_min {
+                                        fields.par_iter().for_each(append_one);
+                                    } else {
+                                        fields.iter().for_each(append_one);
                                     }
                                 }
                             }
@@ -3867,6 +3903,11 @@ impl ConcurrentEngine {
             let merge_alive_store = alive_store.clone();
             let merge_filter_store = filter_store.clone();
             let merge_sort_store = sort_store.clone();
+            let merge_sort_field_bits: Vec<(String, usize)> = config
+                .sort_fields
+                .iter()
+                .map(|sc| (sc.name.clone(), sc.bits as usize))
+                .collect();
             let merge_meta_store = meta_store.clone();
             let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
@@ -3939,13 +3980,33 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
-                        // Compact sort shards that have accumulated too many ops
+                        // Compact sort shards that have accumulated too many ops.
+                        // Legacy per-layer shards (historical appends only —
+                        // flush now appends to the packed files):
                         if let Ok(sort_shards) = ss_.list_current_shards() {
                             for key in &sort_shards {
                                 if ss_.needs_compaction(key).unwrap_or(false) {
                                     if let Err(e) = ss_.compact_current(key) {
                                         eprintln!("merge: sort compaction failed: {e}");
                                     }
+                                }
+                            }
+                        }
+                        // Packed per-field shards — the live sort op
+                        // destination since the 2026-07-10 durability fix.
+                        // Without this the packed ops tail grows unboundedly
+                        // (review #308 F6): fold into a fresh snapshot at the
+                        // same hot-tunable threshold the legacy path uses.
+                        {
+                            let threshold =
+                                ss_.compact_threshold() as u64;
+                            for (field, bits) in &merge_sort_field_bits {
+                                match ss_.compact_packed_sort_if_needed(field, *bits, threshold) {
+                                    Ok(true) => eprintln!("merge: packed sort '{field}' compacted"),
+                                    Ok(false) => {}
+                                    Err(e) => eprintln!(
+                                        "merge: packed sort compaction failed for '{field}': {e}"
+                                    ),
                                 }
                             }
                         }
@@ -14501,15 +14562,15 @@ mod tests {
         ).unwrap();
         // 500 in binary: bit 8 (256), bit 7 (128), bit 6 (64), bit 5 (32),
         // bit 4 (16), bit 2 (4) = 0b111110100
-        // At least bit 8 should be set for slot 1
-        let layer_key = SortLayerShardKey {
-            field: "reactionCount".to_string(),
-            bit_position: 8,
-        };
-        let layer_snap = sort_store.read(&layer_key).unwrap();
-        assert!(layer_snap.is_some(), "sort layer bit8 should exist");
+        // At least bit 8 should be set for slot 1. Flush appends sort ops to
+        // the PACKED per-field shard — the file `load_sort_layers` reads at
+        // boot (fix 2026-07-10: legacy per-layer appends were dead writes).
+        let layers = sort_store
+            .load_sort_layers("reactionCount", 32)
+            .unwrap()
+            .expect("packed sort shard should exist after insert");
         assert!(
-            layer_snap.unwrap().contains(1),
+            layers[8].contains(1),
             "sort layer bit8 should contain slot 1 for reactionCount=500",
         );
         // Insert more docs to accumulate ops, then verify compaction works
