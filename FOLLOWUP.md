@@ -199,3 +199,24 @@ per query string and dedup per-FIELD, preserving last-wins per field). Both dedu
 Backfill after deploy: stuck scheduled posts enumerable via bitmap-vs-PG (isPublished
 false + PG published, publishedAt % 60 == 0 dominant); pre-go-live pending posts self-heal
 if rescheduled, else need the same re-emit.
+
+## Dictionary save tmp-file race (found by #308 round-2 external review, 2026-07-13)
+
+`save_dictionary` (src/dictionary.rs, shipped in #294) writes to a fixed
+`<name>.dict.tmp` before atomic rename. Two concurrent savers — WAL reader's
+`persist_dirty_dictionaries()` per key-minting batch vs an HTTP
+`/api/indexes/:name/snapshot` calling `save_snapshot()` — can truncate/interleave the
+same tmp file and rename corrupted JSON over the live dict → next boot fails to parse.
+Low likelihood (needs same-instant saves of the same dict) but boot-fatal. Fix: unique
+tmp name per invocation (NamedTempFile) or a per-dict save mutex. Out of #308 scope.
+
+## Pre-fix legacy sort-op tails remain shadowed on upgrade (#308 round-2 review finding)
+
+#308 stops NEW dead writes but does not migrate pre-fix legacy per-layer ops tails that
+were appended while a valid packed shard existed — those stay invisible to boot forever.
+DELIBERATE: handled operationally for the one affected deployment (pre-roll POST
+/snapshot persists correct in-memory state; wave-2 heal covers the ~29k historical
+victims). Code-level boot reconciliation was rejected as riskier — legacy tail ops'
+ordering relative to the packed snapshot lineage is unknowable, and replaying stale
+legacy ops over a newer packed snapshot could corrupt. If another deployment ever
+upgrades across this boundary, it must do the same snapshot-before-roll step.

@@ -1479,10 +1479,15 @@ impl SortBitmapStore {
         if !shard_path.exists() {
             return Ok(false);
         }
-        // Cheap header peek outside the lock; re-checked under it.
+        // Cheap header peek outside the lock; re-checked under it. Reads
+        // ONLY the 28-byte header — the packed shard itself can be hundreds
+        // of MB and this runs per sort field per merge dirty cycle.
         let ops_count = {
-            let data = std::fs::read(&shard_path)?;
-            crate::shard_store::ShardHeader::decode(&data)?.ops_count as u64
+            use std::io::Read;
+            let mut header_buf = [0u8; crate::shard_store::HEADER_SIZE];
+            let mut f = std::fs::File::open(&shard_path)?;
+            f.read_exact(&mut header_buf)?;
+            crate::shard_store::ShardHeader::decode(&header_buf)?.ops_count as u64
         };
         if ops_count < threshold {
             return Ok(false);
@@ -1500,6 +1505,18 @@ impl SortBitmapStore {
         }
         let snap_start = crate::shard_store::HEADER_SIZE;
         let snap_end = snap_start + header.snapshot_len as usize;
+        // A truncated file (crash mid-append, disk corruption) must abort
+        // this field's compaction with an error, not panic the merge thread
+        // on an out-of-bounds slice.
+        if data.len() < snap_end || (data.len() as u64) < header.ops_section_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "packed sort shard '{}' truncated: {} bytes, header claims snapshot end {} / ops offset {}",
+                    field, data.len(), snap_end, header.ops_section_offset
+                ),
+            ));
+        }
         let mut snap = if header.snapshot_len > 0 {
             SortFieldSnapshotCodec::decode(&data[snap_start..snap_end])?
         } else {
