@@ -230,3 +230,16 @@ The skill's `get`/`list`/API-verify in `shadow on|off` all 500. GitOps path (fli
 push) still works; `shadow off` exits 6 after pushing successfully. Fix: add the header to
 apiRequest() in flipt.mjs. Also: local flipt-state clone was 74 commits stale with an
 uncommitted duplicate of a remote change — sync + verify direction before patching.
+
+## Boot-replay-window isPublished shadow-false class (2026-07-13 nuke, characterized)
+
+Images INSERTed (via trigger op) during a pod's boot-replay window — between its dump
+CSV snapshot and its ops-poller start — land with doc.isPublished=true (trigger subquery
+inherits Post.publishedAt, #291) but the isPublished FILTER BITMAP false. Fresh-insert
+op replay does not derive the exists_boolean shadow the way deferred-activation replay
+does (#297). Observed: bitdex-0 30 posts / bitdex-1 6 posts (~142 images) after the
+full nuke; steady-state inserts unaffected (510/540 clean in the same wall-clock window).
+MITIGATED by design: the #291 overdue-deferred sweep (10-min cadence, 200/batch) heals
+shadow-false candidates — observed healing live ("healed 69 of 200"). Code fix wanted:
+derive isPublished shadow on the fresh-insert op path, same as deferred replay. Verify
+with: per-post `postId Eq` vs `postId Eq AND isPublished Eq true` deficit probe.
