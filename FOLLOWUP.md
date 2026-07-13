@@ -220,3 +220,13 @@ victims). Code-level boot reconciliation was rejected as riskier — legacy tail
 ordering relative to the packed snapshot lineage is unknowable, and replaying stale
 legacy ops over a newer packed snapshot could corrupt. If another deployment ever
 upgrades across this boundary, it must do the same snapshot-before-roll step.
+
+## Flipt skill API path broken — server moved to v2 environments (2026-07-13)
+
+flipt.civitai.com now requires environment scoping: `/api/v1/*` returns
+`failed to get environment "" from context` unless the request carries
+`X-Flipt-Environment: civitai-app` (or uses `/api/v2/environments/civitai-app/...`).
+The skill's `get`/`list`/API-verify in `shadow on|off` all 500. GitOps path (flipt-state
+push) still works; `shadow off` exits 6 after pushing successfully. Fix: add the header to
+apiRequest() in flipt.mjs. Also: local flipt-state clone was 74 commits stale with an
+uncommitted duplicate of a remote change — sync + verify direction before patching.

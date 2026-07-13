@@ -174,11 +174,11 @@ The `reload.mjs nuke-pg` step automates both passes and reports the final count.
 ```bash
 node .claude/skills/deploy/cli.mjs nuke-pg
 # or run the SQL files directly:
-kubectl --context civit-datapacket exec -i -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -i -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai < .claude/skills/deploy/sql/nuke-pg-state.sql
 ```
 
-The writer pod name (`cnpg-cluster-nvme0-3` at time of writing) can shift across CNPG failovers. Verify before running:
+The writer pod name (`cnpg-cluster-nvme0-5` at time of writing) can shift across CNPG failovers. Verify before running:
 ```bash
 kubectl --context civit-datapacket get pod -n cnpg-database -l role=primary
 ```
@@ -281,7 +281,7 @@ If a phase fails partway, the sidecar retries on next pod restart but does NOT a
 
 If the retry pass leaves >4 triggers, manual escalation:
 ```bash
-kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai -c "
     SELECT pg_blocking_pids(pid), pid, query, state
     FROM pg_stat_activity
@@ -293,7 +293,7 @@ This shows which civitai app queries are blocking the drop. Either wait for them
 
 If the seeded cursor is too low, the ops poller reprocesses old ops harmlessly (LIFO dedup). If too high, ops are lost. To force a re-seed at a specific value:
 ```bash
-kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai -c "
     UPDATE bitdex_cursors SET last_outbox_id = <value>, updated_at = now()
     WHERE replica_id = 'pg-sync-bitdex-0';"

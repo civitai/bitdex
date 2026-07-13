@@ -218,7 +218,7 @@ node .claude/skills/deploy/cli.mjs scale <replicas>
 - **Node:** talos-wjh-tgy (verify before assuming — pod migrates with PVC re-binds; check via `kubectl get pv $(kubectl -n bitdex get pvc data-bitdex-0 -o jsonpath='{.spec.volumeName}') -o jsonpath='{.spec.nodeAffinity}'`)
 - **GHCR:** ghcr.io/civitai/bitdex
 - **K8s Context:** civit-datapacket
-- **PG primary writer:** verify via `kubectl get pod -n cnpg-database -l role=primary` (currently `cnpg-cluster-nvme0-3`; CNPG failovers shift this)
+- **PG primary writer:** verify via `kubectl get pod -n cnpg-database -l role=primary` (currently `cnpg-cluster-nvme0-5`; CNPG failovers shift this)
 - **Sync config:** config/sync-civitai.yaml (source of truth for dump queries + trigger configs)
 
 ## Hard nuke / reload (sync-v2 flow)
