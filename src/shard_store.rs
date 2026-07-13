@@ -240,7 +240,7 @@ impl ShardHeader {
 // ---------------------------------------------------------------------------
 
 /// Write a single op entry to a buffer: [u32 payload_len][payload bytes][u32 crc32]
-fn write_op_entry<O: OpCodec>(op: &O::Op, buf: &mut Vec<u8>) {
+pub(crate) fn write_op_entry<O: OpCodec>(op: &O::Op, buf: &mut Vec<u8>) {
     let mut payload = Vec::new();
     O::encode_op(op, &mut payload);
 
@@ -449,7 +449,7 @@ fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32)
 /// guaranteed by an upstream layer (WAL + cursor-gated persistence) — writes
 /// still land in OS page cache and get flushed later, but we skip the per-op
 /// journal round-trip that serializes on NTFS.
-fn append_ops_to_shard_opts(
+pub(crate) fn append_ops_to_shard_opts(
     path: &Path,
     new_ops_bytes: &[u8],
     additional_count: u32,
