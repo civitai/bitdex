@@ -232,3 +232,10 @@ pods verified 0/44 after. NOTE: the overdue-deferred sweep did NOT reach these i
 consistent with the known sweep page-cap issue (same 200-candidate head each cycle);
 bump its priority. Cosmetic: nudged docs can retain publishedAt−1 while bitmaps/sortAt
 are exact (doc-cache race on batch-2 write); self-corrects on next organic op.
+
+UPDATE 2026-07-14: sweep page-cap FIXED — the sweep now pages through the candidate
+space via keyset cursor (max_page_size per query, up to sweep_limit checked per cycle)
+and carries a rotation cursor across cycles; full coverage bounded at
+ceil(population / sweep_limit) cycles, "full candidate pass complete" log marks wraps.
+Regression tests: test_overdue_deferred_sweep_paginates_past_page_cap,
+test_overdue_deferred_sweep_cursor_rotates_across_cycles.
