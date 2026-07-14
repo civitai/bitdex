@@ -1750,15 +1750,19 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
                 direction: crate::query::SortDirection::Desc,
             }),
             limit: page_size,
-            cursor: cursor.take(),
+            cursor: cursor.clone(),
             offset: None,
             skip_cache: true,
         };
         let result = match engine.execute_query(&query) {
             Ok(result) => result,
             Err(e) => {
+                // Return the last-good cursor, not None: a deterministic
+                // error at page N must not reset the rotation to the top
+                // every cycle (that would starve the tail forever — the
+                // exact failure mode this fn exists to prevent).
                 tracing::warn!("overdue-deferred sweep: query failed: {e}");
-                return (checked, healed, None);
+                return (checked, healed, cursor);
             }
         };
         let page_len = result.ids.len();
@@ -4145,6 +4149,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
+        // The forged writes bypass DocCache and the flush thread's
+        // write-through can repopulate stale entries; evict AFTER the flush
+        // thread has settled so the sweep's get_document reads the disk state.
+        engine.evict_doc_cache(stuck);
+        engine.evict_doc_cache(future);
 
         let mut rec = RecordingSink::new();
         let mut dw2 = DocWriter::new(engine.docstore_arc());
@@ -4222,6 +4231,10 @@ mod tests {
         }
         assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
         assert!(engine.is_slot_alive(last_decoy), "test rig: decoys must be alive");
+        // The forged write bypasses DocCache and the flush thread's
+        // write-through can repopulate a stale entry; evict AFTER the flush
+        // thread has settled so the sweep's get_document reads the disk state.
+        engine.evict_doc_cache(stuck);
         (engine, meta, stuck)
     }
 

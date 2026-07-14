@@ -835,12 +835,19 @@ impl DocStoreV3 {
     /// Open an in-memory DocStoreV3 (for testing).
     pub fn open_temp() -> io::Result<Self> {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Uniqueness needs more than pid+timestamp: SystemTime granularity is
+        // coarse enough (esp. on Windows) that two stores opened concurrently
+        // in one process can land on the same nanos and silently SHARE a
+        // directory — concurrent shard writes then corrupt each other
+        // ("invalid shard magic bytes" flakes in parallel tests).
+        static OPEN_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = OPEN_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let tmp_dir = std::env::temp_dir()
-            .join(format!("bitdex-docstore-v3-{}-{}", std::process::id(), ts));
+            .join(format!("bitdex-docstore-v3-{}-{}-{}", std::process::id(), ts, seq));
         std::fs::create_dir_all(tmp_dir.join("meta"))?;
         let store = DocShardStore::new(tmp_dir.clone(), SlotHexShard)?;
         store.set_compact_threshold(DEFAULT_DOC_COMPACT_THRESHOLD);
