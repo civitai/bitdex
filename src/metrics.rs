@@ -1206,8 +1206,11 @@ impl Metrics {
         // fan-out is overwhelmingly single-digit (observed mean ~1.9, median <1) and
         // this histogram exists to pick a BITDEX_QUERY_OP_SET_MAX_FANOUT cap — a
         // decision that needs resolution at the low end, where the mass actually is.
+        // No 0 bound: zero-match fan-outs are already counted exactly by
+        // `bitdex_query_op_set_zero_match_total`, and a 0 lower bound makes bucket
+        // ratios degenerate for anything that inspects the ladder.
         let query_op_set_fanout_buckets = vec![
-            0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 1_000.0, 10_000.0, 100_000.0,
+            1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 1_000.0, 10_000.0, 100_000.0,
             1_000_000.0, 10_000_000.0, 100_000_000.0,
         ];
         let query_op_set_fanout_size = HistogramVec::new(
@@ -1707,11 +1710,17 @@ mod bucket_resolution_tests {
     /// measurement or an interpolation: `histogram_quantile` interpolates linearly
     /// inside whichever bucket the rank lands in, so a 5x-wide bucket yields a
     /// reported value that can sit anywhere across a 5x span.
+    ///
+    /// Buckets are half-open `(a, b]`, so a pair is only in scope when it can
+    /// actually contain a rank in [lo, hi]: `b < lo` puts the pair entirely below the
+    /// zone, and `a >= hi` puts it entirely above (a quantile at exactly `hi` lands in
+    /// the bucket *ending* at `hi`, never the one starting there). Pairs with a
+    /// non-positive lower bound have no meaningful ratio and are skipped.
     fn max_adjacent_ratio(bounds: &[f64], lo: f64, hi: f64) -> (f64, f64, f64) {
         let mut worst = (1.0, 0.0, 0.0);
         for w in bounds.windows(2) {
             let (a, b) = (w[0], w[1]);
-            if b < lo || a > hi {
+            if b < lo || a >= hi || a <= 0.0 {
                 continue;
             }
             let ratio = b / a;
@@ -1746,6 +1755,7 @@ mod bucket_resolution_tests {
         m.sync_cycle_duration_seconds.with_label_values(&["t"]).observe(0.02);
         m.http_response_seconds.with_label_values(&["GET", "/t"]).observe(0.01);
         m.time_bucket_reconcile_apply_seconds.with_label_values(&["t"]).observe(0.005);
+        m.lazy_load_duration_seconds.with_label_values(&["t", "f"]).observe(0.002);
 
         // (metric, zone_lo, zone_hi, max_ratio) — zone = observed prod p50..p99 span.
         let cases: &[(&str, f64, f64, f64)] = &[
@@ -1761,6 +1771,10 @@ mod bucket_resolution_tests {
             ("bitdex_sync_cycle_duration_seconds", 0.001, 0.5, 2.5),
             ("bitdex_http_response_seconds", 0.001, 0.5, 2.5),
             ("bitdex_time_bucket_reconcile_apply_seconds", 0.001, 0.01, 2.5),
+            // Zone stops at 10s: beyond it the ladder deliberately coarsens to a single
+            // 10->30s step, which is the "cold first-touch load at 105M" outlier region.
+            // Nothing actionable lives between 10s and 30s, so resolution there is waste.
+            ("bitdex_lazy_load_duration_seconds", 0.0001, 10.0, 2.5),
         ];
 
         for &(name, lo, hi, max_ratio) in cases {
