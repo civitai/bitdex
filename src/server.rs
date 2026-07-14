@@ -1624,6 +1624,25 @@ impl BitdexServer {
                                         }
                                     }
                                 }
+                                // Post-activation verify pass (deferred
+                                // activation-miss backstop): confirm recently-
+                                // activated slots are indexed under their own
+                                // postId, re-driving orphans. Bounded per batch,
+                                // runs every batch (drains the ring incrementally).
+                                // Metrics are bumped inside the verifier.
+                                if !engine.is_loading_mode() {
+                                    let batch_limit =
+                                        engine.config().activation_verify.batch_limit;
+                                    let (checked, redriven) =
+                                        crate::ops_processor::verify_recent_activations(
+                                            &engine, batch_limit,
+                                        );
+                                    if redriven > 0 {
+                                        eprintln!(
+                                            "post-activation verify: re-drove {redriven} orphaned slot(s) of {checked} checked"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1956,6 +1975,8 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
             deferred_fanout_scanned_total: state.metrics.deferred_fanout_scanned_total.clone(),
             deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
+            activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
+            activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
             wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
             bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
             query_total: state.metrics.query_total.clone(),
@@ -2321,6 +2342,8 @@ async fn handle_create_index(
         query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
         deferred_fanout_scanned_total: state.metrics.deferred_fanout_scanned_total.clone(),
         deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
+        activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
+        activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
         wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
         bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
         query_total: state.metrics.query_total.clone(),

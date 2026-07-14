@@ -60,6 +60,9 @@ pub struct MetricsBridge {
     /// Deferred slots rescheduled/activated by the deferred-reach pass — the
     /// target counter for the reschedule-drop fix. Label: index.
     pub deferred_fanout_reached_total: prometheus::IntCounterVec,
+    /// Post-activation verifier: slots examined / re-driven. Label: index.
+    pub activation_verify_checked_total: prometheus::IntCounterVec,
+    pub activation_verify_redriven_total: prometheus::IntCounterVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.
@@ -419,6 +422,16 @@ pub struct ConcurrentEngine {
     /// Bridges the submit→publish visibility window for `is_slot_deferred`
     /// (see `MutationSender::deferred_pending`).
     deferred_pending: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    /// Recently-activated slots awaiting a post-activation verify pass. The
+    /// flush thread pushes slots it replayed from their stored doc; the WAL
+    /// reader drains and re-checks each is actually indexed under its own
+    /// postId (re-driving from the doc on a miss). Backstops any residual
+    /// activation-replay drop the re-defer-on-read-miss fix doesn't cover.
+    /// In-memory only (bounded ring): a crash within one verify interval of an
+    /// activation can leave an unverified orphan — bounded and rare, further
+    /// bounded by the overdue sweep; the read-miss re-defer removes the known
+    /// cause. See `push_activation_verify` / `drain_activation_verify`.
+    activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1118,6 +1131,11 @@ impl ConcurrentEngine {
         let deferred_seq = coalescer.deferred_seq_handle();
         let deferred_durable_seq = Arc::new(AtomicU64::new(0));
         let deferred_pending = coalescer.deferred_pending_handle();
+        // Post-activation verify ring (see field docs). Flush thread pushes,
+        // WAL reader drains.
+        let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let flush_activation_verify = Arc::clone(&activation_verify);
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
             ms.load_all_cursors().unwrap_or_default()
@@ -1319,6 +1337,7 @@ impl ConcurrentEngine {
             deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
             deferred_pending: Arc::clone(&deferred_pending),
+            activation_verify: Arc::clone(&activation_verify),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1607,6 +1626,23 @@ impl ConcurrentEngine {
                             #[cfg(feature = "pg-sync")]
                             let mut shadow_writes: Vec<(u32, Vec<(String, bool)>)> =
                                 Vec::new();
+                            // Slots whose stored doc could not be read at
+                            // activation. `activate_due` already set their alive
+                            // bit and removed them from the deferred map. Pushing
+                            // AliveInsert-only (the pre-fix behavior) stranded
+                            // them ALIVE with ZERO bitmaps — invisible to every
+                            // filtered query and to the isPublished=false overdue
+                            // sweep — permanently (the deferred activation-miss
+                            // orphan). A doc-read miss is almost always transient
+                            // (docstore read pressure / compaction race), so undo
+                            // the activation and re-defer for a short retry
+                            // instead of activating blind. Collected here and
+                            // applied after `drop(ds)` to keep the docstore guard
+                            // window minimal.
+                            let mut redefer_on_read_miss: Vec<u32> = Vec::new();
+                            // iii: per-activation outcome tally for diagnosability.
+                            let mut act_ok = 0u64;
+                            let mut act_read_miss = 0u64;
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1635,23 +1671,78 @@ impl ConcurrentEngine {
                                             false,
                                             &flush_field_registry,
                                         );
+                                        // iii: op count is the direct signal for a
+                                        // "replayed but produced nothing" activation.
+                                        if ops.len() <= 1 {
+                                            tracing::warn!(
+                                                target: "activation",
+                                                "slot {slot} activation replay produced {} ops (doc has {} fields)",
+                                                ops.len(), doc.fields.len(),
+                                            );
+                                        }
                                         coalescer.push_ops(ops);
+                                        act_ok += 1;
                                     }
                                     Ok(None) => {
-                                        eprintln!("Warning: deferred slot {} has no stored doc, setting alive only", slot);
-                                        coalescer.push_ops(vec![
-                                            MutationOp::AliveInsert { slots: vec![slot] },
-                                        ]);
+                                        tracing::warn!(
+                                            target: "activation",
+                                            "slot {slot} has no stored doc at activation — re-deferring for retry (not activating blind)"
+                                        );
+                                        redefer_on_read_miss.push(slot);
+                                        act_read_miss += 1;
                                     }
                                     Err(e) => {
-                                        eprintln!("Warning: failed to read deferred slot {}: {e}, setting alive only", slot);
-                                        coalescer.push_ops(vec![
-                                            MutationOp::AliveInsert { slots: vec![slot] },
-                                        ]);
+                                        tracing::warn!(
+                                            target: "activation",
+                                            "slot {slot} stored-doc read failed at activation ({e}) — re-deferring for retry"
+                                        );
+                                        redefer_on_read_miss.push(slot);
+                                        act_read_miss += 1;
                                     }
                                 }
                             }
                             drop(ds);
+                            // Undo the blind activation for read-miss slots and
+                            // re-defer them: clear the alive bit `activate_due`
+                            // set (via the coalescer, applied this cycle) and
+                            // re-schedule at now + retry so the next cycle re-reads
+                            // the doc. Idempotent — a later successful read replays
+                            // the full doc via the branch above. The re-defer is
+                            // persisted this cycle (deferred_persist_needed below).
+                            if !redefer_on_read_miss.is_empty() {
+                                let retry_secs = flush_config.activation_verify.retry_secs;
+                                for &slot in &redefer_on_read_miss {
+                                    coalescer.push_ops(vec![
+                                        MutationOp::AliveRemove { slots: vec![slot] },
+                                    ]);
+                                    staging.slots.schedule_alive(slot, now_unix + retry_secs);
+                                }
+                            }
+                            if act_read_miss > 0 {
+                                tracing::warn!(
+                                    target: "activation",
+                                    "activation cycle: {act_ok} replayed, {act_read_miss} re-deferred on read miss"
+                                );
+                            }
+                            // Queue the slots we replayed for a post-activation
+                            // verify pass (the WAL reader confirms each is really
+                            // indexed under its own postId, re-driving on a miss).
+                            // Read-miss slots were re-deferred, not activated — so
+                            // exclude them. Bounded ring: drop oldest when over cap
+                            // (the overdue sweep + doc/bitmap fixes bound the
+                            // orphan population if a burst overflows).
+                            {
+                                let cap = flush_config.activation_verify.ring_cap;
+                                let mut q = flush_activation_verify.lock();
+                                for &slot in &activated {
+                                    if !redefer_on_read_miss.contains(&slot) {
+                                        q.push_back(slot);
+                                    }
+                                }
+                                while q.len() > cap {
+                                    q.pop_front();
+                                }
+                            }
                             // All docstore interaction (DocWriter construction,
                             // field resolution incl. its lazy ensure_field_index
                             // write lock, batch append) happens HERE, with no
@@ -4877,6 +4968,7 @@ impl ConcurrentEngine {
             deferred_sweep_interval: Arc::clone(&deferred_sweep_interval),
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
             deferred_pending: Arc::clone(&deferred_pending),
+            activation_verify: Arc::clone(&activation_verify),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -8550,6 +8642,34 @@ impl ConcurrentEngine {
         out.sort_unstable();
         out.dedup();
         out
+    }
+    /// Drain up to `limit` recently-activated slots awaiting post-activation
+    /// verification (see the `activation_verify` field). FIFO — the WAL reader
+    /// calls this between batches to re-check each slot is indexed under its
+    /// own postId.
+    pub fn drain_activation_verify(&self, limit: usize) -> Vec<u32> {
+        let mut q = self.activation_verify.lock();
+        let n = limit.min(q.len());
+        q.drain(..n).collect()
+    }
+    /// Re-queue slots for a later verify pass (e.g. the doc wasn't readable
+    /// this pass). Appended to the back so the ring keeps rotating.
+    pub fn requeue_activation_verify(&self, slots: &[u32]) {
+        if slots.is_empty() {
+            return;
+        }
+        let mut q = self.activation_verify.lock();
+        q.extend(slots.iter().copied());
+    }
+    /// Number of slots pending post-activation verification.
+    pub fn activation_verify_len(&self) -> usize {
+        self.activation_verify.lock().len()
+    }
+    /// Test-only: enqueue slots for verification directly.
+    #[cfg(test)]
+    pub fn push_activation_verify_for_test(&self, slots: &[u32]) {
+        let mut q = self.activation_verify.lock();
+        q.extend(slots.iter().copied());
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
