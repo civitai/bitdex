@@ -1837,6 +1837,126 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
     }
     (checked, healed, cursor)
 }
+
+/// Post-activation verifier (deferred activation-miss backstop, 2026-07-14).
+///
+/// Drains recently-activated slots (queued by the flush thread after replay)
+/// and confirms each is actually indexed under its own `postId` — the exact
+/// orphan signature: a slot that `activate_due` fired but whose `postId` filter
+/// insert was dropped, leaving it ALIVE yet absent from every postId-scoped
+/// feed and invisible to the `isPublished=false` overdue sweep. On a miss it
+/// re-drives the full stored doc via `diff_document(None, doc)` — the same
+/// replay activation performs — sent through the mutation channel. Idempotent:
+/// full-overwrite sort layers, idempotent filter inserts, so re-driving a
+/// healthy slot (or one that a concurrent organic op already fixed) is a no-op.
+///
+/// Runs on the WAL reader between batches (query + doc reads stay off the flush
+/// thread). Returns `(checked, redriven)`.
+pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (usize, usize) {
+    // `postId` is the feed-grouping filter field whose insert an activation
+    // drop loses. A deployment without it has nothing to verify here.
+    const VERIFY_FIELD: &str = "postId";
+    if !engine
+        .config()
+        .filter_fields
+        .iter()
+        .any(|f| f.name == VERIFY_FIELD)
+    {
+        return (0, 0);
+    }
+    let slots = engine.drain_activation_verify(limit);
+    if slots.is_empty() {
+        return (0, 0);
+    }
+    let registry = FieldRegistry::from_config(engine.config());
+    let mut checked = 0usize;
+    let mut redriven = 0usize;
+    let mut requeue: Vec<u32> = Vec::new();
+    for slot in slots {
+        let doc = match engine.get_document(slot) {
+            Ok(Some(d)) => d,
+            Ok(None) => continue,             // deleted/absent — nothing to verify
+            Err(_) => {
+                requeue.push(slot); // transient read failure — re-check next pass
+                continue;
+            }
+        };
+        // Only alive slots are activations we care about; a re-deferred or
+        // deleted slot is not an orphan.
+        if !engine.is_slot_alive(slot) {
+            continue;
+        }
+        let pid = match doc.fields.get(VERIFY_FIELD) {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(p))) => *p,
+            _ => continue, // no postId value — can't verify membership
+        };
+        checked += 1;
+        let query = BitdexQuery {
+            filters: vec![FilterClause::Eq(
+                VERIFY_FIELD.to_string(),
+                crate::query::Value::Integer(pid),
+            )],
+            sort: None,
+            limit: usize::MAX,
+            offset: None,
+            cursor: None,
+            skip_cache: true,
+        };
+        let indexed = match engine.execute_query(&query) {
+            Ok(r) => r.ids.iter().any(|&id| id == slot as i64),
+            Err(_) => {
+                requeue.push(slot); // transient query failure — re-check next pass
+                continue;
+            }
+        };
+        if indexed {
+            continue; // healthy — the slot is in its postId bitmap
+        }
+        // Orphan: re-drive the full doc via the activation replay path. Sent
+        // through the mutation channel (the flush thread is the sole ArcSwap
+        // writer — never mutate staging directly here).
+        let document = crate::mutation::Document {
+            fields: doc.fields.clone(),
+        };
+        let ops = crate::mutation::diff_document(
+            slot,
+            None,
+            &document,
+            engine.config(),
+            false,
+            &registry,
+        );
+        for op in ops {
+            let _ = engine.mutation_sender().send(op);
+        }
+        engine.evict_doc_cache(slot);
+        tracing::warn!(
+            target: "activation",
+            "verify: slot {slot} activated but ABSENT from postId {pid} — re-drove from stored doc"
+        );
+        redriven += 1;
+    }
+    if !requeue.is_empty() {
+        engine.requeue_activation_verify(&requeue);
+    }
+    #[cfg(feature = "server")]
+    if let Some(bridge) = engine.metrics_bridge_handle() {
+        if checked > 0 {
+            bridge
+                .activation_verify_checked_total
+                .with_label_values(&[&bridge.index_name])
+                .inc_by(checked as u64);
+        }
+        if redriven > 0 {
+            bridge
+                .activation_verify_redriven_total
+                .with_label_values(&[&bridge.index_name])
+                .inc_by(redriven as u64);
+        }
+    }
+    (checked, redriven)
+}
+
 /// Field-name label for the zero-match fan-out counter. Low-cardinality by
 /// construction: the field NAME of the clause (never the value), recursing
 /// into the first leaf of compound clauses.
@@ -4804,6 +4924,109 @@ mod tests {
             engine.is_slot_deferred(test_slot),
             "a doc-read miss must re-defer the slot for retry"
         );
+    }
+
+    /// Post-activation verifier (deferred activation-miss backstop): an ALIVE
+    /// slot whose stored doc carries a postId but whose postId FILTER bitmap was
+    /// never set (the orphan signature — activated but the postId insert dropped)
+    /// must be detected and re-driven from its doc so it becomes queryable under
+    /// its postId. Healthy slots (already indexed) are checked but not re-driven.
+    #[test]
+    fn test_verify_recent_activations_redrives_postid_orphan() {
+        let mut config = safety_net_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let post_id: i64 = 4242;
+        let orphan: u32 = 70;
+        let healthy: u32 = 71;
+
+        let postid_ids = |engine: &ConcurrentEngine| -> Vec<i64> {
+            let q = crate::query::BitdexQuery {
+                filters: vec![crate::query::FilterClause::Eq(
+                    "postId".into(),
+                    crate::query::Value::Integer(post_id),
+                )],
+                sort: None,
+                limit: 1000,
+                offset: None,
+                cursor: None,
+                skip_cache: true,
+            };
+            engine.execute_query(&q).map(|r| r.ids).unwrap_or_default()
+        };
+
+        // Healthy slot: a normal insert — postId set in BOTH bitmap and doc.
+        {
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: healthy as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "postId".into(), value: json!(post_id) },
+                    Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                    Op::Set { field: "publishedAt".into(), value: json!(now - 10) },
+                ],
+            }];
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.flush();
+        }
+        wait_for_alive_slot(&engine, healthy, 5_000);
+
+        // Orphan slot: alive with existedAt+publishedAt but NO postId bitmap;
+        // postId written to the DOC only — the activation-miss orphan state.
+        {
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: orphan as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                    Op::Set { field: "publishedAt".into(), value: json!(now - 10) },
+                ],
+            }];
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.write_set(orphan, "postId", &json!(post_id));
+            dw.flush();
+        }
+        wait_for_alive_slot(&engine, orphan, 5_000);
+
+        // Setup precondition: only the healthy slot is in postId; orphan is not.
+        let before = postid_ids(&engine);
+        assert!(before.contains(&(healthy as i64)), "healthy must be in postId, got {before:?}");
+        assert!(!before.contains(&(orphan as i64)), "orphan must NOT be in postId yet, got {before:?}");
+
+        // Queue both and run the verifier.
+        engine.push_activation_verify_for_test(&[orphan, healthy]);
+        let (checked, redriven) = verify_recent_activations(&engine, 100);
+        assert_eq!(checked, 2, "both slots have a postId doc value → both checked");
+        assert_eq!(redriven, 1, "only the orphan (absent from postId) is re-driven");
+
+        // The re-drive was sent through the mutation channel; wait for apply.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if postid_ids(&engine).contains(&(orphan as i64)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "orphan never re-indexed under postId after verify re-drive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow

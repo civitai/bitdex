@@ -282,6 +282,14 @@ pub struct Metrics {
     /// early; a flat line while `query_op_set_zero_match_total{field="postId"}`
     /// climbs means the reach isn't firing.
     pub deferred_fanout_reached_total: IntCounterVec,
+    /// Recently-activated slots examined by the post-activation verifier
+    /// (deferred activation-miss backstop). Label: index.
+    pub activation_verify_checked_total: IntCounterVec,
+    /// Activated slots found ABSENT from their own postId bitmap and re-driven
+    /// by the verifier — the target counter for the activation-miss orphan.
+    /// Should be ~0 in steady state; a nonzero rate means orphans are being
+    /// produced (investigate the activation replay). Label: index.
+    pub activation_verify_redriven_total: IntCounterVec,
 
     // -- 11c CPU floor attribution (2026-04-30) --
     /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
@@ -1275,6 +1283,22 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let activation_verify_checked_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_activation_verify_checked_total",
+                "Recently-activated slots examined by the post-activation verifier",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let activation_verify_redriven_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_activation_verify_redriven_total",
+                "Activated slots absent from their own postId and re-driven by the verifier (activation-miss orphan target counter)",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         // 11c CPU floor attribution (2026-04-30): WAL apply per-batch + mem-scanner tick.
         // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
@@ -1524,6 +1548,8 @@ impl Metrics {
         registry.register(Box::new(query_op_set_zero_match_total.clone())).unwrap();
         registry.register(Box::new(deferred_fanout_scanned_total.clone())).unwrap();
         registry.register(Box::new(deferred_fanout_reached_total.clone())).unwrap();
+        registry.register(Box::new(activation_verify_checked_total.clone())).unwrap();
+        registry.register(Box::new(activation_verify_redriven_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
@@ -1677,6 +1703,8 @@ impl Metrics {
             query_op_set_zero_match_total,
             deferred_fanout_scanned_total,
             deferred_fanout_reached_total,
+            activation_verify_checked_total,
+            activation_verify_redriven_total,
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,
