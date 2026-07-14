@@ -269,6 +269,19 @@ pub struct Metrics {
     /// Labeled by the field name of the fan-out's filter so postId-shaped
     /// misses stand out from legitimately-sparse fields.
     pub query_op_set_zero_match_total: IntCounterVec,
+    /// Deferred slots examined by a publish-shaped queryOpSet fan-out's
+    /// deferred-reach pass (the reschedule-drop fix, 2026-07-14). Deferred
+    /// slots carry no bitmap bits, so a fan-out's bitmap query can't see them;
+    /// this pass scans the deferred-alive map and doc-matches each candidate.
+    /// Cost signal: increments by the deferred-map size per publish fan-out.
+    /// Alert if this climbs steeply (deferred backlog + high publish rate).
+    pub deferred_fanout_scanned_total: IntCounterVec,
+    /// Deferred slots actually reached (rescheduled or activated) by the
+    /// deferred-reach pass — the target counter for the reschedule-drop fix.
+    /// Post-deploy this must be non-zero when scheduled posts are published
+    /// early; a flat line while `query_op_set_zero_match_total{field="postId"}`
+    /// climbs means the reach isn't firing.
+    pub deferred_fanout_reached_total: IntCounterVec,
 
     // -- 11c CPU floor attribution (2026-04-30) --
     /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
@@ -1197,6 +1210,22 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let deferred_fanout_scanned_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_deferred_fanout_scanned_total",
+                "Deferred slots examined by a publish-shaped fan-out's deferred-reach pass (cost signal)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let deferred_fanout_reached_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_deferred_fanout_reached_total",
+                "Deferred slots rescheduled/activated by the deferred-reach pass (reschedule-drop fix target counter)",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         // 11c CPU floor attribution (2026-04-30): WAL apply per-batch + mem-scanner tick.
         // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
@@ -1443,6 +1472,8 @@ impl Metrics {
         registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
         registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
         registry.register(Box::new(query_op_set_zero_match_total.clone())).unwrap();
+        registry.register(Box::new(deferred_fanout_scanned_total.clone())).unwrap();
+        registry.register(Box::new(deferred_fanout_reached_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
@@ -1594,6 +1625,8 @@ impl Metrics {
             query_op_set_rejected_total,
             query_op_set_applied_slots_total,
             query_op_set_zero_match_total,
+            deferred_fanout_scanned_total,
+            deferred_fanout_reached_total,
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,

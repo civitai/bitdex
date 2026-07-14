@@ -53,6 +53,13 @@ pub struct MetricsBridge {
     /// the WAL reader has done across all queryOpSets; not the same as the
     /// `applied` count returned per call.
     pub query_op_set_applied_slots_total: prometheus::IntCounterVec,
+    /// Deferred slots examined by a publish fan-out's deferred-reach pass
+    /// (reschedule-drop fix). Cost signal — increments by deferred-map size per
+    /// publish fan-out. Label: index.
+    pub deferred_fanout_scanned_total: prometheus::IntCounterVec,
+    /// Deferred slots rescheduled/activated by the deferred-reach pass — the
+    /// target counter for the reschedule-drop fix. Label: index.
+    pub deferred_fanout_reached_total: prometheus::IntCounterVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.
@@ -8522,6 +8529,27 @@ impl ConcurrentEngine {
         }
         let snap = self.snapshot();
         snap.slots.is_deferred(slot)
+    }
+    /// Every slot currently scheduled for deferred activation: the published
+    /// snapshot's deferred map plus the pending-deferred bridge set (deferrals
+    /// submitted but not yet visible in a published snapshot). Deduped.
+    ///
+    /// Linear in deferred-map size — call only on cold paths. The ops processor
+    /// consults it to reach deferred slots that a queryOpSet fan-out's bitmap
+    /// query cannot see (deferred slots have no filter bits set), and only for
+    /// publish/schedule-shaped fan-outs (a write to the deferred source field).
+    pub fn deferred_slots(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let snap = self.snapshot();
+        for slots in snap.slots.deferred_map().values() {
+            out.extend_from_slice(slots);
+        }
+        if let Ok(p) = self.deferred_pending.lock() {
+            out.extend(p.iter().copied());
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
