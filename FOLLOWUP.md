@@ -220,3 +220,15 @@ victims). Code-level boot reconciliation was rejected as riskier — legacy tail
 ordering relative to the packed snapshot lineage is unknowable, and replaying stale
 legacy ops over a newer packed snapshot could corrupt. If another deployment ever
 upgrades across this boundary, it must do the same snapshot-before-roll step.
+
+## 12h post-nuke sweep: 45 stuck publishes healed; sweep page-cap confirmed biting (2026-07-14)
+
+B1-style probe over ALL 12.5k publish-capture posts since the nuke found 45 deficient on
+bitdex-0 (0.39%): dominant class = reschedule/publish ops dropped in the OLD binary's
+boot-replay window (pre-#310; ages clustered 14-17h; specimen 29762566 = originally
+scheduled +24h, user moved it earlier, reschedule op dropped → stuck deferred with stale
+date; bitdex-1 correct). Healed via wave-2 nudge (−1/true two-batch, 254+251 ops), both
+pods verified 0/44 after. NOTE: the overdue-deferred sweep did NOT reach these in 15h —
+consistent with the known sweep page-cap issue (same 200-candidate head each cycle);
+bump its priority. Cosmetic: nudged docs can retain publishedAt−1 while bitmaps/sortAt
+are exact (doc-cache race on batch-2 write); self-corrects on next organic op.
