@@ -1607,6 +1607,23 @@ impl ConcurrentEngine {
                             #[cfg(feature = "pg-sync")]
                             let mut shadow_writes: Vec<(u32, Vec<(String, bool)>)> =
                                 Vec::new();
+                            // Slots whose stored doc could not be read at
+                            // activation. `activate_due` already set their alive
+                            // bit and removed them from the deferred map. Pushing
+                            // AliveInsert-only (the pre-fix behavior) stranded
+                            // them ALIVE with ZERO bitmaps — invisible to every
+                            // filtered query and to the isPublished=false overdue
+                            // sweep — permanently (the deferred activation-miss
+                            // orphan). A doc-read miss is almost always transient
+                            // (docstore read pressure / compaction race), so undo
+                            // the activation and re-defer for a short retry
+                            // instead of activating blind. Collected here and
+                            // applied after `drop(ds)` to keep the docstore guard
+                            // window minimal.
+                            let mut redefer_on_read_miss: Vec<u32> = Vec::new();
+                            // iii: per-activation outcome tally for diagnosability.
+                            let mut act_ok = 0u64;
+                            let mut act_read_miss = 0u64;
                             let ds = docstore.read();
                             for &slot in &activated {
                                 match ds.get(slot) {
@@ -1635,23 +1652,62 @@ impl ConcurrentEngine {
                                             false,
                                             &flush_field_registry,
                                         );
+                                        // iii: op count is the direct signal for a
+                                        // "replayed but produced nothing" activation.
+                                        if ops.len() <= 1 {
+                                            tracing::warn!(
+                                                target: "activation",
+                                                "slot {slot} activation replay produced {} ops (doc has {} fields)",
+                                                ops.len(), doc.fields.len(),
+                                            );
+                                        }
                                         coalescer.push_ops(ops);
+                                        act_ok += 1;
                                     }
                                     Ok(None) => {
-                                        eprintln!("Warning: deferred slot {} has no stored doc, setting alive only", slot);
-                                        coalescer.push_ops(vec![
-                                            MutationOp::AliveInsert { slots: vec![slot] },
-                                        ]);
+                                        tracing::warn!(
+                                            target: "activation",
+                                            "slot {slot} has no stored doc at activation — re-deferring for retry (not activating blind)"
+                                        );
+                                        redefer_on_read_miss.push(slot);
+                                        act_read_miss += 1;
                                     }
                                     Err(e) => {
-                                        eprintln!("Warning: failed to read deferred slot {}: {e}, setting alive only", slot);
-                                        coalescer.push_ops(vec![
-                                            MutationOp::AliveInsert { slots: vec![slot] },
-                                        ]);
+                                        tracing::warn!(
+                                            target: "activation",
+                                            "slot {slot} stored-doc read failed at activation ({e}) — re-deferring for retry"
+                                        );
+                                        redefer_on_read_miss.push(slot);
+                                        act_read_miss += 1;
                                     }
                                 }
                             }
                             drop(ds);
+                            // Undo the blind activation for read-miss slots and
+                            // re-defer them: clear the alive bit `activate_due`
+                            // set (via the coalescer, applied this cycle) and
+                            // re-schedule at now + retry so the next cycle re-reads
+                            // the doc. Idempotent — a later successful read replays
+                            // the full doc via the branch above. The re-defer is
+                            // persisted this cycle (deferred_persist_needed below).
+                            if !redefer_on_read_miss.is_empty() {
+                                const ACTIVATION_REPLAY_RETRY_SECS: u64 = 30;
+                                for &slot in &redefer_on_read_miss {
+                                    coalescer.push_ops(vec![
+                                        MutationOp::AliveRemove { slots: vec![slot] },
+                                    ]);
+                                    staging.slots.schedule_alive(
+                                        slot,
+                                        now_unix + ACTIVATION_REPLAY_RETRY_SECS,
+                                    );
+                                }
+                            }
+                            if act_read_miss > 0 {
+                                tracing::warn!(
+                                    target: "activation",
+                                    "activation cycle: {act_ok} replayed, {act_read_miss} re-deferred on read miss"
+                                );
+                            }
                             // All docstore interaction (DocWriter construction,
                             // field resolution incl. its lazy ensure_field_index
                             // write lock, batch append) happens HERE, with no

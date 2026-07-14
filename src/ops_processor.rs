@@ -4759,6 +4759,53 @@ mod tests {
         );
     }
 
+    /// PROD REPRO (deferred activation-miss, 2026-07-14): a deferred slot whose
+    /// stored doc can't be read at activation must be RE-DEFERRED for retry, not
+    /// activated blind. `activate_due` sets the alive bit and removes the slot
+    /// from the deferred map before the flush thread reads the doc; the pre-fix
+    /// code, on a doc-read miss, pushed AliveInsert-only — stranding the slot
+    /// ALIVE with zero bitmaps (invisible to every filtered query and to the
+    /// isPublished=false overdue sweep) permanently. The fix undoes the
+    /// activation and re-schedules for a short retry. Here we schedule a slot
+    /// deferred-due-now WITHOUT writing its doc, so the flush thread's
+    /// activation read misses; the slot must NOT go alive and must stay
+    /// deferred. Pre-fix this asserts fails: the slot is alive with no bitmaps.
+    #[test]
+    fn test_activation_read_miss_redefers_not_orphans() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let now = unit_now_secs();
+        let test_slot: u32 = 55; // NO stored doc → read miss at activation
+        let ctrl_slot: u32 = 56; // HAS a doc → activates normally (proves the cycle ran)
+
+        // Control slot's doc: publishedAt in the past so activation replays it.
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        dw.write_set(ctrl_slot, "publishedAt", &json!(now as i64 - 10));
+        dw.write_set(ctrl_slot, "existedAt", &json!(now as i64 - 100));
+        dw.flush();
+
+        // Schedule both deferred, due immediately.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        crate::ingester::BitmapSink::deferred_alive(&mut sink, test_slot, now as u64);
+        crate::ingester::BitmapSink::deferred_alive(&mut sink, ctrl_slot, now as u64);
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+
+        // The control MUST activate — this proves the flush thread ran a real
+        // activate_due cycle (so the test slot's assertions aren't vacuous).
+        wait_for_alive_slot(&engine, ctrl_slot, 5_000);
+
+        // The test slot's doc read missed: it must be re-deferred, NOT activated
+        // blind. Pre-fix it is ALIVE with zero bitmaps (the orphan); the fix
+        // undoes the activation and re-schedules it.
+        assert!(
+            !engine.is_slot_alive(test_slot),
+            "a doc-read miss must NOT activate the slot blind (would orphan it)"
+        );
+        assert!(
+            engine.is_slot_deferred(test_slot),
+            "a doc-read miss must re-defer the slot for retry"
+        );
+    }
+
     /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow
     /// stuck false and a stored past publishedAt (the lost-activation state)
     /// must be healed; genuine drafts (no stored publishedAt) and legitimately
