@@ -5097,6 +5097,105 @@ mod tests {
         );
     }
 
+    /// The post-activation verify ring must survive restart: a slot queued for
+    /// verification, persisted, then reloaded on boot must still be re-checked
+    /// and re-driven. This closes the in-memory ring's boot-gap — an orphan
+    /// created just before a crash would otherwise never be re-checked (the
+    /// overdue sweep can't see an activation orphan).
+    #[test]
+    fn test_activation_verify_ring_survives_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docstore_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+        let mut config = safety_net_config();
+        config.storage.bitmap_path = Some(bitmap_path);
+        config.merge_interval_ms = 200;
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.activation_verify.membership_field = Some("postId".into());
+
+        let post_id: i64 = 909;
+        let orphan: u32 = 88;
+        let now = unit_now_secs() as i64;
+
+        let postid_ids = |engine: &ConcurrentEngine| -> Vec<i64> {
+            let q = crate::query::BitdexQuery {
+                filters: vec![crate::query::FilterClause::Eq(
+                    "postId".into(),
+                    crate::query::Value::Integer(post_id),
+                )],
+                sort: None,
+                limit: 1000,
+                offset: None,
+                cursor: None,
+                skip_cache: true,
+            };
+            engine.execute_query(&q).map(|r| r.ids).unwrap_or_default()
+        };
+
+        // --- First engine: manufacture the orphan, queue + persist the ring ---
+        {
+            let engine = ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            let meta = FieldMeta::from_config(engine.config());
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: orphan as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                    Op::Set { field: "publishedAt".into(), value: json!(now - 10) },
+                ],
+            }];
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.write_set(orphan, "postId", &json!(post_id));
+            dw.flush();
+            wait_for_alive_slot(&engine, orphan, 5_000);
+            assert!(
+                !postid_ids(&engine).contains(&(orphan as i64)),
+                "setup: orphan must not be in postId"
+            );
+            // Queue for verification and persist the ring (what the flush thread
+            // does on an activation cycle), then let a merge persist bitmaps.
+            engine.push_activation_verify_for_test(&[orphan]);
+            engine.persist_activation_verify_for_test();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(engine);
+        }
+
+        // --- Second engine: boot re-seeds the ring; verifier re-drives ---
+        let engine2 = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        assert!(engine2.is_slot_alive(orphan), "orphan must be alive after restart");
+        assert!(
+            !postid_ids(&engine2).contains(&(orphan as i64)),
+            "orphan still not in postId after restart (bitmap was never set)"
+        );
+
+        let (checked, redriven) = verify_recent_activations(&engine2, 100);
+        assert_eq!(checked, 1, "the reloaded ring must present the orphan");
+        assert_eq!(redriven, 1, "the reloaded orphan must be re-driven");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if postid_ids(&engine2).contains(&(orphan as i64)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "orphan never re-indexed under postId after restart re-drive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow
     /// stuck false and a stored past publishedAt (the lost-activation state)
     /// must be healed; genuine drafts (no stored publishedAt) and legitimately

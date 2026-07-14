@@ -110,6 +110,55 @@ impl MetaStore {
     }
 
     // -----------------------------------------------------------------------
+    // Post-activation verify ring
+    // -----------------------------------------------------------------------
+
+    /// Persist the pending post-activation verify ring (recently-activated
+    /// slots not yet re-checked). Written alongside the deferred-alive map so a
+    /// restart re-checks slots whose activation could have silently dropped a
+    /// bitmap. FIFO order preserved. Empty → remove the file.
+    ///
+    /// Format: `[u32 count][u32 slot]*` (little-endian).
+    pub fn write_activation_verify(&self, slots: &[u32]) -> io::Result<()> {
+        let path = self.root.join("meta").join("activation_verify.bin");
+        if slots.is_empty() {
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(4 + slots.len() * 4);
+        buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+        for &slot in slots {
+            buf.extend_from_slice(&slot.to_le_bytes());
+        }
+        write_atomic(&path, &buf)
+    }
+
+    /// Load the persisted post-activation verify ring (FIFO order). Returns an
+    /// empty Vec when no file exists.
+    pub fn load_activation_verify(&self) -> io::Result<Vec<u32>> {
+        let path = self.root.join("meta").join("activation_verify.bin");
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        if data.len() < 4 {
+            return Ok(Vec::new());
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        let mut pos = 4;
+        for _ in 0..count {
+            if pos + 4 > data.len() {
+                break;
+            }
+            out.push(u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
     // Time buckets
     // -----------------------------------------------------------------------
 

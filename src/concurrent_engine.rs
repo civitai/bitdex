@@ -1132,9 +1132,23 @@ impl ConcurrentEngine {
         let deferred_durable_seq = Arc::new(AtomicU64::new(0));
         let deferred_pending = coalescer.deferred_pending_handle();
         // Post-activation verify ring (see field docs). Flush thread pushes,
-        // WAL reader drains.
+        // WAL reader drains. Seeded from MetaStore so slots activated shortly
+        // before a crash — not yet verified — are re-checked on restart
+        // (closes the in-memory ring's boot-gap; the overdue sweep can't see
+        // an activation orphan). Idempotent: re-verifying a healthy slot no-ops.
+        let seeded_verify: std::collections::VecDeque<u32> = meta_store
+            .as_ref()
+            .and_then(|ms| ms.load_activation_verify().ok())
+            .map(std::collections::VecDeque::from)
+            .unwrap_or_default();
+        if !seeded_verify.is_empty() {
+            eprintln!(
+                "Restored {} slots to the post-activation verify ring",
+                seeded_verify.len()
+            );
+        }
         let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>> =
-            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+            Arc::new(parking_lot::Mutex::new(seeded_verify));
         let flush_activation_verify = Arc::clone(&activation_verify);
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
@@ -2924,6 +2938,25 @@ impl ConcurrentEngine {
                                          (will retry next cycle; WAL cursor persistence \
                                          is held back until it succeeds): {e}"
                                     ),
+                                }
+                                // Persist the post-activation verify ring in the
+                                // same window: this block runs on every cycle
+                                // that activated slots (which is exactly when the
+                                // ring grows), so a slot pushed for verification
+                                // is durable the same cycle. On boot the ring is
+                                // re-seeded and the WAL reader re-checks them —
+                                // closing the in-memory ring's crash boot-gap.
+                                // Best-effort (not gated by the durable watermark):
+                                // the verify ring is a recovery hint, not the
+                                // authoritative deferred state, and re-verifying a
+                                // stale/healthy slot on boot is an idempotent no-op.
+                                let verify_snapshot: Vec<u32> =
+                                    flush_activation_verify.lock().iter().copied().collect();
+                                if let Err(e) = ms.write_activation_verify(&verify_snapshot) {
+                                    eprintln!(
+                                        "Warning: failed to persist activation-verify ring \
+                                         (backstop only; will retry next activation): {e}"
+                                    );
                                 }
                             } else {
                                 // No MetaStore configured (ephemeral/test engine):
@@ -8670,6 +8703,15 @@ impl ConcurrentEngine {
     pub fn push_activation_verify_for_test(&self, slots: &[u32]) {
         let mut q = self.activation_verify.lock();
         q.extend(slots.iter().copied());
+    }
+    /// Test-only: persist the current verify ring to MetaStore (what the flush
+    /// thread does on an activation cycle), so a drop+reload can be exercised.
+    #[cfg(test)]
+    pub fn persist_activation_verify_for_test(&self) {
+        if let Some(ref ms) = self.meta_store {
+            let snapshot: Vec<u32> = self.activation_verify.lock().iter().copied().collect();
+            ms.write_activation_verify(&snapshot).expect("persist verify ring");
+        }
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
