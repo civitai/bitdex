@@ -1631,9 +1631,11 @@ impl BitdexServer {
                                 // runs every batch (drains the ring incrementally).
                                 // Metrics are bumped inside the verifier.
                                 if !engine.is_loading_mode() {
+                                    let batch_limit =
+                                        engine.config().activation_verify.batch_limit;
                                     let (checked, redriven) =
                                         crate::ops_processor::verify_recent_activations(
-                                            &engine, 4096,
+                                            &engine, batch_limit,
                                         );
                                     if redriven > 0 {
                                         eprintln!(

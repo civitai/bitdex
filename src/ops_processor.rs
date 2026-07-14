@@ -1853,14 +1853,18 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
 /// Runs on the WAL reader between batches (query + doc reads stay off the flush
 /// thread). Returns `(checked, redriven)`.
 pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (usize, usize) {
-    // `postId` is the feed-grouping filter field whose insert an activation
-    // drop loses. A deployment without it has nothing to verify here.
-    const VERIFY_FIELD: &str = "postId";
+    // The membership field — the filter field the activation fan-out groups on
+    // (e.g. postId) — is config-driven; no field name is baked into the logic.
+    // Absent (or not a configured filter) → the verifier is disabled.
+    let verify_field = match engine.config().activation_verify.membership_field.clone() {
+        Some(f) if !f.is_empty() => f,
+        _ => return (0, 0),
+    };
     if !engine
         .config()
         .filter_fields
         .iter()
-        .any(|f| f.name == VERIFY_FIELD)
+        .any(|f| f.name == verify_field)
     {
         return (0, 0);
     }
@@ -1886,14 +1890,14 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
         if !engine.is_slot_alive(slot) {
             continue;
         }
-        let pid = match doc.fields.get(VERIFY_FIELD) {
+        let pid = match doc.fields.get(verify_field.as_str()) {
             Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(p))) => *p,
-            _ => continue, // no postId value — can't verify membership
+            _ => continue, // no grouping value — can't verify membership
         };
         checked += 1;
         let query = BitdexQuery {
             filters: vec![FilterClause::Eq(
-                VERIFY_FIELD.to_string(),
+                verify_field.clone(),
                 crate::query::Value::Integer(pid),
             )],
             sort: None,
@@ -1929,10 +1933,27 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
         for op in ops {
             let _ = engine.mutation_sender().send(op);
         }
+        // Doc/bitmap coherence: diff_document flips the exists_boolean shadow
+        // (e.g. isPublished) BITMAP, but the stored doc's shadow may be stale
+        // (post the dump fix, deferred-seeded docs store it false). Write the
+        // derived shadow into the doc to match the bitmap — the same coherence
+        // the normal activation replay does — or GET /documents would serve the
+        // wrong published state until a later op (the #291-era stale-doc class).
+        let derived = crate::mutation::derive_exists_boolean_shadows(
+            engine.config(),
+            &document.fields,
+        );
+        if !derived.is_empty() {
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            for (name, val) in &derived {
+                dw.write_set(slot, name, &serde_json::json!(val));
+            }
+            dw.flush();
+        }
         engine.evict_doc_cache(slot);
         tracing::warn!(
             target: "activation",
-            "verify: slot {slot} activated but ABSENT from postId {pid} — re-drove from stored doc"
+            "verify: slot {slot} activated but ABSENT from {verify_field} {pid} — re-drove from stored doc"
         );
         redriven += 1;
     }
@@ -4943,6 +4964,8 @@ mod tests {
             per_value_lazy: false,
             max_range_scan_values: None,
         });
+        // Membership field is config-driven (no baked-in "postId").
+        config.activation_verify.membership_field = Some("postId".into());
         let engine = ConcurrentEngine::new(config).unwrap();
         let meta = FieldMeta::from_config(engine.config());
         let now = unit_now_secs() as i64;
@@ -5000,9 +5023,22 @@ mod tests {
             apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
             crate::ingester::BitmapSink::flush(&mut sink).unwrap();
             dw.write_set(orphan, "postId", &json!(post_id));
+            // Simulate the stale-doc divergence: doc shadow FALSE while the
+            // (insert-set) isPublished bitmap is true — the state the Q3
+            // coherence write must repair on re-drive.
+            dw.write_set(orphan, "isPublished", &json!(false));
             dw.flush();
         }
         wait_for_alive_slot(&engine, orphan, 5_000);
+        // Precondition: the orphan's stored doc shadow is the stale false.
+        let orphan_doc_before = engine.get_document(orphan).unwrap().unwrap();
+        assert!(
+            matches!(
+                orphan_doc_before.fields.get("isPublished"),
+                Some(crate::mutation::FieldValue::Single(crate::query::Value::Bool(false)))
+            ),
+            "setup: orphan doc isPublished should be stale-false"
+        );
 
         // Setup precondition: only the healthy slot is in postId; orphan is not.
         let before = postid_ids(&engine);
@@ -5027,6 +5063,38 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+
+        // Q3 doc/bitmap coherence: the re-drive must have written the derived
+        // isPublished shadow into the stored doc to match the bitmap (which the
+        // insert set true). GET /documents must no longer serve the stale false.
+        let orphan_doc_after = engine.get_document(orphan).unwrap().unwrap();
+        assert!(
+            matches!(
+                orphan_doc_after.fields.get("isPublished"),
+                Some(crate::mutation::FieldValue::Single(crate::query::Value::Bool(true)))
+            ),
+            "re-drive must repair the doc shadow to true (doc/bitmap agreement), got {:?}",
+            orphan_doc_after.fields.get("isPublished")
+        );
+        // And the bitmap agrees: orphan is in isPublished=true.
+        let pub_true = {
+            let q = crate::query::BitdexQuery {
+                filters: vec![crate::query::FilterClause::And(vec![
+                    crate::query::FilterClause::Eq("postId".into(), crate::query::Value::Integer(post_id)),
+                    crate::query::FilterClause::Eq("isPublished".into(), crate::query::Value::Bool(true)),
+                ])],
+                sort: None,
+                limit: 1000,
+                offset: None,
+                cursor: None,
+                skip_cache: true,
+            };
+            engine.execute_query(&q).map(|r| r.ids).unwrap_or_default()
+        };
+        assert!(
+            pub_true.contains(&(orphan as i64)),
+            "orphan must be in postId AND isPublished=true after re-drive, got {pub_true:?}"
+        );
     }
 
     /// Overdue-deferred sweep (fix A4): a slot that is alive with its shadow

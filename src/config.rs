@@ -66,6 +66,10 @@ pub struct Config {
     /// won't be marked alive until that time arrives. Only one field per document.
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
+    /// Post-activation verify + activation-replay robustness (deferred
+    /// activation-miss backstop). See `ActivationVerifyConfig`.
+    #[serde(default)]
+    pub activation_verify: ActivationVerifyConfig,
     /// Memory budget in bytes for RSS-aware cache eviction. When RSS exceeds
     /// `memory_pressure_threshold` of this budget, the flush thread evicts cache
     /// entries until RSS drops below `memory_pressure_target`.
@@ -192,6 +196,51 @@ pub struct DeferredAliveConfig {
 fn default_deferred_sweep_limit() -> usize {
     20_000
 }
+
+/// Post-activation verify + activation-replay robustness knobs (deferred
+/// activation-miss backstop, 2026-07-14). All memory-only, seeded from the
+/// config file (no PATCH hot-reload). Defaults preserve behavior when the
+/// section is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationVerifyConfig {
+    /// Filter field the activation fan-out groups on (e.g. the field a
+    /// Post→Image fan-out keys on). The verifier confirms each activated slot
+    /// is indexed under its own value of this field, re-driving it from the
+    /// stored doc if absent. `None` disables the verifier entirely — there is
+    /// no baked-in field name; a deployment opts in by naming the field.
+    #[serde(default)]
+    pub membership_field: Option<String>,
+    /// Seconds to re-defer a slot whose stored doc could not be read at
+    /// activation, before retrying. Always applied (independent of
+    /// `membership_field`) — the read-miss re-defer is a correctness fix.
+    #[serde(default = "default_activation_retry_secs")]
+    pub retry_secs: u64,
+    /// Bound on the in-memory pending-verify ring (oldest dropped when over).
+    #[serde(default = "default_activation_verify_ring_cap")]
+    pub ring_cap: usize,
+    /// Slots drained from the ring and verified per WAL-reader batch.
+    #[serde(default = "default_activation_verify_batch_limit")]
+    pub batch_limit: usize,
+}
+fn default_activation_retry_secs() -> u64 {
+    30
+}
+fn default_activation_verify_ring_cap() -> usize {
+    262_144
+}
+fn default_activation_verify_batch_limit() -> usize {
+    4_096
+}
+impl Default for ActivationVerifyConfig {
+    fn default() -> Self {
+        Self {
+            membership_field: None,
+            retry_secs: default_activation_retry_secs(),
+            ring_cap: default_activation_verify_ring_cap(),
+            batch_limit: default_activation_verify_batch_limit(),
+        }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -214,6 +263,7 @@ impl Default for Config {
             enabled_metrics: None,
             disabled_metrics: None,
             deferred_alive: None,
+            activation_verify: ActivationVerifyConfig::default(),
             memory_budget_bytes: None,
             memory_pressure_threshold: default_memory_pressure_threshold(),
             memory_pressure_target: default_memory_pressure_target(),

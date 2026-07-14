@@ -1710,15 +1710,12 @@ impl ConcurrentEngine {
                             // the full doc via the branch above. The re-defer is
                             // persisted this cycle (deferred_persist_needed below).
                             if !redefer_on_read_miss.is_empty() {
-                                const ACTIVATION_REPLAY_RETRY_SECS: u64 = 30;
+                                let retry_secs = flush_config.activation_verify.retry_secs;
                                 for &slot in &redefer_on_read_miss {
                                     coalescer.push_ops(vec![
                                         MutationOp::AliveRemove { slots: vec![slot] },
                                     ]);
-                                    staging.slots.schedule_alive(
-                                        slot,
-                                        now_unix + ACTIVATION_REPLAY_RETRY_SECS,
-                                    );
+                                    staging.slots.schedule_alive(slot, now_unix + retry_secs);
                                 }
                             }
                             if act_read_miss > 0 {
@@ -1735,14 +1732,14 @@ impl ConcurrentEngine {
                             // (the overdue sweep + doc/bitmap fixes bound the
                             // orphan population if a burst overflows).
                             {
-                                const ACTIVATION_VERIFY_CAP: usize = 262_144;
+                                let cap = flush_config.activation_verify.ring_cap;
                                 let mut q = flush_activation_verify.lock();
                                 for &slot in &activated {
                                     if !redefer_on_read_miss.contains(&slot) {
                                         q.push_back(slot);
                                     }
                                 }
-                                while q.len() > ACTIVATION_VERIFY_CAP {
+                                while q.len() > cap {
                                     q.pop_front();
                                 }
                             }

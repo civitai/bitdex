@@ -45,6 +45,9 @@
     "deferred_alive": {
       "source_field": "publishedAt"
     },
+    "activation_verify": {
+      "membership_field": "postId"
+    },
     "time_buckets": {
       "filter_field": "sortAtUnix",
       "sort_field": "sortAt",
