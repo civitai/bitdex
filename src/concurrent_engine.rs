@@ -13874,13 +13874,17 @@ mod tests {
         let (applied2, skipped2, errors2) = apply_ops_batch(
             &mut sink, &meta, &mut entries2, Some(&engine), Some(&mut doc_writer),
         );
-        if (dead_slot as u32) < sc {
-            assert_eq!(skipped2, 1, "non-alive slot below slot_counter should be skipped");
-            assert_eq!(applied2, 0);
-        } else {
-            // Auto-promoted because beyond slot_counter
-            assert_eq!(applied2, 1, "slot beyond slot_counter should be auto-promoted");
-        }
+        // Fix 2026-07-13 (boot-replay skip-watermark): a below-HWM slot with
+        // NO stored doc was never inserted — the op IS the insert, so it
+        // auto-promotes instead of skipping. The stale-op skip now requires a
+        // stored doc (deleted slots keep theirs until autovac); that branch is
+        // pinned by ops_processor::tests::
+        // test_below_hwm_insert_op_auto_promotes_when_no_doc.
+        assert_eq!(
+            applied2, 1,
+            "non-alive slot with no stored doc must auto-promote (insert), regardless of slot_counter"
+        );
+        assert_eq!(skipped2, 0);
         assert_eq!(errors2, 0);
 
         // Apply ops with creates_slot=true for new entity — should succeed

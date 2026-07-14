@@ -992,6 +992,32 @@ pub fn apply_ops_batch<S: BitmapSink>(
                              (entity_id={entity_id}, beyond slot_counter={})",
                             eng.slot_counter()
                         );
+                    } else if eng
+                        .docstore_arc()
+                        .read()
+                        .get(slot)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        // Below the high-water mark, not alive, and NO stored doc:
+                        // this slot was never inserted — the op IS the insert.
+                        // The high-water heuristic alone is unsafe here: a bulk
+                        // load's later phases (metrics dumps at a later wall-clock
+                        // cut than the images CSV) push slot_counter past slots
+                        // whose insert ops exist only in the replay stream, and
+                        // the plain skip silently dropped them (2026-07-13 nuke:
+                        // 9,614 skipped ops / 285 posts missing images on the
+                        // pod that dumped mid-churn). Deleted slots are the case
+                        // the skip exists for, and they KEEP their stored doc
+                        // until autovac — so doc-absent discriminates
+                        // never-inserted from deleted exactly.
+                        creates_slot = true;
+                        tracing::info!(
+                            "ops processor: auto-promoting slot {slot} to creates_slot \
+                             (entity_id={entity_id}, below slot_counter={} but no stored doc)",
+                            eng.slot_counter()
+                        );
                     } else {
                         // Diagnostic: log first few skips to help debug WAL reader stall
                         if skipped < 3 {
@@ -2237,6 +2263,112 @@ mod tests {
             Ok(())
         }
     }
+    /// Regression (nuke 2026-07-13, boot-replay skip-watermark): a bulk load's
+    /// LATER phases (metrics, dumped at a later wall-clock cut) push
+    /// slot_counter past slots whose insert ops exist only in the replay
+    /// stream — the images CSV was snapshotted BEFORE those images existed.
+    /// The old "!alive && below high-water ⇒ stale, skip" heuristic silently
+    /// dropped those inserts (bitdex-1: 9,614 skipped ops, 285 posts missing
+    /// images). A never-inserted slot has NO stored doc, while a deleted slot
+    /// keeps its doc until autovac — so doc-absence must auto-promote the op
+    /// to an insert, and doc-presence must keep the stale-op skip.
+    #[test]
+    fn test_below_hwm_insert_op_auto_promotes_when_no_doc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docstore_path = dir.path().join("docs");
+        let mut config = test_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+
+        // Raise the high-water mark: insert slot 100 the normal way.
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(1) }],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, 100, 5_000);
+        assert!(engine.slot_counter() > 50, "slot 100 must raise the high-water mark");
+
+        // Replay-shaped insert: slot 50 is BELOW the high-water mark, not
+        // alive, creates_slot=false (triggers can't mark inserts), and has no
+        // stored doc. Must auto-promote and insert, not skip.
+        let mut sink2 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: 50,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(2) }],
+        }];
+        let (applied2, skipped2, errors2) =
+            apply_ops_batch(&mut sink2, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        assert_eq!(
+            (applied2, skipped2, errors2),
+            (1, 0, 0),
+            "below-HWM insert op with no stored doc must auto-promote, not skip"
+        );
+        crate::ingester::BitmapSink::flush(&mut sink2).unwrap();
+        dw2.flush();
+        wait_for_alive_slot(&engine, 50, 5_000);
+        assert!(
+            engine.docstore_arc().read().get(50).unwrap().is_some(),
+            "auto-promoted insert must write the doc"
+        );
+
+        // Deleted-slot case must STILL skip: delete slot 100 (doc stays on
+        // disk until autovac), then send it a stale Set.
+        let mut sink3 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut batch3 = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![Op::Delete],
+        }];
+        let (applied3, _, errors3) =
+            apply_ops_batch(&mut sink3, &meta, &mut batch3, Some(&engine), None);
+        assert_eq!((applied3, errors3), (1, 0));
+        crate::ingester::BitmapSink::flush(&mut sink3).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5_000);
+        while engine.is_slot_alive(100) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!engine.is_slot_alive(100), "slot 100 must be deleted");
+        assert!(
+            engine.docstore_arc().read().get(100).unwrap().is_some(),
+            "precondition: deleted slot keeps its stored doc (autovac not run)"
+        );
+
+        let mut sink4 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut batch4 = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(3) }],
+        }];
+        let (applied4, skipped4, _) =
+            apply_ops_batch(&mut sink4, &meta, &mut batch4, Some(&engine), None);
+        assert_eq!(
+            (applied4, skipped4),
+            (0, 1),
+            "stale op for a deleted slot (doc present) must still skip"
+        );
+        assert!(!engine.is_slot_alive(100), "deleted slot must stay dead");
+        engine.shutdown();
+    }
+
     /// Regression (stakeout 2026-07-08, specimen post 29660803): a fan-out
     /// mutates the MATCHED slots' docs, but the WAL-reader loop only evicts
     /// the DocCache for the SOURCE entity_id (the Post) — so a previously
