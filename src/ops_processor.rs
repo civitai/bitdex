@@ -795,6 +795,38 @@ fn get_deferred_timestamp(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
 /// Pass a `DocWriter` for steady-state to keep the docstore in sync with bitmap
 /// changes. Pass `None` during dump mode (dump processor handles docs separately).
 ///
+/// Process-wide memo of slots confirmed DELETED (not alive, below the
+/// high-water mark, stored doc present). Bounds the cost of the doc-presence
+/// probe in the stale-op skip path: late updates for deleted entities can
+/// repeat, and each probe decodes a docstore shard. Cleared wholesale if it
+/// ever grows past the cap (stale entries are harmless — a re-probe just
+/// re-confirms; a recycled slot becomes ALIVE again and never reaches this
+/// path).
+fn confirmed_deleted_slots() -> &'static parking_lot::Mutex<ahash::AHashSet<u32>> {
+    static MEMO: std::sync::OnceLock<parking_lot::Mutex<ahash::AHashSet<u32>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| parking_lot::Mutex::new(ahash::AHashSet::new()))
+}
+
+fn is_confirmed_deleted(slot: u32) -> bool {
+    confirmed_deleted_slots().lock().contains(&slot)
+}
+
+fn remember_confirmed_deleted(slot: u32) {
+    let mut memo = confirmed_deleted_slots().lock();
+    if memo.len() >= 1_000_000 {
+        memo.clear();
+    }
+    memo.insert(slot);
+}
+
+/// Tests share the process-wide memo; clear it so one test's deleted slots
+/// can't leak skip decisions into another's.
+#[cfg(test)]
+pub(crate) fn clear_confirmed_deleted_memo() {
+    confirmed_deleted_slots().lock().clear();
+}
+
 /// Returns (applied, skipped, errors).
 pub fn apply_ops_batch<S: BitmapSink>(
     sink: &mut S,
@@ -992,6 +1024,14 @@ pub fn apply_ops_batch<S: BitmapSink>(
                              (entity_id={entity_id}, beyond slot_counter={})",
                             eng.slot_counter()
                         );
+                    } else if is_confirmed_deleted(slot) {
+                        // Memoized: this slot already proved doc-present
+                        // (deleted). Skip without re-reading the docstore —
+                        // late stale updates for deleted entities can repeat
+                        // (metrics refreshers, retries) and the doc read
+                        // decodes a whole shard.
+                        skipped += 1;
+                        continue;
                     } else if eng
                         .docstore_arc()
                         .read()
@@ -1019,6 +1059,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             eng.slot_counter()
                         );
                     } else {
+                        remember_confirmed_deleted(slot);
                         // Diagnostic: log first few skips to help debug WAL reader stall
                         if skipped < 3 {
                             eprintln!(
@@ -2274,6 +2315,7 @@ mod tests {
     /// to an insert, and doc-presence must keep the stale-op skip.
     #[test]
     fn test_below_hwm_insert_op_auto_promotes_when_no_doc() {
+        clear_confirmed_deleted_memo();
         let dir = tempfile::TempDir::new().unwrap();
         let docstore_path = dir.path().join("docs");
         let mut config = test_config();
@@ -2366,6 +2408,43 @@ mod tests {
             "stale op for a deleted slot (doc present) must still skip"
         );
         assert!(!engine.is_slot_alive(100), "deleted slot must stay dead");
+        assert!(
+            is_confirmed_deleted(100),
+            "deleted-slot probe must be memoized to bound repeat docstore reads"
+        );
+
+        // Memoized repeat: same stale op again must skip via the memo
+        // (behaviorally identical; pins the fast path exists).
+        let mut sink5 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut batch5 = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(4) }],
+        }];
+        let (applied5, skipped5, _) =
+            apply_ops_batch(&mut sink5, &meta, &mut batch5, Some(&engine), None);
+        assert_eq!((applied5, skipped5), (0, 1), "memoized deleted slot must skip");
+
+        // Beyond-HWM fast path must promote WITHOUT consulting the docstore
+        // memo/probe (pins the `slot >= slot_counter` branch on its own —
+        // review #310 F4: the collapsed concurrent_engine test would pass
+        // via the doc probe even if this branch were deleted).
+        let beyond = engine.slot_counter() + 500;
+        let mut sink6 = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw6 = DocWriter::new(engine.docstore_arc());
+        let mut batch6 = vec![EntityOps {
+            entity_id: beyond as i64,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(5) }],
+        }];
+        let (applied6, skipped6, _) =
+            apply_ops_batch(&mut sink6, &meta, &mut batch6, Some(&engine), Some(&mut dw6));
+        assert_eq!(
+            (applied6, skipped6),
+            (1, 0),
+            "beyond-HWM slot must auto-promote via the high-water branch"
+        );
+        clear_confirmed_deleted_memo();
         engine.shutdown();
     }
 
