@@ -1686,16 +1686,30 @@ fn process_delete<S: BitmapSink>(
 /// legitimately deferred slots (future value) are skipped by the doc check.
 ///
 /// Runs on the WAL reader thread between batches — never on the flush thread.
-/// Returns (candidates_checked, healed_slots).
+///
+/// Pagination (page-cap fix, 2026-07-14): `execute_query` clamps `limit` to
+/// `max_page_size` (200 in prod), so a single query can never see more than
+/// one page of the shadow-false candidate space. Skipped candidates (drafts,
+/// legitimately-deferred) stay shadow-false, so without pagination every
+/// cycle re-scans the SAME head and stuck slots below it are never reached
+/// (45 victims sat 15h on 2026-07-14). This fn now pages via keyset cursor
+/// until `limit` candidates are checked or the space is exhausted, and
+/// returns the cursor so the caller can resume the rotation next cycle —
+/// every candidate is reached within ceil(population / limit) cycles.
+///
+/// Returns (candidates_checked, healed_slots, resume_cursor). A `None`
+/// resume_cursor means the full candidate space was covered; pass the
+/// returned cursor back in as `resume` on the next cycle.
 pub fn overdue_deferred_sweep<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
     engine: &ConcurrentEngine,
     doc_writer: &mut DocWriter,
     limit: usize,
-) -> (usize, Vec<u32>) {
+    resume: Option<crate::query::CursorPosition>,
+) -> (usize, Vec<u32>, Option<crate::query::CursorPosition>) {
     let Some((source_field, ms_to_secs)) = meta.deferred_alive_field.clone() else {
-        return (0, Vec::new());
+        return (0, Vec::new(), None);
     };
     let Some(shadow) = meta
         .exists_boolean_shadows
@@ -1704,7 +1718,7 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
         .cloned()
     else {
         // No shadow configured — nothing observable to sweep against.
-        return (0, Vec::new());
+        return (0, Vec::new(), None);
     };
     // Feed-relevance ordering: the computed target derived from the source
     // (e.g. sortAt from publishedAt); fall back to the source sort field.
@@ -1713,72 +1727,102 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
         .get(source_field.as_str())
         .and_then(|deps| deps.first().map(|d| d.target.clone()))
         .unwrap_or_else(|| source_field.clone());
-    let query = BitdexQuery {
-        filters: vec![crate::query::FilterClause::Eq(
-            shadow.to_string(),
-            crate::query::Value::Bool(false),
-        )],
-        sort: Some(crate::query::SortClause {
-            field: sort_field,
-            direction: crate::query::SortDirection::Desc,
-        }),
-        limit,
-        cursor: None,
-        offset: None,
-        skip_cache: true,
-    };
-    let ids = match engine.execute_query(&query) {
-        Ok(result) => result.ids,
-        Err(e) => {
-            tracing::warn!("overdue-deferred sweep: query failed: {e}");
-            return (0, Vec::new());
-        }
-    };
+    // The engine clamps per-query results to max_page_size, so page through
+    // the candidate space with the keyset cursor instead of issuing one
+    // over-clamped query.
+    let page_size = engine.config().max_page_size.min(limit).max(1);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let mut cursor = resume;
+    let mut exhausted = false;
     let mut checked = 0usize;
     let mut healed: Vec<u32> = Vec::new();
-    for id in ids {
-        if id < 0 || id > u32::MAX as i64 {
-            continue;
+    while checked < limit {
+        let query = BitdexQuery {
+            filters: vec![crate::query::FilterClause::Eq(
+                shadow.to_string(),
+                crate::query::Value::Bool(false),
+            )],
+            sort: Some(crate::query::SortClause {
+                field: sort_field.clone(),
+                direction: crate::query::SortDirection::Desc,
+            }),
+            limit: page_size,
+            cursor: cursor.clone(),
+            offset: None,
+            skip_cache: true,
+        };
+        let result = match engine.execute_query(&query) {
+            Ok(result) => result,
+            Err(e) => {
+                // Return the last-good cursor, not None: a deterministic
+                // error at page N must not reset the rotation to the top
+                // every cycle (that would starve the tail forever — the
+                // exact failure mode this fn exists to prevent).
+                tracing::warn!("overdue-deferred sweep: query failed: {e}");
+                return (checked, healed, cursor);
+            }
+        };
+        let page_len = result.ids.len();
+        if page_len == 0 {
+            exhausted = true;
+            break;
         }
-        let slot = id as u32;
-        checked += 1;
-        let Ok(Some(doc)) = engine.get_document(slot) else {
-            continue;
-        };
-        let Some(crate::mutation::FieldValue::Single(v)) = doc.fields.get(source_field.as_str())
-        else {
-            continue; // genuine draft — no stored source value
-        };
-        // Extract the raw integer BEFORE any u32 narrowing — a milliseconds
-        // source would wrap u32 first and corrupt the comparison.
-        let raw: i64 = match v {
-            crate::types::Value::Integer(i) => *i,
-            other => match crate::mutation::value_to_sort_u32(other) {
-                Some(u) => u as i64,
-                None => continue,
-            },
-        };
-        let secs = if ms_to_secs { raw / 1000 } else { raw };
-        if secs <= 0 || secs > now {
-            continue; // draft (0) or legitimately deferred (future)
+        for id in result.ids {
+            if id < 0 || id > u32::MAX as i64 {
+                continue;
+            }
+            let slot = id as u32;
+            checked += 1;
+            let Ok(Some(doc)) = engine.get_document(slot) else {
+                continue;
+            };
+            let Some(crate::mutation::FieldValue::Single(v)) =
+                doc.fields.get(source_field.as_str())
+            else {
+                continue; // genuine draft — no stored source value
+            };
+            // Extract the raw integer BEFORE any u32 narrowing — a milliseconds
+            // source would wrap u32 first and corrupt the comparison.
+            let raw: i64 = match v {
+                crate::types::Value::Integer(i) => *i,
+                other => match crate::mutation::value_to_sort_u32(other) {
+                    Some(u) => u as i64,
+                    None => continue,
+                },
+            };
+            let secs = if ms_to_secs { raw / 1000 } else { raw };
+            if secs <= 0 || secs > now {
+                continue; // draft (0) or legitimately deferred (future)
+            }
+            let mut sort_values: HashMap<&str, u32> = HashMap::new();
+            sort_values.insert(source_field.as_str(), secs as u32);
+            let empty: HashMap<&str, u32> = HashMap::new();
+            recompute_computed_sorts_for_slot(
+                sink,
+                meta,
+                Some(engine),
+                slot,
+                &sort_values,
+                &empty,
+                Some(doc_writer),
+            );
+            healed.push(slot);
         }
-        let mut sort_values: HashMap<&str, u32> = HashMap::new();
-        sort_values.insert(source_field.as_str(), secs as u32);
-        let empty: HashMap<&str, u32> = HashMap::new();
-        recompute_computed_sorts_for_slot(
-            sink,
-            meta,
-            Some(engine),
-            slot,
-            &sort_values,
-            &empty,
-            Some(doc_writer),
+        cursor = result.cursor;
+        if page_len < page_size || cursor.is_none() {
+            exhausted = true;
+            break;
+        }
+    }
+    if exhausted {
+        cursor = None;
+        tracing::info!(
+            "overdue-deferred sweep: full candidate pass complete (checked {checked}, healed {})",
+            healed.len()
         );
-        healed.push(slot);
     }
     if !healed.is_empty() {
         tracing::info!(
@@ -1786,7 +1830,7 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
             healed.len()
         );
     }
-    (checked, healed)
+    (checked, healed, cursor)
 }
 /// Field-name label for the zero-match fan-out counter. Low-cardinality by
 /// construction: the field NAME of the clause (never the value), recursing
@@ -4105,13 +4149,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
+        // The forged writes bypass DocCache and the flush thread's
+        // write-through can repopulate stale entries; evict AFTER the flush
+        // thread has settled so the sweep's get_document reads the disk state.
+        engine.evict_doc_cache(stuck);
+        engine.evict_doc_cache(future);
 
         let mut rec = RecordingSink::new();
         let mut dw2 = DocWriter::new(engine.docstore_arc());
-        let (checked, healed) =
-            overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw2, 1_000);
+        let (checked, healed, cursor) =
+            overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw2, 1_000, None);
         dw2.flush();
         assert!(checked >= 3, "all three shadow-false slots are candidates, got {checked}");
+        assert!(cursor.is_none(), "candidate space fits in one pass — no resume cursor");
         assert_eq!(healed, vec![stuck], "exactly the stuck slot must be healed");
         // Heal emits the shadow flip and the publishedAt sort layer for `stuck`.
         assert!(
@@ -4126,6 +4176,125 @@ mod tests {
             !rec.filter_inserts.iter().any(|(f, v, s)| f == "isPublished" && *v == 1 && (*s == draft || *s == future)),
             "draft and future slots must not be flipped"
         );
+    }
+
+    /// Shared rig for the page-cap regression tests: `n_decoys` shadow-false
+    /// drafts with RECENT existedAt (high sortAt — they own the head of the
+    /// Desc-sorted candidate list and are never healed, drafts have no stored
+    /// publishedAt) plus one stuck slot with OLD existedAt (tail of the list)
+    /// and a forged past publishedAt doc (the lost-activation state).
+    /// Returns (engine, meta, stuck_slot).
+    fn page_cap_rig(n_decoys: u32) -> (ConcurrentEngine, FieldMeta, u32) {
+        let mut config = safety_net_config();
+        config.max_page_size = 5;
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let stuck: u32 = 1;
+        let decoys: Vec<u32> = (2..2 + n_decoys).collect();
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch: Vec<EntityOps> = Vec::new();
+        // Stuck slot: oldest existedAt → LOWEST sortAt → last in Desc order.
+        batch.push(EntityOps {
+            entity_id: stuck as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100_000) },
+                Op::Set { field: "isPublished".into(), value: json!(false) },
+            ],
+        });
+        for (i, &d) in decoys.iter().enumerate() {
+            batch.push(EntityOps {
+                entity_id: d as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 10 - i as i64) },
+                    Op::Set { field: "isPublished".into(), value: json!(false) },
+                ],
+            });
+        }
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        // Forge the lost activation: doc carries a past publishedAt but the
+        // shadow/sort bitmaps were never written.
+        dw.write_set(stuck, "publishedAt", &json!(now - 50));
+        sink.flush().unwrap();
+        dw.flush();
+        let last_decoy = *decoys.last().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        while std::time::Instant::now() < deadline {
+            if engine.is_slot_alive(last_decoy) && engine.is_slot_alive(stuck) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(engine.is_slot_alive(stuck), "test rig: stuck slot must be alive");
+        assert!(engine.is_slot_alive(last_decoy), "test rig: decoys must be alive");
+        // The forged write bypasses DocCache and the flush thread's
+        // write-through can repopulate a stale entry; evict AFTER the flush
+        // thread has settled so the sweep's get_document reads the disk state.
+        engine.evict_doc_cache(stuck);
+        (engine, meta, stuck)
+    }
+
+    /// Regression (2026-07-14 page-cap): `execute_query` clamps limit to
+    /// `max_page_size`, so the old single-query sweep only ever saw the head
+    /// of the Desc-sorted candidate list. A stuck slot ranked below the first
+    /// page was never reached (45 posts sat 15h in prod). One sweep pass with
+    /// `limit` > population must paginate past the clamp and heal it.
+    #[test]
+    fn test_overdue_deferred_sweep_paginates_past_page_cap() {
+        // 12 decoys ahead of the stuck slot; page cap 5 → stuck is on page 3.
+        let (engine, meta, stuck) = page_cap_rig(12);
+        let mut rec = RecordingSink::new();
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let (checked, healed, cursor) =
+            overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw, 1_000, None);
+        dw.flush();
+        assert!(
+            checked >= 13,
+            "sweep must page through ALL 13 candidates, not stop at the 5-cap, got {checked}"
+        );
+        assert_eq!(healed, vec![stuck], "the stuck slot beyond page 1 must be healed");
+        assert!(cursor.is_none(), "space exhausted in one pass — no resume cursor");
+    }
+
+    /// Regression (2026-07-14 page-cap): when `sweep_limit` is smaller than
+    /// the candidate population, the returned cursor must rotate the scan
+    /// window forward so successive cycles reach the tail — instead of
+    /// re-scanning the same head forever (the prod failure mode).
+    #[test]
+    fn test_overdue_deferred_sweep_cursor_rotates_across_cycles() {
+        let (engine, meta, stuck) = page_cap_rig(12);
+        let mut cursor: Option<crate::query::CursorPosition> = None;
+        let mut healed_all: Vec<u32> = Vec::new();
+        let mut cycles = 0usize;
+        // limit=5 per cycle over 13 candidates → stuck must heal within
+        // ceil(13/5)=3 cycles. Allow one extra for the wrap.
+        for _ in 0..4 {
+            cycles += 1;
+            let mut rec = RecordingSink::new();
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let (_, healed, next) =
+                overdue_deferred_sweep(&mut rec, &meta, &engine, &mut dw, 5, cursor.take());
+            dw.flush();
+            healed_all.extend(healed);
+            cursor = next;
+            if healed_all.contains(&stuck) {
+                break;
+            }
+            assert!(
+                cursor.is_some() || cycles >= 3,
+                "mid-rotation cycles must return a resume cursor (cycle {cycles})"
+            );
+        }
+        assert_eq!(
+            healed_all,
+            vec![stuck],
+            "rotating cursor must reach the stuck slot within {cycles} cycles"
+        );
+        assert!(cycles <= 3, "coverage must be bounded: healed in {cycles} cycles, expected <=3");
     }
 
     /// Regression (audit 2026-07-07 §3.1): deleting a deferred slot must

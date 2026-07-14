@@ -232,3 +232,18 @@ pods verified 0/44 after. NOTE: the overdue-deferred sweep did NOT reach these i
 consistent with the known sweep page-cap issue (same 200-candidate head each cycle);
 bump its priority. Cosmetic: nudged docs can retain publishedAt−1 while bitmaps/sortAt
 are exact (doc-cache race on batch-2 write); self-corrects on next organic op.
+
+## query_stream_full_channel_drops_oldest fails deterministically on Windows (2026-07-14)
+
+`server::tests::query_stream_full_channel_drops_oldest` panics at "first event: Lagged(1)"
+(server.rs:7665) on clean origin/main (87247d2), verified in a fresh worktree — pre-existing,
+not from the sweep page-cap branch. Repeated locally, deterministic on this Windows box.
+Likely broadcast-channel timing (drop-oldest semantics racing the subscriber). If Linux CI
+is green, it's a Windows-only timing hole in the test; fix the test, not rerun-once it.
+
+UPDATE 2026-07-14: sweep page-cap FIXED — the sweep now pages through the candidate
+space via keyset cursor (max_page_size per query, up to sweep_limit checked per cycle)
+and carries a rotation cursor across cycles; full coverage bounded at
+ceil(population / sweep_limit) cycles, "full candidate pass complete" log marks wraps.
+Regression tests: test_overdue_deferred_sweep_paginates_past_page_cap,
+test_overdue_deferred_sweep_cursor_rotates_across_cycles.

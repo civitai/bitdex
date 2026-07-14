@@ -62,7 +62,7 @@ All cache settings are persisted to `indexes/{name}/config.yaml` on PATCH and su
 | Setting | Type | Default | Persisted | What It Controls |
 |---------|------|---------|-----------|-----------------|
 | `deferred_sweep_interval_secs` | u64 | 0 (off) | NO (seed via `deferred_alive.sweep_interval_secs`) | Interval for the overdue-deferred sweep — heals slots whose deferred activation was lost (shadow false + stored source timestamp past). Runs on the WAL reader thread between batches. |
-| `deferred_sweep_limit` | usize | 20,000 | NO (seed via `deferred_alive.sweep_limit`) | Max shadow-false candidates examined per sweep pass (sorted most-feed-relevant first). |
+| `deferred_sweep_limit` | usize | 20,000 | NO (seed via `deferred_alive.sweep_limit`) | Max shadow-false candidates examined per sweep pass (sorted most-feed-relevant first). The sweep pages through the candidate space with a keyset cursor (max_page_size per query) and carries a rotation cursor across cycles, so full coverage takes ceil(population / limit) cycles. A "full candidate pass complete" log line marks each wrap. |
 
 ---
 

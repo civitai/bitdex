@@ -1382,6 +1382,11 @@ impl BitdexServer {
                     // Baselined to "now" so the first sweep runs one full
                     // interval after boot (lazy loads settle first).
                     let mut last_deferred_sweep = std::time::Instant::now();
+                    // Rotation cursor: where the last sweep pass stopped in the
+                    // shadow-false candidate space. `None` = start from the top.
+                    // Carrying it across cycles bounds full coverage to
+                    // ceil(population / sweep_limit) cycles (page-cap fix).
+                    let mut deferred_sweep_cursor: Option<crate::query::CursorPosition> = None;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Pause WAL apply while the engine is in bulk-load mode.
@@ -1597,10 +1602,12 @@ impl BitdexServer {
                                             engine.docstore_arc(),
                                         );
                                         let t0 = std::time::Instant::now();
-                                        let (checked, healed) =
+                                        let (checked, healed, next_cursor) =
                                             crate::ops_processor::overdue_deferred_sweep(
                                                 &mut sink, &meta, &engine, &mut dw, limit,
+                                                deferred_sweep_cursor.take(),
                                             );
+                                        deferred_sweep_cursor = next_cursor;
                                         dw.flush();
                                         if let Err(e) = crate::ingester::BitmapSink::flush(&mut sink) {
                                             eprintln!("overdue-deferred sweep: sink flush failed: {e}");
