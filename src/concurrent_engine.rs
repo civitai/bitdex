@@ -53,6 +53,13 @@ pub struct MetricsBridge {
     /// the WAL reader has done across all queryOpSets; not the same as the
     /// `applied` count returned per call.
     pub query_op_set_applied_slots_total: prometheus::IntCounterVec,
+    /// Deferred slots examined by a publish fan-out's deferred-reach pass
+    /// (reschedule-drop fix). Cost signal — increments by deferred-map size per
+    /// publish fan-out. Label: index.
+    pub deferred_fanout_scanned_total: prometheus::IntCounterVec,
+    /// Deferred slots rescheduled/activated by the deferred-reach pass — the
+    /// target counter for the reschedule-drop fix. Label: index.
+    pub deferred_fanout_reached_total: prometheus::IntCounterVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.

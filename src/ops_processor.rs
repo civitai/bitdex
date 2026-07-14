@@ -32,6 +32,11 @@ use crate::ingester::BitmapSink;
 /// `BITDEX_QUERY_OP_SET_MAX_FANOUT` env var. Reads on every apply (microsecond
 /// cost dwarfed by `execute_query`'s ms-scale work) so operators can tune
 /// without restart by editing the manifest and rolling pods.
+/// Warn when a single publish fan-out's deferred-reach pass scans more than
+/// this many deferred candidates (one docstore read each). Healthy steady
+/// state keeps only a handful of scheduled slots deferred; prod once grew to
+/// ~49.7k during the reschedule-drop bug, so this bounds surprise.
+const DEFERRED_REACH_WARN_THRESHOLD: usize = 10_000;
 const DEFAULT_MAX_FANOUT: usize = usize::MAX;
 fn max_fanout() -> usize {
     std::env::var("BITDEX_QUERY_OP_SET_MAX_FANOUT")
@@ -1930,6 +1935,28 @@ fn apply_fanout_to_deferred_slots<S: BitmapSink>(
     if candidates.is_empty() {
         return 0;
     }
+    // Cost signal: this pass reads one doc per candidate. The deferred map is
+    // small in healthy steady state, but prod once accumulated ~49.7k deferred
+    // slots (the bug this fix repairs) — warn so a regrown backlog + high
+    // publish rate is visible before it becomes a WAL-reader CPU problem.
+    if candidates.len() > DEFERRED_REACH_WARN_THRESHOLD {
+        tracing::warn!(
+            target: "ops_processor",
+            "deferred-reach: scanning {} deferred slots for publish fan-out (> {} threshold) — \
+             deferred backlog may be growing",
+            candidates.len(),
+            DEFERRED_REACH_WARN_THRESHOLD,
+        );
+    }
+    #[cfg(feature = "server")]
+    let metrics = engine.metrics_bridge_handle();
+    #[cfg(feature = "server")]
+    if let Some(ref bridge) = metrics {
+        bridge
+            .deferred_fanout_scanned_total
+            .with_label_values(&[&bridge.index_name])
+            .inc_by(candidates.len() as u64);
+    }
     // A now/past Set reschedules to that instant (activates next flush cycle);
     // a Remove-only (source cleared) activates immediately as a plain draft.
     let new_at = get_deferred_timestamp(meta, ops);
@@ -1940,6 +1967,13 @@ fn apply_fanout_to_deferred_slots<S: BitmapSink>(
 
     let mut touched: Vec<u32> = Vec::new();
     for slot in candidates {
+        // A slot that is already alive can't be deferred; if a stale snapshot
+        // still lists it (or a re-defer landed and reverted within the window)
+        // skip it — the bitmap-matched path above already handles alive slots,
+        // and applying here would double-count and redundantly reschedule.
+        if engine.is_slot_alive(slot) {
+            continue;
+        }
         let doc = match engine.get_document(slot) {
             Ok(Some(d)) => d,
             _ => continue,
@@ -1981,6 +2015,13 @@ fn apply_fanout_to_deferred_slots<S: BitmapSink>(
         for &slot in &touched {
             engine.evict_doc_cache(slot);
         }
+    }
+    #[cfg(feature = "server")]
+    if let Some(ref bridge) = metrics {
+        bridge
+            .deferred_fanout_reached_total
+            .with_label_values(&[&bridge.index_name])
+            .inc_by(touched.len() as u64);
     }
     touched.len()
 }
@@ -2102,7 +2143,7 @@ fn apply_query_op_set<S: BitmapSink>(
     }
 
     if slot_ids.is_empty() {
-        // Zero-match fan-out: indistinguishable here from a legitimately
+        // Zero BITMAP matches. Indistinguishable here from a legitimately
         // empty target (post with no images yet), so it must not fail — but
         // it is also the exact signature of the silent no-op class (specimen
         // 136063341: a fan-out that matched nothing on a freshly-dumped pod
@@ -2110,17 +2151,24 @@ fn apply_query_op_set<S: BitmapSink>(
         // shadowing sync-created diffs — see FOLLOWUP.md). Count it, labeled
         // by filter field, and log at info so a post-boot spike is
         // attributable to a query shape without extra instrumentation.
-        tracing::info!(
-            target: "ops_processor",
-            "queryOpSet '{}' matched 0 slots — applied nothing",
-            query_str,
-        );
-        #[cfg(feature = "server")]
-        if let Some(ref bridge) = metrics {
-            bridge
-                .query_op_set_zero_match_total
-                .with_label_values(&[&bridge.index_name, &zero_match_field])
-                .inc();
+        //
+        // But NOT when the deferred-reach pass above already handled slots:
+        // an all-deferred post (every image scheduled) matches zero bitmap
+        // slots yet is NOT a no-op — counting it here would falsely inflate
+        // the very counter used to detect the drop this fix repairs.
+        if deferred_applied == 0 {
+            tracing::info!(
+                target: "ops_processor",
+                "queryOpSet '{}' matched 0 slots — applied nothing",
+                query_str,
+            );
+            #[cfg(feature = "server")]
+            if let Some(ref bridge) = metrics {
+                bridge
+                    .query_op_set_zero_match_total
+                    .with_label_values(&[&bridge.index_name, &zero_match_field])
+                    .inc();
+            }
         }
         return Ok(deferred_applied);
     }
@@ -3056,6 +3104,314 @@ mod tests {
             sort_layer_value(&engine, "sortAt", image_slot),
             Some(t_pub_now.max(t_existed) as u32),
             "activation must recompute sortAt"
+        );
+    }
+
+    /// Engine for the deferred-reach tests: `test_config` fields + postId
+    /// filter, publishedAt sort (also the deferred source), computed sortAt.
+    /// post_id is fixed at 100 so `sort_layer_value` can query it.
+    fn deferred_reach_engine(dir: &tempfile::TempDir) -> ConcurrentEngine {
+        let docstore_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+        let mut config = test_config();
+        config.storage.bitmap_path = Some(bitmap_path);
+        config.merge_interval_ms = 45_000;
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "sortAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: Some(crate::config::ComputedField {
+                op: crate::config::ComputedOp::Greatest,
+                source_fields: vec!["existedAt".into(), "publishedAt".into()],
+            }),
+        });
+        config.deferred_alive = Some(crate::config::DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+            sweep_interval_secs: 0,
+            sweep_limit: 20_000,
+        });
+        ConcurrentEngine::new_with_path(config, &docstore_path).unwrap()
+    }
+
+    /// Insert one image as DEFERRED (creates_slot + future publishedAt): doc
+    /// written, no bitmaps set. Returns after flush + publish.
+    fn insert_deferred_image(
+        engine: &ConcurrentEngine,
+        meta: &FieldMeta,
+        slot: u32,
+        post_id: i64,
+        existed_at: i64,
+        pub_future: i64,
+    ) {
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(post_id) },
+                Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                Op::Set { field: "existedAt".into(), value: json!(existed_at) },
+                Op::Set { field: "publishedAt".into(), value: json!(pub_future) },
+            ],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut sink, meta, &mut batch, Some(engine), Some(&mut dw));
+        assert_eq!((applied, errors), (1, 0), "deferred insert");
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        engine.force_publish_blocking(std::time::Duration::from_secs(5));
+        assert!(engine.is_slot_deferred(slot), "image {slot} must be deferred");
+        assert!(!engine.is_slot_alive(slot), "image {slot} must not be alive");
+    }
+
+    /// Read a single integer doc field, or None if absent/non-integer.
+    fn doc_int_field(engine: &ConcurrentEngine, slot: u32, field: &str) -> Option<i64> {
+        let doc = engine.get_document(slot).ok()??;
+        match doc.fields.get(field) {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(v))) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Apply a single fan-out batch (Post entity → images) through a
+    /// RecordingSink so the emitted deferred/bitmap ops can be asserted
+    /// directly — the deterministic pattern the direct-op deferred tests use,
+    /// avoiding a race on the flush thread's activation replay. The engine is
+    /// still real (execute_query resolves the fan-out; deferred_slots() + the
+    /// docstore drive the deferred-reach pass). Returns (applied, sink).
+    fn apply_fanout_recording(
+        engine: &ConcurrentEngine,
+        meta: &FieldMeta,
+        post_id: i64,
+        inner_ops: Vec<Op>,
+    ) -> (usize, RecordingSink) {
+        let mut rec = RecordingSink::new();
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: post_id,
+            creates_slot: false,
+            ops: vec![Op::QueryOpSet {
+                query: Some(format!("postId eq {post_id}")),
+                ops: inner_ops,
+            }],
+        }];
+        let (applied, _, errors) =
+            apply_ops_batch(&mut rec, meta, &mut batch, Some(engine), Some(&mut dw));
+        assert_eq!(errors, 0, "fan-out must not error");
+        dw.flush();
+        (applied, rec)
+    }
+
+    /// (a) A fan-out that moves publishedAt from one FUTURE time to ANOTHER
+    /// future time must reschedule the deferred slot in place: a single
+    /// deferred_alive at the NEW future key, no bitmap writes, doc updated.
+    #[test]
+    fn test_deferred_fanout_future_to_future_stays_deferred() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 7;
+        let post_id: i64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_deferred_image(&engine, &meta, slot, post_id, now - 3600, now + 3600);
+
+        let t2 = now + 7200; // a DIFFERENT future time
+        let (applied, rec) = apply_fanout_recording(
+            &engine,
+            &meta,
+            post_id,
+            vec![
+                Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+                Op::Set { field: "publishedAt".into(), value: json!(t2) },
+            ],
+        );
+        assert_eq!(applied, 1, "fan-out must reach the deferred slot");
+        // Rescheduled to the NEW future key, and only that.
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, t2 as u64)],
+            "must reschedule the deferred slot to t2"
+        );
+        // Deferred arm writes NO bitmaps (that's what keeps it out of feeds).
+        assert!(
+            rec.filter_inserts.is_empty() && rec.sort_sets.is_empty(),
+            "deferred reschedule must not touch bitmaps"
+        );
+        // Doc carries the new schedule so activation later replays t2.
+        assert_eq!(doc_int_field(&engine, slot, "publishedAt"), Some(t2));
+    }
+
+    /// (b) A fan-out that CLEARS publishedAt (unpublish → revert to draft) must
+    /// schedule the deferred slot for IMMEDIATE activation (deferred_alive at
+    /// ~now), mirroring the direct-op unschedule path.
+    #[test]
+    fn test_deferred_fanout_unpublish_activates_as_draft() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 7;
+        let post_id: i64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_deferred_image(&engine, &meta, slot, post_id, now - 3600, now + 3600);
+
+        // Unpublish: source cleared, no future timestamp.
+        let (applied, rec) = apply_fanout_recording(
+            &engine,
+            &meta,
+            post_id,
+            vec![Op::Set { field: "publishedAt".into(), value: serde_json::Value::Null }],
+        );
+        assert_eq!(applied, 1, "fan-out must reach the deferred slot");
+        assert_eq!(rec.deferred_alive.len(), 1, "must emit one (immediate) activation");
+        let (s, at) = rec.deferred_alive[0];
+        assert_eq!(s, slot);
+        assert!(
+            (at as i64) >= now - 5 && (at as i64) <= now + 5,
+            "unpublish must activate immediately (~now), got {at}"
+        );
+        assert!(
+            rec.filter_inserts.is_empty() && rec.sort_sets.is_empty(),
+            "deferred activation defers bitmap rebuild to replay, writes none here"
+        );
+    }
+
+    /// (c) A NON-publish fan-out (touches no deferred source field) must NOT
+    /// reach deferred slots — the cost gate. No deferred_alive emitted, and the
+    /// deferred slot's doc is left untouched (the gate returns before any scan
+    /// or docstore write).
+    #[test]
+    fn test_nonpublish_fanout_does_not_touch_deferred() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 7;
+        let post_id: i64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_deferred_image(&engine, &meta, slot, post_id, now - 3600, now + 3600);
+
+        // A tag fan-out — no write to publishedAt (the deferred source).
+        let (applied, rec) = apply_fanout_recording(
+            &engine,
+            &meta,
+            post_id,
+            vec![Op::Add { field: "tagIds".into(), value: json!(42) }],
+        );
+        // No alive images in this post, and the deferred slot is gated out.
+        assert_eq!(applied, 0, "non-publish fan-out must apply nothing here");
+        assert!(rec.deferred_alive.is_empty(), "gate: no deferred reschedule");
+        assert!(engine.is_slot_deferred(slot), "deferred slot must remain deferred");
+        // Gate proof: had the deferred-reach pass run, it would have written
+        // tagIds=42 into the deferred slot's doc. It must not.
+        let doc = engine.get_document(slot).unwrap().unwrap();
+        let has_tag = matches!(
+            doc.fields.get("tagIds"),
+            Some(crate::mutation::FieldValue::Multi(v))
+                if v.contains(&crate::query::Value::Integer(42))
+        );
+        assert!(!has_tag, "non-publish fan-out must not reach the deferred slot's doc");
+    }
+
+    /// (d) A mixed post — one alive image, one deferred image — early-published.
+    /// Both arms apply exactly once: the alive image via the bitmap match
+    /// (publishedAt sort write), the deferred image via the deferred-reach pass
+    /// (a single deferred_alive). No double application of either slot.
+    #[test]
+    fn test_mixed_post_publish_fanout_both_arms() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let post_id: i64 = 100;
+        let alive_slot: u32 = 7;
+        let deferred_slot: u32 = 8;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let existed = now - 3600;
+
+        // Alive draft image (no publishedAt → alive, postId bit set).
+        {
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: alive_slot as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "postId".into(), value: json!(post_id) },
+                    Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                    Op::Set { field: "existedAt".into(), value: json!(existed) },
+                ],
+            }];
+            let (applied, _, errors) =
+                apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            assert_eq!((applied, errors), (1, 0));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.flush();
+        }
+        wait_for_alive_slot(&engine, alive_slot, 5_000);
+        // Deferred image scheduled for the future.
+        insert_deferred_image(&engine, &meta, deferred_slot, post_id, existed, now + 3600);
+
+        // Early-publish the whole post.
+        let t_pub = now - 5;
+        let (applied, rec) = apply_fanout_recording(
+            &engine,
+            &meta,
+            post_id,
+            vec![
+                Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+                Op::Set { field: "publishedAt".into(), value: json!(t_pub) },
+            ],
+        );
+        // Exactly two applied: one bitmap-matched (alive) + one deferred-reached.
+        assert_eq!(applied, 2, "both arms apply exactly once");
+        // Deferred arm: exactly the deferred slot rescheduled to the past time
+        // (activates next flush cycle) — never the alive slot.
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(deferred_slot, t_pub as u64)],
+            "only the deferred image is rescheduled, at t_pub"
+        );
+        // Bitmap arm: the alive slot's publishedAt sort layers were written; the
+        // deferred slot never touches bitmaps.
+        assert!(
+            rec.sort_sets.iter().any(|(f, _, s)| f == "publishedAt" && *s == alive_slot),
+            "alive image published via the bitmap arm"
+        );
+        assert!(
+            !rec.sort_sets.iter().any(|(_, _, s)| *s == deferred_slot)
+                && !rec.filter_inserts.iter().any(|(_, _, s)| *s == deferred_slot),
+            "deferred image must not get bitmap writes (no double application)"
         );
     }
 
