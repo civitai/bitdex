@@ -319,10 +319,18 @@ impl Metrics {
         )
         .unwrap();
 
-        // Tuned for production: 100% of queries land under 50ms with doc cache.
-        // Dense sub-ms resolution where most queries live, sparse upper for outliers.
+        // Dense sub-ms resolution where most queries live, plus <=2.5x steps through
+        // the 50ms-1s tail. The tail resolution is load-bearing: at 104M scale ~2% of
+        // queries exceed 100ms, so the 99th percentile lands in the tail, not the head.
+        // An earlier ladder jumped 0.1 -> 0.5 on the assumption that everything stayed
+        // under 50ms. Once that stopped holding, p99 fell inside that single 400ms-wide
+        // bucket, where histogram_quantile can only interpolate linearly — exact if the
+        // samples inside are uniform, but real tails are heavy, so it over-reported by
+        // ~31% against a Pareto-shaped tail (434ms reported vs 332ms actual). Keeping
+        // adjacent ratios <=2.5x bounds that error to ~1%.
         let query_buckets = vec![
-            0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0,
+            0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05,
+            0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0,
         ];
         let query_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -335,9 +343,10 @@ impl Metrics {
         .unwrap();
 
         // HTTP round-trip: wall-clock from request arrival to response sent.
-        // Wide buckets to catch the gap between fast queries and slow responses.
+        // Carries [method, path] labels, so each bucket costs one series per route —
+        // kept deliberately leaner than the single-combo query ladders below.
         let http_buckets = vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
         ];
         let http_response_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -362,7 +371,14 @@ impl Metrics {
         )
         .unwrap();
 
-        let phase_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+        // Per-phase query ladders (filter/sort/docs). Each carries only an `index`
+        // label, so extra buckets cost one series apiece — cheap enough to resolve
+        // both ends. The head matters (filter's median is under 10us) and so does
+        // the tail (sort's p99 sits in the 100-500ms range and drives total p99).
+        let phase_buckets = vec![
+            0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025,
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 5.0,
+        ];
         let query_filter_seconds = HistogramVec::new(
             HistogramOpts::new("bitdex_query_filter_seconds", "Bitmap filter evaluation time")
                 .buckets(phase_buckets.clone()),
@@ -667,7 +683,9 @@ impl Metrics {
                 "bitdex_time_bucket_reconcile_apply_seconds",
                 "Wall time of the on-flush-thread reconcile apply (re-validate candidates + prune/backfill mutate), in seconds. Distinct from the off-thread scan; bounds the flush-thread blocking cost.",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
+            .buckets(vec![
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+            ]),
             &["index"],
         )
         .unwrap();
@@ -745,7 +763,13 @@ impl Metrics {
                 "bitdex_cache_worker_cycle_seconds",
                 "Wall-clock duration of each async cache worker cycle, in seconds.",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+            // Resolution concentrated around the observed 100ms-1s working range so
+            // cycles creeping toward the max_maintenance_ms budget are visible before
+            // they hit it, with headroom out to 10s for pathological batches.
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
+                0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0,
+            ]),
             &["index"],
         )
         .unwrap();
@@ -838,7 +862,12 @@ impl Metrics {
         )
         .unwrap();
 
-        let lazy_load_buckets = vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0];
+        // Carries [index, field] labels. Most lazy loads are already-warm no-ops well
+        // under 1ms; the slow first-touch loads run to tens of seconds at 105M scale.
+        let lazy_load_buckets = vec![
+            0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+            0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+        ];
         let lazy_load_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_lazy_load_duration_seconds",
@@ -980,8 +1009,14 @@ impl Metrics {
             &["index"],
         ).unwrap();
 
-        // Phase 2.5: DocStore I/O observability
-        let docstore_read_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+        // Phase 2.5: DocStore I/O observability.
+        // Bimodal by construction: DocCache hits land under 10us, disk reads land in
+        // the ms-to-100ms range. Both modes need resolution — the whole point of the
+        // metric is telling them apart.
+        let docstore_read_buckets = vec![
+            0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025,
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5,
+        ];
         let docstore_read_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_docstore_read_seconds",
@@ -1119,7 +1154,10 @@ impl Metrics {
             HistogramOpts::new(
                 "bitdex_sync_cycle_duration_seconds",
                 "WAL reader cycle processing duration",
-            ).buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            ).buckets(vec![
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15,
+                0.25, 0.5, 0.75, 1.0, 2.5, 5.0,
+            ]),
             &["source"],
         ).unwrap();
         let sync_wal_pending_bytes = IntGaugeVec::new(
@@ -1146,7 +1184,12 @@ impl Metrics {
         let wal_last_applied_timestamp_seconds = IntGauge::new(
             "bitdex_wal_last_applied_timestamp_seconds", "Unix epoch of last successful WAL op application",
         ).unwrap();
-        let wal_append_buckets = vec![0.00001, 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0];
+        // Dominated by the fsync, which lands in the 100us-5ms band — that band needs
+        // the resolution, since a regression there shows up as write throughput loss.
+        let wal_append_buckets = vec![
+            0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005,
+            0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ];
         let wal_append_duration_seconds = Histogram::with_opts(
             HistogramOpts::new(
                 "bitdex_wal_append_duration_seconds",
@@ -1159,10 +1202,13 @@ impl Metrics {
         // queryOpSet fan-out cost (issue #60).
         // Histogram buckets span the full observed range:
         // narrow (postId-eq, ~1 slot) → moderate (modelVersionIds, 1K-100K) → wide
-        // (nsfwLevel-eq, 10M+). Powers of 10 with a 22.9M anchor for the local
-        // nsfwLevel=1 size we measured during the OOM repro work.
+        // (nsfwLevel-eq, 10M+). Powers of 10 above 100; finer below, because prod
+        // fan-out is overwhelmingly single-digit (observed mean ~1.9, median <1) and
+        // this histogram exists to pick a BITDEX_QUERY_OP_SET_MAX_FANOUT cap — a
+        // decision that needs resolution at the low end, where the mass actually is.
         let query_op_set_fanout_buckets = vec![
-            1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0,
+            0.0, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 1_000.0, 10_000.0, 100_000.0,
+            1_000_000.0, 10_000_000.0, 100_000_000.0,
         ];
         let query_op_set_fanout_size = HistogramVec::new(
             HistogramOpts::new(
@@ -1202,7 +1248,8 @@ impl Metrics {
         // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
         // full-walk on the 23M-distinct-value bitmap).
         let apply_seconds_buckets = vec![
-            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075,
+            0.1, 0.15, 0.25, 0.4, 0.5, 0.75, 1.0, 1.5, 2.5, 5.0,
         ];
         let wal_apply_batch_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -1625,5 +1672,137 @@ impl Metrics {
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod bucket_resolution_tests {
+    use super::*;
+
+    /// Pull the registered upper bounds for `name` straight out of the registry, so
+    /// these assertions cover what a scrape actually exposes rather than a literal
+    /// re-declared in the test.
+    fn registered_bounds(m: &Metrics, name: &str) -> Vec<f64> {
+        let families = m.registry.gather();
+        let fam = families
+            .iter()
+            .find(|f| f.get_name() == name)
+            .unwrap_or_else(|| panic!("histogram '{name}' not found in registry"));
+        let metric = fam
+            .get_metric()
+            .first()
+            .unwrap_or_else(|| panic!("histogram '{name}' has no child series; observe into it first"));
+        metric
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .map(|b| b.get_upper_bound())
+            .filter(|b| b.is_finite())
+            .collect()
+    }
+
+    /// Largest ratio between adjacent bounds that overlap [lo, hi].
+    ///
+    /// This is the number that decides whether a quantile in that range is a
+    /// measurement or an interpolation: `histogram_quantile` interpolates linearly
+    /// inside whichever bucket the rank lands in, so a 5x-wide bucket yields a
+    /// reported value that can sit anywhere across a 5x span.
+    fn max_adjacent_ratio(bounds: &[f64], lo: f64, hi: f64) -> (f64, f64, f64) {
+        let mut worst = (1.0, 0.0, 0.0);
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if b < lo || a > hi {
+                continue;
+            }
+            let ratio = b / a;
+            if ratio > worst.0 {
+                worst = (ratio, a, b);
+            }
+        }
+        worst
+    }
+
+    /// Every latency histogram must resolve the range its quantiles actually land in.
+    ///
+    /// Regression guard for the 0.1 -> 0.5 gap in `query_duration_seconds`: with no
+    /// bound between them, every reported p99 in the 100-500ms band was linear
+    /// interpolation across one bucket, and moved with the cache-hit mix rather than
+    /// with latency. Zones below are the observed prod quantile ranges at ~90 qps /
+    /// 104M records; the 2.5x ceiling keeps interpolation error bounded and small.
+    #[test]
+    fn latency_histograms_resolve_their_quantile_range() {
+        let m = Metrics::new();
+
+        // Instantiate one child per histogram so the registry exposes its bounds.
+        m.query_duration_seconds.with_label_values(&["t"]).observe(0.2);
+        m.query_filter_seconds.with_label_values(&["t"]).observe(0.02);
+        m.query_sort_seconds.with_label_values(&["t"]).observe(0.2);
+        m.query_docs_seconds.with_label_values(&["t"]).observe(0.06);
+        m.docstore_read_seconds.with_label_values(&["t"]).observe(0.02);
+        m.cache_worker_cycle_seconds.with_label_values(&["t"]).observe(0.4);
+        m.wal_append_duration_seconds.observe(0.002);
+        m.wal_apply_batch_seconds.with_label_values(&["t"]).observe(0.02);
+        m.bitmap_mem_scan_tick_seconds.with_label_values(&["t"]).observe(0.03);
+        m.sync_cycle_duration_seconds.with_label_values(&["t"]).observe(0.02);
+        m.http_response_seconds.with_label_values(&["GET", "/t"]).observe(0.01);
+        m.time_bucket_reconcile_apply_seconds.with_label_values(&["t"]).observe(0.005);
+
+        // (metric, zone_lo, zone_hi, max_ratio) — zone = observed prod p50..p99 span.
+        let cases: &[(&str, f64, f64, f64)] = &[
+            ("bitdex_query_duration_seconds", 0.05, 1.0, 2.5),
+            ("bitdex_query_sort_seconds", 0.05, 1.0, 2.5),
+            ("bitdex_query_docs_seconds", 0.005, 0.5, 2.5),
+            ("bitdex_query_filter_seconds", 0.001, 0.1, 2.5),
+            ("bitdex_docstore_read_seconds", 0.0005, 0.25, 2.5),
+            ("bitdex_cache_worker_cycle_seconds", 0.1, 5.0, 2.5),
+            ("bitdex_wal_append_duration_seconds", 0.0001, 0.01, 2.5),
+            ("bitdex_wal_apply_batch_seconds", 0.001, 0.5, 2.5),
+            ("bitdex_bitmap_mem_scan_tick_seconds", 0.001, 0.5, 2.5),
+            ("bitdex_sync_cycle_duration_seconds", 0.001, 0.5, 2.5),
+            ("bitdex_http_response_seconds", 0.001, 0.5, 2.5),
+            ("bitdex_time_bucket_reconcile_apply_seconds", 0.001, 0.01, 2.5),
+        ];
+
+        for &(name, lo, hi, max_ratio) in cases {
+            let bounds = registered_bounds(&m, name);
+            let (ratio, a, b) = max_adjacent_ratio(&bounds, lo, hi);
+            assert!(
+                ratio <= max_ratio,
+                "{name}: bucket [{a}..{b}] spans {ratio:.1}x inside the {lo}..{hi} quantile zone \
+                 (max {max_ratio}x). A quantile landing there is interpolated across that span, \
+                 not measured. Add bounds between {a} and {b}."
+            );
+        }
+    }
+
+    /// The p99 of the headline query metric must land on a real bound, not inside a
+    /// wide bucket, for the tail where prod actually sits (~2% of queries >100ms).
+    #[test]
+    fn query_duration_covers_the_hundred_to_five_hundred_ms_tail() {
+        let m = Metrics::new();
+        m.query_duration_seconds.with_label_values(&["t"]).observe(0.2);
+        let bounds = registered_bounds(&m, "bitdex_query_duration_seconds");
+
+        let tail: Vec<f64> = bounds.iter().copied().filter(|&b| b > 0.1 && b < 0.5).collect();
+        assert!(
+            tail.len() >= 3,
+            "expected >=3 bounds strictly between 100ms and 500ms, found {tail:?}. \
+             Without them every p99 in that band is interpolated across one 400ms bucket."
+        );
+    }
+
+    /// Fan-out is a sizing input for BITDEX_QUERY_OP_SET_MAX_FANOUT, and prod fan-out
+    /// is overwhelmingly single-digit — powers of 10 alone cannot resolve that.
+    #[test]
+    fn op_set_fanout_resolves_the_single_digit_range() {
+        let m = Metrics::new();
+        m.query_op_set_fanout_size.with_label_values(&["t"]).observe(2.0);
+        let bounds = registered_bounds(&m, "bitdex_query_op_set_fanout_size");
+
+        let low: Vec<f64> = bounds.iter().copied().filter(|&b| b > 0.0 && b <= 10.0).collect();
+        assert!(
+            low.len() >= 4,
+            "expected >=4 bounds in 0<b<=10 (observed prod mean ~1.9), found {low:?}"
+        );
     }
 }
