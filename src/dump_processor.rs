@@ -1841,6 +1841,25 @@ pub fn process_dump_with_progress(
     );
     let doc_field_plan_ref = &doc_field_plan;
 
+    // Deferred rows must store the exists_boolean shadow (e.g. isPublished) as
+    // FALSE, matching the ops-path deferred branch — `diff_document` keeps the
+    // shadow out of the stored doc until activation, when it is re-derived.
+    // `execute_doc_plan` instead derives it TRUE from a non-null (future)
+    // publishedAt, so a deferred/scheduled row's doc claimed isPublished=true
+    // before go-live: GET /documents reported scheduled content as published,
+    // and the doc disagreed with the (correctly-absent) shadow bitmap. The
+    // stored value is ignored at activation (re-derived), so forcing it false
+    // here only corrects pre-activation reads. Collect the shadow doc-field
+    // indices so the deferred branch can override them.
+    let deferred_shadow_indices: std::collections::HashSet<u16> = config
+        .data_schema
+        .fields
+        .iter()
+        .filter(|fm| matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean))
+        .filter_map(|fm| bulk_writer.field_to_idx().get(&fm.target).copied())
+        .collect();
+    let deferred_shadow_indices_ref = &deferred_shadow_indices;
+
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
@@ -2061,6 +2080,16 @@ pub fn process_dump_with_progress(
                                     &config_computed_sort_vals,
                                     &mut doc_fields,
                                 );
+                                // Force exists_boolean shadows (isPublished) to
+                                // FALSE for the deferred doc — the slot is not
+                                // published until activation, matching the
+                                // ops-path deferred branch.
+                                if !deferred_shadow_indices_ref.is_empty() {
+                                    force_deferred_shadows_false(
+                                        &mut doc_fields,
+                                        deferred_shadow_indices_ref,
+                                    );
+                                }
                                 if !doc_fields.is_empty() {
                                     encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
                                     bulk_writer.append_merge_payload(slot, &doc_encode_buf);
@@ -3387,6 +3416,28 @@ pub(crate) enum DumpFieldValue<'a> {
     MultiInt(Vec<i64>),
 }
 
+/// Force exists_boolean shadow doc fields (e.g. `isPublished`) to FALSE for a
+/// deferred row's stored doc. The ops-path deferred branch keeps the shadow out
+/// of the stored doc until activation; the dump's enrichment instead derives it
+/// TRUE from a non-null (future) publishedAt, so a scheduled row's doc claimed
+/// `isPublished=true` before go-live and disagreed with its (correctly-absent)
+/// shadow bitmap. The stored shadow is ignored at activation — `diff_document`
+/// re-derives it from the source field — so overriding it here only corrects
+/// pre-activation reads and doc/bitmap agreement. Overrides in place when the
+/// enrichment already emitted the shadow; inserts false otherwise.
+pub(crate) fn force_deferred_shadows_false(
+    doc_fields: &mut Vec<(u16, DumpFieldValue<'_>)>,
+    shadow_indices: &std::collections::HashSet<u16>,
+) {
+    for &sidx in shadow_indices.iter() {
+        if let Some(entry) = doc_fields.iter_mut().find(|(i, _)| *i == sidx) {
+            entry.1 = DumpFieldValue::Bool(false);
+        } else {
+            doc_fields.push((sidx, DumpFieldValue::Bool(false)));
+        }
+    }
+}
+
 /// Encode a DocOp::Merge from DumpFieldValues into a buffer.
 /// Same wire format as `DocOpCodec::encode_op` for `DocOp::Merge` but writes
 /// directly from borrowed refs — no PackedValue / String allocation.
@@ -3664,6 +3715,54 @@ pub(crate) fn execute_doc_plan<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (deferred activation-miss hunt, 2026-07-14): a dump-seeded
+    /// deferred row's stored doc must carry the exists_boolean shadow
+    /// (isPublished) as FALSE, so GET /documents doesn't claim a scheduled post
+    /// is published pre-go-live and the doc agrees with its (absent) shadow
+    /// bitmap. `execute_doc_plan` derives it TRUE from the future publishedAt;
+    /// `force_deferred_shadows_false` corrects it.
+    #[test]
+    fn test_force_deferred_shadows_false() {
+        let shadow_idx: std::collections::HashSet<u16> = [5u16].into_iter().collect();
+
+        // Case 1: enrichment already emitted isPublished=true → overridden false;
+        // non-shadow fields (postId at idx 0, publishedAt at idx 3) untouched.
+        let mut fields = vec![
+            (0u16, DumpFieldValue::Int(29761757)),
+            (3u16, DumpFieldValue::Int(1784069100)),
+            (5u16, DumpFieldValue::Bool(true)),
+        ];
+        force_deferred_shadows_false(&mut fields, &shadow_idx);
+        assert!(
+            matches!(fields.iter().find(|(i, _)| *i == 5).unwrap().1, DumpFieldValue::Bool(false)),
+            "shadow must be forced false"
+        );
+        assert!(
+            matches!(fields.iter().find(|(i, _)| *i == 0).unwrap().1, DumpFieldValue::Int(29761757)),
+            "non-shadow postId must be untouched"
+        );
+        assert!(
+            matches!(fields.iter().find(|(i, _)| *i == 3).unwrap().1, DumpFieldValue::Int(1784069100)),
+            "non-shadow publishedAt must be untouched"
+        );
+
+        // Case 2: shadow absent from the doc → inserted as false.
+        let mut fields2 = vec![(0u16, DumpFieldValue::Int(1))];
+        force_deferred_shadows_false(&mut fields2, &shadow_idx);
+        assert!(
+            matches!(fields2.iter().find(|(i, _)| *i == 5).unwrap().1, DumpFieldValue::Bool(false)),
+            "absent shadow must be inserted false"
+        );
+
+        // Case 3: empty shadow set → no-op.
+        let mut fields3 = vec![(5u16, DumpFieldValue::Bool(true))];
+        force_deferred_shadows_false(&mut fields3, &std::collections::HashSet::new());
+        assert!(
+            matches!(fields3[0].1, DumpFieldValue::Bool(true)),
+            "empty shadow set must leave fields unchanged"
+        );
+    }
 
     #[test]
     fn test_parse_dump_request() {
