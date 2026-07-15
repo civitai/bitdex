@@ -1930,7 +1930,10 @@ impl OrphanVerdict {
 /// What one `verify_recent_activations` pass did.
 ///
 /// `redriven`, `publish_lag` and `inconclusive` are mutually exclusive and
-/// together account for every checked slot that was not already indexed.
+/// together account for every checked slot whose membership was successfully
+/// determined and found absent. A slot whose re-read fails is requeued, not
+/// counted — `checked` is incremented before the read, so it can exceed the
+/// sum of the three counters on any given pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VerifyOutcome {
     /// Activated slots examined (had a membership value to verify).
@@ -2118,7 +2121,17 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
         ));
         let reread_present = match engine.execute_query(&query) {
             Ok(r) => r.ids.iter().any(|&id| id == slot as i64),
-            Err(_) => false,
+            // A failed re-read is UNKNOWN, not absent. Collapsing it to `false`
+            // would classify it NonApply behind a completed barrier and bump
+            // `redriven_total` — an unknown counted as a confirmed drop, which
+            // is the exact conflation this verdict split exists to remove. The
+            // first query (above) already treats its own Err as unknown and
+            // requeues; do the same here rather than let a transient read
+            // failure page an operator with a phantom drop.
+            Err(_) => {
+                requeue.push(slot); // transient read failure — re-check next pass
+                continue;
+            }
         };
         let recent_removes =
             engine.recent_removes_for_slot(slot, diag_now_ms.saturating_sub(5_000));
