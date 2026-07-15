@@ -5432,6 +5432,168 @@ mod tests {
         );
     }
 
+    /// THE ORDERING CONTRACT the verifier's soundness rests on:
+    /// **the publish count must never advance before the snapshot it describes.**
+    ///
+    /// The verifier proves a slot's batch is visible by watching the count pass
+    /// the value recorded at enqueue. That proof lives across two modules and is
+    /// held only by program order inside the flush loop — `inner.store` before
+    /// `flush_pub_count.fetch_add`, one increment site, both in the same cycle.
+    /// A refactor can break that silently and no type will complain, so it is
+    /// pinned here: move the increment above the store and this test fails.
+    ///
+    /// Checks the direction that can actually hurt us. Publishing WITHOUT
+    /// incrementing is safe (the ForcePublish handlers do it, and the verifier
+    /// just waits for the next main-loop publish); incrementing without
+    /// publishing is what would let the verifier read pre-publish state and
+    /// report a healthy post as dropped.
+    #[test]
+    fn test_publish_count_advances_only_after_publish() {
+        let config = safety_net_config();
+        let engine = ConcurrentEngine::new(config).unwrap();
+
+        // Write, then wait for the count to move. Whenever it moves, the write
+        // it covers must already be readable — that is the whole contract.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(4242)),
+        );
+        let doc = crate::mutation::Document { fields };
+        let before = engine.publish_count_acquire();
+        engine.put(4242, &doc).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // Acquire-load FIRST, then read the snapshot. If the count has moved
+            // past `before`, the publish carrying slot 4242 has landed and the
+            // snapshot read below MUST see it. Reading in this order is what the
+            // Release/Acquire pair makes meaningful — with a Relaxed counter this
+            // would still pass on x86 and could fail elsewhere.
+            if engine.publish_count_acquire() > before {
+                assert!(
+                    engine.is_slot_alive(4242),
+                    "publish count advanced past the write's enqueue value, but the \
+                     write is not visible — the counter is running AHEAD of the \
+                     publish it certifies. The verifier would read pre-publish \
+                     state and report a phantom drop."
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publish count never advanced after a write — flush thread stalled?"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A test engine that has published at least once, so slots tagged 0 are
+    /// drainable. An IDLE engine never publishes — nothing is dirty, so the
+    /// count legitimately stays at 0 — which is itself the design working: with
+    /// no publish, nothing is provably visible and nothing may be judged.
+    #[cfg(test)]
+    fn engine_past_first_publish(config: crate::config::Config) -> ConcurrentEngine {
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(1)),
+        );
+        engine
+            .put(1, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.publish_count_acquire() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+    }
+
+    /// The tag must be read at ENQUEUE, not at drain.
+    ///
+    /// A slot is only drainable once the live publish count EXCEEDS the value it
+    /// carries. Reading that value at drain time instead would fold in the very
+    /// publish being waited on, making every slot look ready immediately — the
+    /// check would compile, pass, and do nothing. This pins the gate itself:
+    /// a slot tagged with a count at or above the live one is NOT drainable, and
+    /// becomes drainable exactly when the count passes it.
+    #[test]
+    fn test_verify_waits_for_the_publish_of_its_own_batch() {
+        let engine = engine_past_first_publish(safety_net_config());
+
+        // Gated on a publish count no run will reach: it must stay put.
+        engine.push_activation_verify_gated_for_test(
+            &[7],
+            crate::concurrent_engine::VerifyGate::AfterPublish(u64::MAX),
+        );
+        assert_eq!(
+            engine.drain_activation_verify(100),
+            Vec::<u32>::new(),
+            "a slot whose batch is not yet published must NOT be handed to the \
+             verifier — judging it now is exactly the pre-publish read that \
+             manufactures false orphans"
+        );
+        assert_eq!(engine.activation_verify_len(), 1, "it stays queued, not dropped");
+        assert_eq!(engine.activation_verify_ready_len(), 0);
+
+        // The mirror case, on a fresh ring: a slot whose batch IS provably
+        // published must be handed over. (Fresh, because a ring holding the
+        // unpublished slot above would legitimately stop the drain there —
+        // production tags are non-decreasing, so MAX-then-0 cannot occur.)
+        let engine = engine_past_first_publish(safety_net_config());
+        engine.push_activation_verify_gated_for_test(
+            &[8],
+            crate::concurrent_engine::VerifyGate::AfterPublish(0),
+        );
+        assert!(
+            engine.publish_count_acquire() > 0,
+            "precondition: a publish has happened, so the gate at 0 is passed"
+        );
+        assert_eq!(
+            engine.drain_activation_verify(100),
+            vec![8],
+            "a slot whose batch is provably published must be verifiable — the \
+             gate must delay judgement, never prevent it"
+        );
+    }
+
+    /// The ring's ordering is STRUCTURAL, and the drain relies on it: it stops at
+    /// the first unpublished entry, which is only sound if nothing behind that
+    /// entry can be ready. Tags come from a single flush thread reading a
+    /// monotonic counter, so the ring is always non-decreasing — no config knob
+    /// can perturb it (unlike a time-based delay, where a hot-reloaded interval
+    /// could). Cheap to hold, so hold it: otherwise the short-circuit silently
+    /// becomes "drop slots on the floor" or gets "fixed" into a full scan on
+    /// every WAL batch.
+    #[test]
+    fn test_drain_stops_at_first_unpublished_and_keeps_the_rest() {
+        let engine = engine_past_first_publish(safety_net_config());
+
+        // Ready, ready, NOT-ready, ready — in ring order.
+        use crate::concurrent_engine::VerifyGate::AfterPublish;
+        engine.push_activation_verify_gated_for_test(&[1, 2], AfterPublish(0));
+        engine.push_activation_verify_gated_for_test(&[3], AfterPublish(u64::MAX));
+        engine.push_activation_verify_gated_for_test(&[4], AfterPublish(0));
+
+        let drained = engine.drain_activation_verify(100);
+        assert_eq!(
+            drained,
+            vec![1, 2],
+            "the drain must stop at the first unpublished slot rather than skip it"
+        );
+        assert_eq!(
+            engine.activation_verify_len(),
+            2,
+            "the unpublished slot AND everything behind it stay queued — a slot \
+             must never be silently discarded by the short-circuit"
+        );
+    }
+
     /// Post-activation verifier (deferred activation-miss backstop): an ALIVE
     /// slot whose stored doc carries a postId but whose postId FILTER bitmap was
     /// never set (the orphan signature — activated but the postId insert dropped)
@@ -5924,7 +6086,16 @@ mod tests {
             );
             // Queue for verification and persist the ring (what the flush thread
             // does on an activation cycle), then let a merge persist bitmaps.
-            engine.push_activation_verify_for_test(&[orphan]);
+            //
+            // Tagged with a HIGH publish count, the way a real slot enqueued
+            // after thousands of flush cycles would be. That detail is what
+            // makes this test able to fail: the publish counter is process-local
+            // and restarts at 0, so a tag that survives the restart intact can
+            // never be passed. See the assertions on the second engine.
+            engine.push_activation_verify_gated_for_test(
+                &[orphan],
+                crate::concurrent_engine::VerifyGate::AfterPublish(5_000),
+            );
             engine.persist_activation_verify_for_test();
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(engine);
@@ -5938,8 +6109,29 @@ mod tests {
             "orphan still not in postId after restart (bitmap was never set)"
         );
 
+        // Deliberately NOT waiting for a publish: a restored slot has no
+        // in-flight batch, so it must be verifiable immediately. Requiring a
+        // publish here would strand it on any index quiet enough not to write.
+        assert_eq!(
+            engine2.publish_count_acquire(),
+            0,
+            "precondition: a freshly booted, idle engine has published nothing — \
+             which is exactly the state a restored slot must be verifiable in"
+        );
+
         let outcome = verify_recent_activations(&engine2, 100);
-        assert_eq!(outcome.checked, 1, "the reloaded ring must present the orphan");
+        // THE REHYDRATE SEAM: the slot was enqueued at count 5000, but this
+        // process's counter restarted at 0. It is verifiable only because the
+        // loader re-stamped the tag. Persist the tag verbatim instead and this
+        // assertion reads checked=0 — the slot stranded in the ring forever,
+        // silently, which is the failure with no signal attached.
+        assert_eq!(
+            outcome.checked, 1,
+            "a slot restored from the persisted ring must still be verified — if this \
+             is 0, its publish-count tag survived the restart and now names a count \
+             this process will never reach, so the slot is stranded unverified with \
+             no log, no counter and no alarm"
+        );
         assert_eq!(outcome.redriven, 1, "the reloaded orphan must be re-driven");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

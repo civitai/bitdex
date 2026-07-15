@@ -300,6 +300,63 @@ enum LazyLoad {
         slots: crate::slot::SlotAllocator,
     },
 }
+/// A slot awaiting post-activation verification, tagged with the publish count
+/// observed when it was queued.
+///
+/// The tag is what lets the verifier prove — rather than assume — that the
+/// slot's activation batch is visible before judging it absent. The flush
+/// thread applies the batch, reads the publish count as `enqueued_at_publish`,
+/// then publishes and increments. So once the live count exceeds
+/// `enqueued_at_publish`, the batch is provably in the published snapshot and
+/// "absent" means absent.
+///
+/// This replaces a force-publish barrier the verifier used to run inline: it
+/// waited a bounded time for a publish it could not make happen faster, timed
+/// out on a large share of them, and then had to guess. Observing a publish
+/// costs nothing and cannot time out. See `drain_activation_verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingVerify {
+    pub slot: u32,
+    pub gate: VerifyGate,
+}
+
+/// What a pending slot is waiting for before it can be judged.
+///
+/// Not a bare `u64`: a slot restored from disk has NOTHING to wait for — its
+/// state is already in the boot snapshot — and no count can express that,
+/// because the gate is "count has moved PAST my tag" and the counter starts at
+/// 0. Encoding "nothing to wait for" as a number would mean either stranding
+/// restored slots on a quiet index (no writes ⇒ no publish ⇒ no verification,
+/// silently) or loosening the comparison for everyone and letting live slots be
+/// judged before their batch is published. The two cases are genuinely
+/// different, so they are two variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyGate {
+    /// Verifiable now. Used for slots rehydrated at boot: whatever happened to
+    /// them happened before the restart, and the restored state is already in
+    /// the snapshot the verifier will read — there is no in-flight batch.
+    Ready,
+    /// Verifiable once the publish count EXCEEDS this value — the slot's
+    /// activation batch was applied by the cycle that recorded it, and becomes
+    /// visible when that cycle publishes.
+    ///
+    /// The value MUST be read on the flush thread while queueing (before that
+    /// cycle's publish), never at drain time — a value read at drain would
+    /// already include the publish it is meant to be waiting for, silently
+    /// inverting the check into "always ready".
+    AfterPublish(u64),
+}
+
+impl VerifyGate {
+    /// Whether this slot may be judged, given the live publish count.
+    fn is_open(self, published: u64) -> bool {
+        match self {
+            Self::Ready => true,
+            Self::AfterPublish(c) => published > c,
+        }
+    }
+}
+
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
 /// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
@@ -504,7 +561,7 @@ pub struct ConcurrentEngine {
     /// activation can leave an unverified orphan — bounded and rare, further
     /// bounded by the overdue sweep; the read-miss re-defer removes the known
     /// cause. See `push_activation_verify` / `drain_activation_verify`.
-    activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>>,
+    activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<PendingVerify>>>,
     /// Diagnostic ring of recently-applied remove-shaped ops (alive/filter/sort),
     /// used by the activation-orphan verifier to distinguish a whole-batch
     /// NON-APPLY from an explicit REVERT of a just-activated slot. Bounded
@@ -1215,10 +1272,44 @@ impl ConcurrentEngine {
         // before a crash — not yet verified — are re-checked on restart
         // (closes the in-memory ring's boot-gap; the overdue sweep can't see
         // an activation orphan). Idempotent: re-verifying a healthy slot no-ops.
-        let seeded_verify: std::collections::VecDeque<u32> = meta_store
+        //
+        // RE-STAMP, don't restore: every rehydrated slot comes back as
+        // `VerifyGate::Ready`.
+        //
+        // Two reasons, and both are load-bearing. First, a restored slot has
+        // NOTHING to wait for — its state was published before the restart and
+        // is already in the snapshot built below, so there is no in-flight batch
+        // and gating it on a future publish would strand it on any index quiet
+        // enough not to write (no writes ⇒ nothing dirty ⇒ no publish ⇒ no
+        // verification, silently). Second, `flush_publish_count` is
+        // process-local and starts at 0, so a count carried over from the
+        // previous process would name a value this one may never reach — the
+        // same permanent, unsignalled stranding. Silent non-verification is the
+        // one failure mode with nothing attached to it: no log line, no counter,
+        // no alarm. A slot that quietly stops being watched looks exactly like a
+        // slot with nothing wrong.
+        //
+        // Correct in both directions: if the pre-restart batch was genuinely
+        // lost, the slot reads absent after the next publish and is re-driven;
+        // if it landed, it reads present and is dropped. The `!is_loading_mode`
+        // gate on the verifier keeps it out of the restore window meanwhile.
+        // Re-stamping is also why the on-disk format stays a plain slot list —
+        // no tag to serialize, so no version bump and no migration.
+        // Pinned by ops_processor::tests::
+        // test_activation_verify_ring_survives_restart (which enqueues at a HIGH
+        // count precisely so that persisting the tag would strand it).
+        let seeded_verify: std::collections::VecDeque<PendingVerify> = meta_store
             .as_ref()
             .and_then(|ms| ms.load_activation_verify().ok())
-            .map(std::collections::VecDeque::from)
+            .map(|slots| {
+                slots
+                    .into_iter()
+                    .map(|slot| PendingVerify {
+                        slot,
+                        gate: VerifyGate::Ready,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         if !seeded_verify.is_empty() {
             eprintln!(
@@ -1226,7 +1317,7 @@ impl ConcurrentEngine {
                 seeded_verify.len()
             );
         }
-        let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>> =
+        let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<PendingVerify>>> =
             Arc::new(parking_lot::Mutex::new(seeded_verify));
         let flush_activation_verify = Arc::clone(&activation_verify);
         // Diagnostic remove-op ring (activation-orphan non-apply-vs-revert probe).
@@ -1862,12 +1953,32 @@ impl ConcurrentEngine {
                             // exclude them. Bounded ring: drop oldest when over cap
                             // (the overdue sweep + doc/bitmap fixes bound the
                             // orphan population if a burst overflows).
+                            //
+                            // Each slot is tagged with the publish count read
+                            // HERE — on the flush thread, in the same cycle that
+                            // applied its ops (via `coalescer.push_ops` above),
+                            // and BEFORE this cycle's `inner.store` publishes
+                            // them. The verifier waits for the count to pass that
+                            // tag, which is precisely when the batch becomes
+                            // visible, so it never reads pre-publish state and
+                            // never has to guess how long a promote took.
+                            //
+                            // Reading the count at DRAIN time instead would be
+                            // silently wrong: it would already include this
+                            // cycle's publish, making every slot look ready
+                            // immediately — the check would still compile, still
+                            // pass its own unit tests, and do nothing.
+                            // Pinned by ops_processor::tests::
+                            // test_verify_waits_for_the_publish_of_its_own_batch.
                             {
                                 let cap = flush_config.activation_verify.ring_cap;
+                                let gate = VerifyGate::AfterPublish(
+                                    flush_pub_count.load(Ordering::Acquire),
+                                );
                                 let mut q = flush_activation_verify.lock();
                                 for &slot in &activated {
                                     if !redefer_on_read_miss.contains(&slot) {
-                                        q.push_back(slot);
+                                        q.push_back(PendingVerify { slot, gate });
                                     }
                                 }
                                 while q.len() > cap {
@@ -2810,6 +2921,18 @@ impl ConcurrentEngine {
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                            //
+                            // ORDERING CONTRACT — the post-activation verifier's
+                            // soundness depends on this store happening BEFORE
+                            // `flush_pub_count.fetch_add` below, in this same cycle.
+                            // The verifier proves a slot's activation batch is
+                            // published by observing the counter advance past the
+                            // value it recorded at enqueue; if the increment ever
+                            // moves above this store, the verifier can read
+                            // pre-publish state and report a phantom drop on
+                            // `redriven_total`. Do not reorder.
+                            // Pinned by ops_processor::tests::
+                            // test_publish_count_advances_only_after_publish.
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2929,7 +3052,24 @@ impl ConcurrentEngine {
                             }
                             // Record flush stats for Prometheus
                             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
-                            flush_pub_count.fetch_add(1, Ordering::Relaxed);
+                            // ORDERING CONTRACT — see `inner.store` above. This is the
+                            // ONLY site that advances the publish count, and it must
+                            // stay BELOW that store: the verifier treats "count moved
+                            // past the value I recorded at enqueue" as PROOF that the
+                            // snapshot carrying that batch is live. Two consequences:
+                            //   - Never increment without publishing first (that would
+                            //     make the verifier read pre-publish state and raise a
+                            //     phantom drop on `redriven_total`).
+                            //   - Publishing WITHOUT incrementing is safe — the
+                            //     ForcePublish handlers do exactly that, and the
+                            //     verifier simply waits for the next main-loop publish.
+                            // Release (not Relaxed) so a reader that Acquire-loads this
+                            // counter — see `publish_count_acquire` — is guaranteed to
+                            // see the store above. x86-TSO would hide a Relaxed bug
+                            // here; other ISAs would not.
+                            // Pinned by ops_processor::tests::
+                            // test_publish_count_advances_only_after_publish.
+                            flush_pub_count.fetch_add(1, Ordering::Release);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
                             // Yield after publish — snapshot is live, let tokio
@@ -3120,8 +3260,32 @@ impl ConcurrentEngine {
                                 // the verify ring is a recovery hint, not the
                                 // authoritative deferred state, and re-verifying a
                                 // stale/healthy slot on boot is an idempotent no-op.
-                                let verify_snapshot: Vec<u32> =
-                                    flush_activation_verify.lock().iter().copied().collect();
+                                // Slots only. The publish-count tags are
+                                // deliberately NOT persisted, and serializing
+                                // them would be a silent, permanent bug:
+                                // `flush_publish_count` is PROCESS-LOCAL and
+                                // restarts at 0, while this file outlives the
+                                // process. A slot tagged at, say, 5000 and
+                                // restored verbatim would wait for a count that
+                                // restarts below it — `count > 5000` is false
+                                // forever — so it would sit in the ring
+                                // unverified for the life of the pod, with no
+                                // log line, no counter, and no alarm. A slot
+                                // that quietly stops being watched looks exactly
+                                // like a slot with nothing wrong.
+                                //
+                                // "We're losing information, serialize the tag"
+                                // is the reasonable-sounding change that causes
+                                // it. The loader re-stamps instead (see the
+                                // seeding site), which is why this stays a plain
+                                // slot list needing no format version.
+                                // Pinned by ops_processor::tests::
+                                // test_activation_verify_ring_survives_restart.
+                                let verify_snapshot: Vec<u32> = flush_activation_verify
+                                    .lock()
+                                    .iter()
+                                    .map(|p| p.slot)
+                                    .collect();
                                 if let Err(e) = ms.write_activation_verify(&verify_snapshot) {
                                     eprintln!(
                                         "Warning: failed to persist activation-verify ring \
@@ -8336,12 +8500,38 @@ impl ConcurrentEngine {
         );
     }
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
+    ///
+    /// Relaxed — this is the Prometheus/reporting path, where a slightly stale
+    /// count is fine. Do NOT tighten these to serve a correctness consumer:
+    /// `publish_count_acquire` exists for that, so the two uses can't drift into
+    /// each other. See its docs for the ordering that matters.
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
             self.flush_publish_count.load(Ordering::Relaxed),
             self.flush_duration_nanos.load(Ordering::Relaxed),
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
         )
+    }
+    /// Publish count, ACQUIRE-loaded — the post-activation verifier's proof that
+    /// a snapshot is live.
+    ///
+    /// The flush thread applies an activation batch, records this counter's value
+    /// `C` while queueing the slot, publishes the snapshot carrying that batch,
+    /// and only then Release-increments the counter. So for a slot enqueued at
+    /// `C`, observing `publish_count_acquire() > C` PROVES its batch is in the
+    /// published snapshot — no barrier, no waiting, no guess about how long a
+    /// promote takes.
+    ///
+    /// The Acquire is load-bearing, not decoration: it synchronizes-with the
+    /// flush thread's Release increment, which is what makes the preceding
+    /// `inner.store` visible to this thread's subsequent snapshot read. With a
+    /// Relaxed load the counter would still LOOK right on x86 and could read a
+    /// stale snapshot elsewhere — the failure would be an unreproducible phantom
+    /// drop, so the ordering is stated rather than inherited from the ISA.
+    ///
+    /// Deliberately separate from `flush_stats` (Relaxed, reporting-only).
+    pub fn publish_count_acquire(&self) -> u64 {
+        self.flush_publish_count.load(Ordering::Acquire)
     }
     /// Per-phase flush timing in nanoseconds:
     /// `(apply, cache, publish, timebucket, compact, opslog, sort_promote)`.
@@ -8864,14 +9054,49 @@ impl ConcurrentEngine {
         out.dedup();
         out
     }
-    /// Drain up to `limit` recently-activated slots awaiting post-activation
-    /// verification (see the `activation_verify` field). FIFO — the WAL reader
-    /// calls this between batches to re-check each slot is indexed under its
-    /// own postId.
+    /// Drain up to `limit` activated slots whose activation batch is PROVABLY
+    /// published, and which are therefore safe to judge.
+    ///
+    /// A slot is released only once the publish count has moved past the value
+    /// recorded when it was queued (see `PendingVerify` and
+    /// `publish_count_acquire`). Slots still waiting on their publish stay in
+    /// the ring; they are not orphans, and the verifier must not see them —
+    /// reading a slot before its batch is published is exactly how a healthy
+    /// post gets reported as a dropped one.
+    ///
+    /// Stops at the first slot that is not yet published, so the cost is
+    /// proportional to what is returned rather than to the ring's depth. That
+    /// short-circuit is sound because the ring is ordered: the single flush
+    /// thread queues in publish-count order, so nothing behind a not-yet-
+    /// published entry can be ready either. Unlike a time-based delay, no
+    /// config knob can perturb that ordering.
+    ///
+    /// Requeued slots (see `requeue_activation_verify`) go to the back with a
+    /// fresh tag, preserving the same ordering.
     pub fn drain_activation_verify(&self, limit: usize) -> Vec<u32> {
+        let published = self.publish_count_acquire();
         let mut q = self.activation_verify.lock();
-        let n = limit.min(q.len());
-        q.drain(..n).collect()
+        let mut out = Vec::new();
+        while out.len() < limit {
+            match q.front() {
+                Some(p) if p.gate.is_open(published) => {
+                    out.push(p.slot);
+                    q.pop_front();
+                }
+                // Not yet published, or ring empty — everything behind it was
+                // queued no earlier, so nothing further is ready.
+                _ => break,
+            }
+        }
+        out
+    }
+    /// Number of slots whose batch is published and which are ready to verify.
+    /// Diagnostic counterpart to `activation_verify_len` (which counts all
+    /// pending, published or not).
+    pub fn activation_verify_ready_len(&self) -> usize {
+        let published = self.publish_count_acquire();
+        let q = self.activation_verify.lock();
+        q.iter().take_while(|p| p.gate.is_open(published)).count()
     }
     /// Diagnostic: describe a filter value's in-memory VersionedBitmap state for
     /// a slot, in the published snapshot. Used by the post-activation verifier to
@@ -8906,22 +9131,35 @@ impl ConcurrentEngine {
     }
     /// Re-queue slots for a later verify pass (e.g. the doc wasn't readable
     /// this pass). Appended to the back so the ring keeps rotating.
+    ///
+    /// Re-tagged with the CURRENT publish count, so a requeued slot waits for a
+    /// further publish before it is looked at again. That keeps the ring's
+    /// ordering non-decreasing (every existing entry was tagged no later than
+    /// now), which is what lets `drain_activation_verify` stop at the first
+    /// unpublished entry.
     pub fn requeue_activation_verify(&self, slots: &[u32]) {
         if slots.is_empty() {
             return;
         }
+        let gate = VerifyGate::AfterPublish(self.publish_count_acquire());
         let mut q = self.activation_verify.lock();
-        q.extend(slots.iter().copied());
+        q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
-    /// Number of slots pending post-activation verification.
+    /// Number of slots pending post-activation verification, published or not.
+    /// See `activation_verify_ready_len` for the drainable subset.
     pub fn activation_verify_len(&self) -> usize {
         self.activation_verify.lock().len()
     }
-    /// Test-only: enqueue slots for verification directly.
+    /// Test-only: enqueue slots that are immediately verifiable.
     #[cfg(test)]
     pub fn push_activation_verify_for_test(&self, slots: &[u32]) {
+        self.push_activation_verify_gated_for_test(slots, VerifyGate::Ready);
+    }
+    /// Test-only: enqueue slots behind an explicit gate.
+    #[cfg(test)]
+    pub fn push_activation_verify_gated_for_test(&self, slots: &[u32], gate: VerifyGate) {
         let mut q = self.activation_verify.lock();
-        q.extend(slots.iter().copied());
+        q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
     /// Diagnostic: recent remove-shaped ops (alive/filter/sort) applied to a
     /// slot at or after `since_ms` (wall-clock millis), newest last. Used by the
@@ -8964,7 +9202,10 @@ impl ConcurrentEngine {
     #[cfg(test)]
     pub fn persist_activation_verify_for_test(&self) {
         if let Some(ref ms) = self.meta_store {
-            let snapshot: Vec<u32> = self.activation_verify.lock().iter().copied().collect();
+            // Slots only, mirroring the flush thread's persist: tags are
+            // per-boot and re-stamped on load.
+            let snapshot: Vec<u32> =
+                self.activation_verify.lock().iter().map(|p| p.slot).collect();
             ms.write_activation_verify(&snapshot).expect("persist verify ring");
         }
     }
