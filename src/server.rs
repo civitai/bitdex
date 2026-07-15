@@ -5412,8 +5412,47 @@ async fn handle_ready(State(state): State<SharedState>) -> impl IntoResponse {
 /// Memory budget endpoint — shows where every GB of RSS goes.
 /// Bitmap totals run on a blocking thread (can be slow at 107M records).
 /// Designed for manual debugging, not Prometheus scraping.
+#[derive(Deserialize)]
+struct DebugMemoryParams {
+    /// When true, run a heavy per-field scan estimating each filter field's
+    /// *in-memory* footprint (vs serialized) — surfaces which pool owns the
+    /// serialized-vs-resident "blind spot". Off by default (iterates every
+    /// value bitmap).
+    #[serde(default)]
+    deep: bool,
+}
+
+/// Read jemalloc's authoritative allocator stats. Only meaningful when built
+/// with `--features heap-prof` (the prod build); otherwise every field is None.
+/// Returns (allocated, active, resident, mapped, retained, metadata).
+///
+/// `allocated` is the ground-truth *live* app heap (requested-and-not-freed),
+/// so `allocated - tracked_total` is the exact size of what our serialized
+/// tracker fails to account for. `retained` is virtual address space only
+/// (madvise/decay state) — NOT resident RAM; do not add it to a memory budget.
+#[allow(clippy::type_complexity)]
+fn read_jemalloc_stats() -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    #[cfg(feature = "heap-prof")]
+    {
+        // epoch::advance() refreshes the cached stats before reading.
+        if tikv_jemalloc_ctl::epoch::advance().is_ok() {
+            let rd = |r: Result<usize, _>| r.ok().map(|v| v as u64);
+            return (
+                rd(tikv_jemalloc_ctl::stats::allocated::read()),
+                rd(tikv_jemalloc_ctl::stats::active::read()),
+                rd(tikv_jemalloc_ctl::stats::resident::read()),
+                rd(tikv_jemalloc_ctl::stats::mapped::read()),
+                rd(tikv_jemalloc_ctl::stats::retained::read()),
+                rd(tikv_jemalloc_ctl::stats::metadata::read()),
+            );
+        }
+    }
+    (None, None, None, None, None, None)
+}
+
 async fn handle_debug_memory(
     State(state): State<SharedState>,
+    AxumQuery(params): AxumQuery<DebugMemoryParams>,
 ) -> impl IntoResponse {
     let rss_bytes = crate::concurrent_engine::get_rss_bytes() as u64;
 
@@ -5430,7 +5469,8 @@ async fn handle_debug_memory(
         }
     };
 
-    let (slot_bytes, filter_bytes, sort_bytes) = if let Some(engine) = engine {
+    let (slot_bytes, filter_bytes, sort_bytes) = if let Some(ref engine) = engine {
+        let engine = Arc::clone(engine);
         tokio::task::spawn_blocking(move || {
             let (s, f, so) = engine.bitmap_memory_totals();
             (s as u64, f as u64, so as u64)
@@ -5442,6 +5482,57 @@ async fn handle_debug_memory(
     let bitmap_total = slot_bytes + filter_bytes + sort_bytes;
     let tracked_total = bitmap_total + uc_bytes + doc_cache_bytes;
     let untracked = rss_bytes.saturating_sub(tracked_total);
+
+    // Authoritative allocator view. `allocated` is live app heap; the gap
+    // below it and tracked_total is the serialized-accounting blind spot.
+    let (jm_allocated, jm_active, jm_resident, jm_mapped, jm_retained, jm_metadata) =
+        read_jemalloc_stats();
+    let untracked_live_gap = jm_allocated.map(|a| a.saturating_sub(tracked_total));
+    let fragmentation = match (jm_resident, jm_active) {
+        (Some(r), Some(a)) => Some(r.saturating_sub(a)),
+        _ => None,
+    };
+
+    // Optional heavy per-field in-memory estimate (?deep=true).
+    let deep_json = if params.deep {
+        if let Some(ref engine) = engine {
+            let engine = Arc::clone(engine);
+            let report = tokio::task::spawn_blocking(move || engine.filter_inmem_report())
+                .await
+                .unwrap_or_default();
+            let mut fields: Vec<serde_json::Value> = Vec::with_capacity(report.len());
+            let mut ser_total: usize = 0;
+            let mut inmem_total: usize = 0;
+            let mut rows: Vec<(String, usize, usize, usize)> = report;
+            // Largest in-memory offenders first.
+            rows.sort_by(|a, b| b.3.cmp(&a.3));
+            for (name, count, ser, inmem) in &rows {
+                ser_total += *ser;
+                inmem_total += *inmem;
+                fields.push(serde_json::json!({
+                    "field": name,
+                    "bitmap_count": count,
+                    "serialized_bytes": ser,
+                    "est_inmem_bytes": inmem,
+                    "inflation_x": if *ser > 0 { *inmem as f64 / *ser as f64 } else { 0.0 },
+                }));
+            }
+            Some(serde_json::json!({
+                "note": "Estimated in-memory filter footprint vs serialized. \
+                         inmem includes container capacity slack + per-bitmap \
+                         struct/Arc/HashMap overhead that serialized accounting \
+                         omits. Best-effort estimate, not exact.",
+                "filter_serialized_total": ser_total,
+                "filter_est_inmem_total": inmem_total,
+                "filter_inflation_x": if ser_total > 0 { inmem_total as f64 / ser_total as f64 } else { 0.0 },
+                "fields": fields,
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let pod_limit: u64 = std::env::var("BITDEX_MEMORY_LIMIT_BYTES")
         .ok()
@@ -5468,6 +5559,24 @@ async fn handle_debug_memory(
         },
         "tracked_total": tracked_total,
         "untracked": untracked,
+        // Allocator ground truth. `allocated` = live app heap; compare to
+        // tracked_total via `untracked_live_gap`. `retained` is virtual only.
+        "jemalloc": {
+            "allocated": jm_allocated,
+            "active": jm_active,
+            "resident": jm_resident,
+            "mapped": jm_mapped,
+            "retained": jm_retained,
+            "metadata": jm_metadata,
+            "untracked_live_gap": untracked_live_gap,
+            "fragmentation": fragmentation,
+            "note": "allocated = live app heap (requested, un-freed). \
+                     untracked_live_gap = allocated - tracked_total = live heap \
+                     our serialized tracker misses. fragmentation = resident - \
+                     active. retained is VIRTUAL address space (not RAM). \
+                     Populated only in heap-prof builds.",
+        },
+        "deep": deep_json,
         "budget": {
             "pod_limit": pod_limit,
             "rss_current": rss_bytes,
@@ -5480,6 +5589,8 @@ async fn handle_debug_memory(
             "untracked": format!("{:.2} GB", untracked as f64 / 1e9),
             "headroom": format!("{:.2} GB", headroom as f64 / 1e9),
             "safe_doc_cache": format!("{:.2} GB", safe_doc_cache as f64 / 1e9),
+            "jemalloc_allocated": jm_allocated.map(|v| format!("{:.2} GB", v as f64 / 1e9)),
+            "untracked_live_gap": untracked_live_gap.map(|v| format!("{:.2} GB", v as f64 / 1e9)),
         }
     }))
 }

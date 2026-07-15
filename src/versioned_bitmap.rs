@@ -301,6 +301,44 @@ impl VersionedBitmap {
         self.base.serialized_size() + self.diff.serialized_size()
     }
 
+    /// Best-effort estimate of the *in-memory* heap footprint (bytes) of this
+    /// VersionedBitmap — a truer figure than `bitmap_bytes()` (which reports the
+    /// compact serialized/portable size and thus badly undercounts many small
+    /// bitmaps). Diagnostics only.
+    ///
+    /// Why serialized ≠ resident: `serialized_size()` is `len`-based, but the
+    /// live representation carries (1) container `Vec` capacity slack (roaring
+    /// grows arrays by doubling), (2) per-container struct overhead in the
+    /// `containers` Vec, (3) the top-level `RoaringBitmap`/`Vec` headers, and
+    /// (4) two `Arc` control blocks (base + diff) plus the empty-diff roarings.
+    /// For a field with hundreds of thousands of tiny per-value bitmaps this
+    /// fixed-per-bitmap overhead — invisible to serialized accounting — is the
+    /// dominant term. This estimator surfaces it.
+    pub fn inmem_bytes(&self) -> usize {
+        // Container payload using capacity() (real allocation, incl. slack),
+        // plus per-container struct + top-level RoaringBitmap/Vec headers.
+        fn rb_inmem(rb: &RoaringBitmap) -> usize {
+            let s = rb.statistics();
+            let payload = s.n_bytes_array_containers as usize
+                + s.n_bytes_bitset_containers as usize
+                + s.n_bytes_run_containers as usize;
+            // roaring stores each container as { key: u16, store: Store<enum> }
+            // in a Vec; ~32 B/container is a conservative struct estimate.
+            const CONTAINER_STRUCT: usize = 32;
+            std::mem::size_of::<RoaringBitmap>()
+                + s.n_containers as usize * CONTAINER_STRUCT
+                + payload
+        }
+        // Arc strong+weak refcount control block precedes each heap payload.
+        const ARC_CTRL: usize = 2 * std::mem::size_of::<usize>();
+        let base = ARC_CTRL + rb_inmem(&self.base);
+        let diff = ARC_CTRL
+            + std::mem::size_of::<BitmapDiff>()
+            + rb_inmem(&self.diff.sets)
+            + rb_inmem(&self.diff.clears);
+        std::mem::size_of::<VersionedBitmap>() + base + diff
+    }
+
     /// Bulk-insert bits into the diff layer.
     pub fn insert_bulk(&mut self, bits: impl IntoIterator<Item = u32>) {
         let diff = Arc::make_mut(&mut self.diff);

@@ -413,6 +413,33 @@ impl FilterField {
         }
         total
     }
+    /// Best-effort estimate of the *in-memory* heap footprint (bytes) of this
+    /// field's value bitmaps — a truer figure than `bitmap_bytes()` (serialized).
+    /// Includes each VersionedBitmap's real container/Arc overhead plus the
+    /// per-entry cost of the `HashMap<u64, VersionedBitmap>` slot (key + hashbrown
+    /// control/load-factor slack). Diagnostics only; chunked identically to
+    /// `bitmap_bytes()` to bound continuous read-lock hold.
+    pub fn inmem_bytes(&self) -> usize {
+        const CHUNK: usize = 16_384;
+        // hashbrown: ~1 control byte/entry at ~87.5% max load → ~1.14x slots;
+        // each slot holds key(u64) + VersionedBitmap. The VB struct itself is
+        // counted inside inmem_bytes(); here we add the key + slack only.
+        const HASHMAP_ENTRY_OVERHEAD: usize = std::mem::size_of::<u64>() + 8;
+        let keys: Vec<u64> = {
+            let r = self.bitmaps.read();
+            r.keys().copied().collect()
+        };
+        let mut total: usize = 0;
+        for chunk in keys.chunks(CHUNK) {
+            let r = self.bitmaps.read();
+            for &k in chunk {
+                if let Some(vb) = r.get(&k) {
+                    total += vb.inmem_bytes() + HASHMAP_ENTRY_OVERHEAD;
+                }
+            }
+        }
+        total
+    }
     /// Drop all base bitmaps and mark every value as unloaded.
     /// The diff layers are preserved so mutations can accumulate
     /// while the field is not in memory.
@@ -683,6 +710,19 @@ impl FilterIndex {
         self.fields
             .iter()
             .map(|(name, f)| (name.as_str(), f.bitmap_count(), f.bitmap_bytes()))
+            .collect()
+    }
+    /// Per-field (name, bitmap_count, serialized_bytes, estimated_inmem_bytes).
+    /// The serialized-vs-inmem gap is the "blind spot" the serialized-only
+    /// tracker misses; it grows with the number of resident per-value bitmaps.
+    /// Diagnostics only — iterates every value bitmap, so gate behind an
+    /// explicit request (not the metrics hot path).
+    pub fn per_field_inmem(&self) -> Vec<(&str, usize, usize, usize)> {
+        self.fields
+            .iter()
+            .map(|(name, f)| {
+                (name.as_str(), f.bitmap_count(), f.bitmap_bytes(), f.inmem_bytes())
+            })
             .collect()
     }
 }
