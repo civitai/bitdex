@@ -17,6 +17,15 @@ pub struct Metrics {
     // -- Document lifecycle --
     pub alive_documents: IntGaugeVec,
     pub slot_high_water: IntGaugeVec,
+    /// Post-activation verify ring depth (all pending) and the drainable subset.
+    ///
+    /// These are the only verifier signals that report a strand as a PRESENCE.
+    /// Every counter (`checked`/`publish_lag`/`redriven`/`inconclusive`) reports
+    /// a strand by going quiet, which looks exactly like a clean result — so a
+    /// prediction built only from them is confirmed by the failure it exists to
+    /// catch. Depth turns that absence into a rising line. Label: index.
+    pub activation_verify_pending: IntGaugeVec,
+    pub activation_verify_ready: IntGaugeVec,
     pub upsert_total: IntCounterVec,
     pub delete_total: IntCounterVec,
 
@@ -339,6 +348,31 @@ impl Metrics {
 
         let slot_high_water = IntGaugeVec::new(
             Opts::new("bitdex_slot_high_water", "High-water slot counter"),
+            &["index"],
+        )
+        .unwrap();
+
+        let activation_verify_pending = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_activation_verify_pending",
+                "Slots queued for post-activation verification, waiting or ready. \
+                 A STRAND SHOWS UP HERE AS A RISING LINE — which is why it exists: \
+                 every other verifier signal reports a strand as an ABSENCE (all \
+                 counters quiet), and absence is indistinguishable from health.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+
+        let activation_verify_ready = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_activation_verify_ready",
+                "Subset of bitdex_activation_verify_pending whose publish gate is \
+                 open, i.e. drainable now. Persistently high while pending also \
+                 climbs means the verifier is not draining what it could. Ready \
+                 pinned at 0 while pending climbs means the gate is never opening \
+                 — the seq stalled or rewound.",
+            ),
             &["index"],
         )
         .unwrap();
@@ -1411,6 +1445,8 @@ impl Metrics {
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
+        registry.register(Box::new(activation_verify_pending.clone())).unwrap();
+        registry.register(Box::new(activation_verify_ready.clone())).unwrap();
         registry.register(Box::new(upsert_total.clone())).unwrap();
         registry.register(Box::new(delete_total.clone())).unwrap();
         registry.register(Box::new(query_total.clone())).unwrap();
@@ -1600,6 +1636,8 @@ impl Metrics {
             registry,
             alive_documents,
             slot_high_water,
+            activation_verify_pending,
+            activation_verify_ready,
             upsert_total,
             delete_total,
             query_total,

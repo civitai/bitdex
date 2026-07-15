@@ -2201,6 +2201,20 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
     }
     #[cfg(feature = "server")]
     if let Some(bridge) = engine.metrics_bridge_handle() {
+        // Ring depth, sampled EVERY pass — including passes that drain nothing,
+        // which is the case worth seeing. Unconditional on purpose: every other
+        // signal here is a counter that reports a strand by going quiet, and
+        // quiet is what a clean result looks like too. Depth is the only one
+        // where a strand is a rising line rather than an absence, so it must not
+        // be gated behind "did anything happen".
+        bridge
+            .activation_verify_pending
+            .with_label_values(&[&bridge.index_name])
+            .set(engine.activation_verify_len() as i64);
+        bridge
+            .activation_verify_ready
+            .with_label_values(&[&bridge.index_name])
+            .set(engine.activation_verify_ready_len() as i64);
         if checked > 0 {
             bridge
                 .activation_verify_checked_total
@@ -5471,52 +5485,131 @@ mod tests {
         engine
     }
 
-    /// The tag must be read at ENQUEUE, not at drain.
+    /// THE GATE, tested at the only value that discriminates: `published == c`.
     ///
-    /// A slot is only drainable once the live publish count EXCEEDS the value it
-    /// carries. Reading that value at drain time instead would fold in the very
-    /// publish being waited on, making every slot look ready immediately — the
-    /// check would compile, pass, and do nothing. This pins the gate itself:
-    /// a slot tagged with a count at or above the live one is NOT drainable, and
-    /// becomes drainable exactly when the count passes it.
+    /// Every live slot sits at exactly this value between being enqueued and its
+    /// own batch publishing — the flush thread tags it with the seq that is
+    /// CURRENTLY published, and the batch lands at `c + 1`. So `published == c`
+    /// means "my batch has NOT published yet", and the gate must be CLOSED.
+    ///
+    /// This is the assertion the earlier version of this test lacked, while
+    /// carrying this name. It gated at `AfterPublish(u64::MAX)` (closed under
+    /// both `>` and `>=`) and `AfterPublish(0)` with `published > 0` (open under
+    /// both) — two values that agree, and never the one that disagrees. Relaxing
+    /// the gate to `>=` therefore left 79 tests green while making it a total
+    /// no-op: every slot drainable the instant it is queued, verifier reading
+    /// pre-publish state, false orphans restored in one character. A test named
+    /// for an invariant it does not pin is worse than no test, because it is
+    /// trusted — this one fails under `>=`.
     #[test]
-    fn test_verify_waits_for_the_publish_of_its_own_batch() {
+    fn test_gate_is_closed_at_the_slots_own_publish_seq() {
         let engine = engine_past_first_publish(safety_net_config());
 
-        // Gated on a publish count no run will reach: it must stay put.
+        // The live-slot state, reproduced exactly: tag == currently-published seq.
+        let live = engine.published_seq();
         engine.push_activation_verify_gated_for_test(
-            &[7],
-            crate::concurrent_engine::VerifyGate::AfterPublish(u64::MAX),
+            &[42],
+            crate::concurrent_engine::VerifyGate::AfterPublish(live),
         );
+
+        // THE DISCRIMINATING ASSERTION. `>` keeps this closed; `>=` opens it.
         assert_eq!(
             engine.drain_activation_verify(100),
             Vec::<u32>::new(),
-            "a slot whose batch is not yet published must NOT be handed to the \
-             verifier — judging it now is exactly the pre-publish read that \
-             manufactures false orphans"
+            "a slot tagged with the CURRENTLY published seq has not had its own \
+             batch published yet — the gate must be CLOSED. If this returns the \
+             slot, the gate is a no-op: it hands the verifier pre-publish state \
+             and manufactures the false orphans it exists to prevent."
         );
-        assert_eq!(engine.activation_verify_len(), 1, "it stays queued, not dropped");
-        assert_eq!(engine.activation_verify_ready_len(), 0);
+        assert_eq!(engine.activation_verify_len(), 1, "still queued, not dropped");
+        assert_eq!(engine.activation_verify_ready_len(), 0, "and not counted ready");
 
-        // The mirror case, on a fresh ring: a slot whose batch IS provably
-        // published must be handed over. (Fresh, because a ring holding the
-        // unpublished slot above would legitimately stop the drain there —
-        // production tags are non-decreasing, so MAX-then-0 cannot occur.)
-        let engine = engine_past_first_publish(safety_net_config());
-        engine.push_activation_verify_gated_for_test(
-            &[8],
-            crate::concurrent_engine::VerifyGate::AfterPublish(0),
+        // Now let its batch publish. The gate must OPEN — it delays judgement,
+        // it never prevents it.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(43)),
         );
-        assert!(
-            engine.published_seq() > 0,
-            "precondition: a publish has happened, so the gate at 0 is passed"
-        );
+        engine
+            .put(43, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.published_seq() <= live {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
             engine.drain_activation_verify(100),
-            vec![8],
-            "a slot whose batch is provably published must be verifiable — the \
-             gate must delay judgement, never prevent it"
+            vec![42],
+            "once the seq passes the tag the batch is provably live, so the slot \
+             MUST be released — a gate that never opens is a stranded slot"
         );
+    }
+
+    /// The publish seq must never RUN BACKWARDS — pinning bug 3.
+    ///
+    /// The two `InnerEngine` rebuild sites (field unload) construct a fresh
+    /// struct, so they must carry `publish_seq` across. Writing `publish_seq: 0`
+    /// there compiles, reads perfectly well, and rewinds the gate. Unlike the
+    /// seq-vs-snapshot ordering — which this design made *inexpressible* — this
+    /// mistake IS expressible, so it gets a test rather than a comment.
+    ///
+    /// The damage is transient, not permanent: `flush_cycle` keeps climbing, so
+    /// the gate recovers within a cycle. The cost is the window — while the seq
+    /// is behind, nothing drains, the ring keeps taking activations, and past
+    /// `ring_cap` the front is evicted, silently dropping unverified slots.
+    #[test]
+    fn test_unload_does_not_rewind_publish_seq() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = safety_net_config();
+        config.storage.bitmap_path = Some(dir.path().join("bitmaps"));
+        config.merge_interval_ms = 200;
+        let docstore_path = dir.path().join("docs");
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+
+        // Get the seq off the floor so a rewind to 0 is actually a decrease.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(11)),
+        );
+        engine
+            .put(11, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.published_seq() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = engine.published_seq();
+        assert!(before > 0, "precondition: seq is off the floor");
+
+        // Unload rebuilds InnerEngine — the seq must survive the rebuild.
+        engine.save_and_unload().unwrap();
+
+        // Watch across the rebuild's publish. Monotonic means monotonic: not
+        // "recovers shortly", not "usually" — never lower, at any observation.
+        let watch = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        while std::time::Instant::now() < watch {
+            let now = engine.published_seq();
+            assert!(
+                now >= before,
+                "publish seq went BACKWARDS across an unload ({now} < {before}). \
+                 An unload changes what is resident, not which publish we are on. \
+                 While the seq is behind, the gate opens for nothing: the ring \
+                 fills with activations that never drain, and past ring_cap the \
+                 oldest are evicted — unverified slots dropped with no log line, \
+                 no counter and no alarm."
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// The ring's ordering is STRUCTURAL, and the drain relies on it: it stops at
@@ -6045,10 +6138,12 @@ mod tests {
             // does on an activation cycle), then let a merge persist bitmaps.
             //
             // Tagged with a HIGH publish count, the way a real slot enqueued
-            // after thousands of flush cycles would be. That detail is what
-            // makes this test able to fail: the publish counter is process-local
-            // and restarts at 0, so a tag that survives the restart intact can
-            // never be passed. See the assertions on the second engine.
+            // after thousands of flush cycles would be. Realistic, but NOT what
+            // makes this test able to fail — Mutation H hardcodes the tag at the
+            // LOAD site, so the test would fail at AfterPublish(0) too. What
+            // makes it able to fail is the re-stamp on load being the only thing
+            // that clears a tag the new process cannot reach; the fixture just
+            // looks like production while doing it.
             engine.push_activation_verify_gated_for_test(
                 &[orphan],
                 crate::concurrent_engine::VerifyGate::AfterPublish(5_000),

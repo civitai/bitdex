@@ -70,6 +70,11 @@ pub struct MetricsBridge {
     /// barrier (drop vs over-long lag unproven — not a confirmed drop).
     /// Label: index.
     pub activation_verify_inconclusive_total: prometheus::IntCounterVec,
+    /// Post-activation verifier ring depth: all pending, and the drainable
+    /// subset. The ONLY verifier signals in which a strand appears as a
+    /// presence rather than an absence. Label: index.
+    pub activation_verify_pending: prometheus::IntGaugeVec,
+    pub activation_verify_ready: prometheus::IntGaugeVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.
@@ -352,6 +357,15 @@ impl VerifyGate {
     fn is_open(self, published: u64) -> bool {
         match self {
             Self::Ready => true,
+            // STRICTLY greater, and the strictness is the whole gate. A slot is
+            // tagged with the seq that is CURRENTLY published, and its own batch
+            // publishes at `c + 1`. So `published == c` is the state every live
+            // slot occupies between enqueue and its own publish: relaxing this to
+            // `>=` opens the gate the instant the slot is queued and hands the
+            // verifier pre-publish state — the false-orphan bug this gate exists
+            // to remove, restored in one character.
+            // Pinned by ops_processor::tests::
+            // test_gate_is_closed_at_the_slots_own_publish_seq, which fails under `>=`.
             Self::AfterPublish(c) => published > c,
         }
     }
@@ -1983,7 +1997,20 @@ impl ConcurrentEngine {
                             // immediately — the check would still compile, still
                             // pass its own unit tests, and do nothing.
                             // Pinned by ops_processor::tests::
-                            // test_verify_waits_for_the_publish_of_its_own_batch.
+                            // test_gate_is_closed_at_the_slots_own_publish_seq.
+                            //
+                            // ⚠️ THREAD CONFINEMENT IS LOAD-BEARING HERE. This is
+                            // sound because the apply above, this tag, and the
+                            // `inner.store` below all happen on the SINGLE flush
+                            // thread within ONE loop iteration, with no publish
+                            // in between — so the next publish is necessarily the
+                            // one carrying this batch. Add ANY store of `staging`
+                            // between here and the apply and the bug returns
+                            // quietly: that store stamps `flush_cycle`, which is
+                            // already > this tag, so the gate opens and hands the
+                            // verifier a correctly-stamped snapshot that does not
+                            // contain the batch. The seq would be honest and the
+                            // verdict still wrong. Don't publish in this span.
                             {
                                 let cap = flush_config.activation_verify.ring_cap;
                                 let gate = VerifyGate::AfterPublish(inner.load().publish_seq);
@@ -3685,14 +3712,21 @@ impl ConcurrentEngine {
                                     slots,
                                     filters: new_filters,
                                     sorts: new_sorts,
-                                    // CARRY the seq forward. Rebuilding staging
-                                    // must never rewind it: the verifier reads
-                                    // "published seq passed my tag", so a seq
-                                    // that went backwards would leave every
-                                    // slot tagged above it waiting on a value
-                                    // that never returns — unverified, silently
-                                    // and permanently. An unload changes what is
-                                    // resident, not which publish we are on.
+                                    // CARRY the seq forward. An unload changes
+                                    // what is resident, not which publish we are
+                                    // on, so rebuilding staging must not rewind
+                                    // it. `publish_seq: 0` here compiles and
+                                    // reads fine, and the damage is transient
+                                    // rather than permanent — `flush_cycle` never
+                                    // rewinds, so the next cycle stamps a higher
+                                    // seq and the gate recovers. The cost is the
+                                    // window: while the seq is behind, no slot
+                                    // drains, the ring keeps taking activations,
+                                    // and once it passes `ring_cap` the oldest
+                                    // entries are evicted off the front —
+                                    // silently dropping slots that were never
+                                    // verified. Pinned by ops_processor::tests::
+                                    // test_unload_does_not_rewind_publish_seq.
                                     publish_seq: staging.publish_seq,
                                 };
                                 flush_unified_cache.clear();
@@ -9064,15 +9098,17 @@ impl ConcurrentEngine {
     /// reading a slot before its batch is published is exactly how a healthy
     /// post gets reported as a dropped one.
     ///
-    /// Stops at the first slot that is not yet published, so the cost is
-    /// proportional to what is returned rather than to the ring's depth. That
-    /// short-circuit is sound because the ring is ordered: the single flush
-    /// thread queues in publish-count order, so nothing behind a not-yet-
-    /// published entry can be ready either. Unlike a time-based delay, no
-    /// config knob can perturb that ordering.
+    /// Stops at the first slot whose gate is closed, so the cost is proportional
+    /// to what is returned rather than to the ring's depth.
     ///
-    /// Requeued slots (see `requeue_activation_verify`) go to the back with a
-    /// fresh tag, preserving the same ordering.
+    /// That short-circuit is an OPTIMISATION resting on the ring being ordered in
+    /// practice — activations are queued by the single flush thread reading a
+    /// monotonic seq, and requeues re-tag under the ring lock — not on a property
+    /// anything enforces. It is safe either way: the gate is evaluated per entry,
+    /// so an out-of-order tag can only make the drain stop EARLY, parking slots
+    /// for another pass. It can never release a slot before its own publish, and
+    /// it can never drop one. Do not upgrade this to a claim that ordering is
+    /// guaranteed — it isn't, and the code doesn't need it to be.
     pub fn drain_activation_verify(&self, limit: usize) -> Vec<u32> {
         let published = self.published_seq();
         let mut q = self.activation_verify.lock();
@@ -9091,8 +9127,9 @@ impl ConcurrentEngine {
         out
     }
     /// Number of slots whose batch is published and which are ready to verify.
-    /// Diagnostic counterpart to `activation_verify_len` (which counts all
-    /// pending, published or not).
+    /// Counterpart to `activation_verify_len` (all pending, published or not).
+    /// Exported as `bitdex_activation_verify_ready` — see that metric's docs for
+    /// why ring DEPTH is the only verifier signal a strand shows up in.
     pub fn activation_verify_ready_len(&self) -> usize {
         let published = self.published_seq();
         let q = self.activation_verify.lock();
@@ -9141,8 +9178,15 @@ impl ConcurrentEngine {
         if slots.is_empty() {
             return;
         }
-        let gate = VerifyGate::AfterPublish(self.published_seq());
+        // Take the lock FIRST, then read the seq. Reading it before locking lets
+        // two requeues interleave — A reads seq 5, B reads seq 6 and appends,
+        // then A appends 5 behind it — and the ring goes decreasing. That is
+        // benign for safety (a lower tag only ever releases EARLIER than its
+        // neighbour, and never before its own publish), but `drain` stops at the
+        // first closed gate, so an out-of-order tag can park the entries behind
+        // it for an extra pass. Cheap to just not have.
         let mut q = self.activation_verify.lock();
+        let gate = VerifyGate::AfterPublish(self.published_seq());
         q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
     /// Number of slots pending post-activation verification, published or not.
@@ -10290,9 +10334,12 @@ impl ConcurrentEngine {
             }
         }
         // Carry the publish seq across the rebuild — an unload changes what is
-        // resident, not which publish we are on. Rewinding it would strand every
-        // slot tagged above the new value: waiting forever on a seq that never
-        // comes back, with no log line and no counter. Read before `snap` goes.
+        // resident, not which publish we are on. Rewinding it stalls the gate
+        // until `flush_cycle` climbs back past it (transient, not permanent),
+        // and the cost is the window: the ring keeps filling while nothing
+        // drains, and past `ring_cap` the front is evicted — unverified slots
+        // dropped with no log line and no counter. Read before `snap` goes.
+        // Pinned by ops_processor::tests::test_unload_does_not_rewind_publish_seq.
         let publish_seq = snap.publish_seq;
         // Drop our reference to the old snapshot before sending to flush thread.
         drop(snap);
