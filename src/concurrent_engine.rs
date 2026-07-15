@@ -198,6 +198,72 @@ pub fn get_rss_bytes() -> u64 {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     { 0 }
 }
+/// Outcome of the per-value idle-eviction decision. Pure/testable; see
+/// [`idle_evict_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleEvictDecision {
+    /// Genuinely idle (stamp older than cutoff) and clean → drop from memory.
+    Evict,
+    /// Keep resident this sweep (dirty, or recently accessed).
+    Keep,
+    /// No stamp yet (never queried since entering memory). Keep, but seed a
+    /// stamp now so a full idle window must elapse before it can be evicted.
+    SeedStampAndKeep,
+}
+
+/// Decide whether an idle-eviction candidate value should be evicted this sweep.
+///
+/// Pure function of the inputs so it can be unit-tested in isolation from the
+/// flush thread:
+/// - `is_dirty`: the value's VersionedBitmap has unpersisted diffs → never evict
+///   (dropping it would lose the diff).
+/// - `stamp_ms`: last wall-clock access stamp, or `None` if the value has no
+///   stamp entry yet. A `None` stamp means the value was inserted / activation-
+///   replayed / lazy-loaded but never queried — evicting it blindly (the old
+///   `unwrap_or(true)` behavior) drops a value that may have no on-disk copy,
+///   causing silent loss. Seed-and-keep instead.
+/// - `cutoff_ms`: `now_ms - idle_ms`; a stamp strictly older than this is idle.
+#[inline]
+fn idle_evict_decision(
+    is_dirty: bool,
+    stamp_ms: Option<u64>,
+    cutoff_ms: u64,
+) -> IdleEvictDecision {
+    if is_dirty {
+        return IdleEvictDecision::Keep;
+    }
+    match stamp_ms {
+        Some(ts) if ts < cutoff_ms => IdleEvictDecision::Evict,
+        Some(_) => IdleEvictDecision::Keep,
+        None => IdleEvictDecision::SeedStampAndKeep,
+    }
+}
+
+/// Capacity of the diagnostic remove-op ring (see [`RemoveRecord`]). Removes
+/// (AliveRemove / FilterRemove / SortClear) are far rarer than inserts, so a
+/// few thousand entries covers well over the ±200ms window the verifier scans.
+const REMOVE_RING_CAP: usize = 16_384;
+
+/// One recorded remove-shaped mutation, for the activation-orphan diagnostic.
+///
+/// The orphan hunt narrowed the whole-batch loss to either a NON-APPLY of the
+/// activation batch or an explicit REVERT (a FilterRemove/SortClear/AliveRemove
+/// hitting the just-activated slot). To tell these apart the flush thread
+/// records every remove it applies into a bounded ring; when the verifier finds
+/// an orphan it dumps this slot's recent removes. A hit in the ±200ms window is
+/// a revert signal; an empty result points at non-apply. Diagnostic-only, gated
+/// on the verifier being enabled, and only records removes (not the hot insert
+/// path).
+#[derive(Debug, Clone)]
+struct RemoveRecord {
+    at_ms: u64,
+    slot: u32,
+    /// "alive" | "filter" | "sort".
+    kind: &'static str,
+    /// Field name for filter/sort removes; empty for alive.
+    field: Arc<str>,
+}
+
 /// Lazy-load request sent from query threads to the flush thread.
 /// Used during startup restore to load bitmaps on demand per field.
 enum LazyLoad {
@@ -432,6 +498,12 @@ pub struct ConcurrentEngine {
     /// bounded by the overdue sweep; the read-miss re-defer removes the known
     /// cause. See `push_activation_verify` / `drain_activation_verify`.
     activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>>,
+    /// Diagnostic ring of recently-applied remove-shaped ops (alive/filter/sort),
+    /// used by the activation-orphan verifier to distinguish a whole-batch
+    /// NON-APPLY from an explicit REVERT of a just-activated slot. Bounded
+    /// (`REMOVE_RING_CAP`), in-memory only, populated by the flush thread only
+    /// when the post-activation verifier is enabled. See `recent_removes_for_slot`.
+    remove_op_ring: Arc<parking_lot::Mutex<std::collections::VecDeque<RemoveRecord>>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1150,6 +1222,19 @@ impl ConcurrentEngine {
         let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>> =
             Arc::new(parking_lot::Mutex::new(seeded_verify));
         let flush_activation_verify = Arc::clone(&activation_verify);
+        // Diagnostic remove-op ring (activation-orphan non-apply-vs-revert probe).
+        // Only recorded when the verifier is enabled (membership_field set).
+        let remove_op_ring: Arc<parking_lot::Mutex<std::collections::VecDeque<RemoveRecord>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                REMOVE_RING_CAP,
+            )));
+        let flush_remove_op_ring = Arc::clone(&remove_op_ring);
+        let flush_remove_ring_enabled = config
+            .activation_verify
+            .membership_field
+            .as_ref()
+            .map(|f| !f.is_empty())
+            .unwrap_or(false);
         // Load named cursors from disk (if any exist).
         let initial_cursors = if let Some(ref ms) = meta_store {
             ms.load_all_cursors().unwrap_or_default()
@@ -1352,6 +1437,7 @@ impl ConcurrentEngine {
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
             deferred_pending: Arc::clone(&deferred_pending),
             activation_verify: Arc::clone(&activation_verify),
+            remove_op_ring: Arc::clone(&remove_op_ring),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1957,6 +2043,59 @@ impl ConcurrentEngine {
                         }
                         for sgk in coalescer.sort_clear_entries().keys() {
                             stale_fields.push(sgk.field.to_string());
+                        }
+                        // Diagnostic: record remove-shaped ops (alive/filter/sort)
+                        // applied this cycle into the bounded ring, so the
+                        // activation-orphan verifier can tell a NON-APPLY apart from
+                        // an explicit REVERT of a just-activated slot. Only when the
+                        // verifier is enabled; sort clears are deduped per (field,slot)
+                        // to avoid ~32× per-bit-layer noise.
+                        if flush_remove_ring_enabled {
+                            let ring_now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let mut recs: Vec<RemoveRecord> = Vec::new();
+                            for (fgk, slots) in coalescer.filter_remove_entries() {
+                                for &slot in slots {
+                                    recs.push(RemoveRecord {
+                                        at_ms: ring_now_ms,
+                                        slot,
+                                        kind: "filter",
+                                        field: Arc::clone(&fgk.field),
+                                    });
+                                }
+                            }
+                            let mut seen_sort: HashSet<(Arc<str>, u32)> = HashSet::new();
+                            for (sgk, slots) in coalescer.sort_clear_entries() {
+                                for &slot in slots {
+                                    if seen_sort.insert((Arc::clone(&sgk.field), slot)) {
+                                        recs.push(RemoveRecord {
+                                            at_ms: ring_now_ms,
+                                            slot,
+                                            kind: "sort",
+                                            field: Arc::clone(&sgk.field),
+                                        });
+                                    }
+                                }
+                            }
+                            for &slot in coalescer.alive_removes() {
+                                recs.push(RemoveRecord {
+                                    at_ms: ring_now_ms,
+                                    slot,
+                                    kind: "alive",
+                                    field: Arc::from(""),
+                                });
+                            }
+                            if !recs.is_empty() {
+                                let mut ring = flush_remove_op_ring.lock();
+                                for r in recs {
+                                    if ring.len() >= REMOVE_RING_CAP {
+                                        ring.pop_front();
+                                    }
+                                    ring.push_back(r);
+                                }
+                            }
                         }
                         // Count DeferredAlive ops applied to staging this batch.
                         // The map persist itself happens later in the cycle (with
@@ -3416,18 +3555,35 @@ impl ConcurrentEngine {
                             let to_evict: Vec<u64> = field.bitmap_keys()
                                 .into_iter()
                                 .filter(|&value| {
-                                    // Skip dirty bitmaps (unpersisted mutations)
-                                    if let Some(vb) = field.get_versioned(value) {
-                                        if vb.is_dirty() {
-                                            return false;
+                                    let is_dirty = field
+                                        .get_versioned(value)
+                                        .map(|vb| vb.is_dirty())
+                                        .unwrap_or(false);
+                                    let key = (field_name_arc.clone(), value);
+                                    // Read the stamp (guard dropped before any insert below).
+                                    let stamp = flush_eviction_stamps
+                                        .get(&key)
+                                        .map(|entry| entry.value().load(Ordering::Relaxed));
+                                    match idle_evict_decision(is_dirty, stamp, cutoff_ms) {
+                                        IdleEvictDecision::Evict => true,
+                                        IdleEvictDecision::Keep => false,
+                                        IdleEvictDecision::SeedStampAndKeep => {
+                                            // Never-stamped value: freshly inserted /
+                                            // activation-replayed / lazy-loaded but not yet
+                                            // queried. Do NOT drop it blind (the old
+                                            // `unwrap_or(true)` bug) — a just-inserted value
+                                            // that merged clean would be evicted with zero idle
+                                            // window, and disk has no copy (never persisted) →
+                                            // silent data loss. Seed a stamp NOW so it gets a
+                                            // full idle window before becoming eligible. This is
+                                            // the prerequisite for enabling eviction on
+                                            // single_value per_value_lazy fields (postId RSS
+                                            // fix): unstamped values must not be dropped.
+                                            flush_eviction_stamps
+                                                .insert(key, AtomicU64::new(now_ms));
+                                            false
                                         }
                                     }
-                                    // Check stamp (wall-clock millis)
-                                    let key = (field_name_arc.clone(), value);
-                                    flush_eviction_stamps
-                                        .get(&key)
-                                        .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff_ms)
-                                        .unwrap_or(true) // no stamp = never touched = evict
                                 })
                                 .collect();
                             if !to_evict.is_empty() {
@@ -5026,6 +5182,7 @@ impl ConcurrentEngine {
             deferred_sweep_limit: Arc::clone(&deferred_sweep_limit),
             deferred_pending: Arc::clone(&deferred_pending),
             activation_verify: Arc::clone(&activation_verify),
+            remove_op_ring: Arc::clone(&remove_op_ring),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -8759,6 +8916,42 @@ impl ConcurrentEngine {
         let mut q = self.activation_verify.lock();
         q.extend(slots.iter().copied());
     }
+    /// Diagnostic: recent remove-shaped ops (alive/filter/sort) applied to a
+    /// slot at or after `since_ms` (wall-clock millis), newest last. Used by the
+    /// activation-orphan verifier to tell a whole-batch NON-APPLY (empty result)
+    /// apart from an explicit REVERT (a remove landed on the just-activated
+    /// slot). Returns pre-formatted `kind[:field]@ms` strings. Empty unless the
+    /// verifier is enabled (the ring is only populated then).
+    pub fn recent_removes_for_slot(&self, slot: u32, since_ms: u64) -> Vec<String> {
+        let ring = self.remove_op_ring.lock();
+        ring.iter()
+            .filter(|r| r.slot == slot && r.at_ms >= since_ms)
+            .map(|r| {
+                if r.field.is_empty() {
+                    format!("{}@{}", r.kind, r.at_ms)
+                } else {
+                    format!("{}:{}@{}", r.kind, r.field, r.at_ms)
+                }
+            })
+            .collect()
+    }
+    /// Test-only: push a synthetic remove record into the diagnostic ring.
+    #[cfg(test)]
+    pub fn push_remove_record_for_test(
+        &self,
+        slot: u32,
+        kind: &'static str,
+        field: &str,
+        at_ms: u64,
+    ) {
+        let mut ring = self.remove_op_ring.lock();
+        ring.push_back(RemoveRecord {
+            at_ms,
+            slot,
+            kind,
+            field: Arc::from(field),
+        });
+    }
     /// Test-only: persist the current verify ring to MetaStore (what the flush
     /// thread does on an activation cycle), so a drop+reload can be exercised.
     #[cfg(test)]
@@ -11347,6 +11540,51 @@ mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
+
+    // ── Idle-eviction decision (over-eviction fix) ──────────────────────────
+    #[test]
+    fn idle_evict_dirty_is_never_evicted() {
+        // Dirty value has an unpersisted diff → must be kept regardless of stamp.
+        assert_eq!(
+            idle_evict_decision(true, Some(0), 1_000),
+            IdleEvictDecision::Keep
+        );
+        assert_eq!(
+            idle_evict_decision(true, None, 1_000),
+            IdleEvictDecision::Keep
+        );
+    }
+
+    #[test]
+    fn idle_evict_never_stamped_value_is_not_dropped() {
+        // Regression guard for the `unwrap_or(true)` over-eviction bug: a clean
+        // value with NO stamp (never queried since it entered memory — e.g. an
+        // activation-replayed insert that merged clean) must NOT be evicted
+        // blind. It gets a seeded stamp + a full idle window instead.
+        assert_eq!(
+            idle_evict_decision(false, None, 5_000),
+            IdleEvictDecision::SeedStampAndKeep
+        );
+    }
+
+    #[test]
+    fn idle_evict_stamped_value_respects_cutoff() {
+        // Stamp strictly older than cutoff → evict.
+        assert_eq!(
+            idle_evict_decision(false, Some(499), 500),
+            IdleEvictDecision::Evict
+        );
+        // Stamp at the boundary (== cutoff) → keep (matches `< cutoff` semantics).
+        assert_eq!(
+            idle_evict_decision(false, Some(500), 500),
+            IdleEvictDecision::Keep
+        );
+        // Fresh stamp → keep.
+        assert_eq!(
+            idle_evict_decision(false, Some(900), 500),
+            IdleEvictDecision::Keep
+        );
+    }
 
     /// Watchdog trip condition (task #17, 2026-07-10): a hung rebuild worker
     /// (thread alive, never sends) leaves `in_flight` stuck true forever and

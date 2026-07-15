@@ -379,7 +379,31 @@ impl VersionedBitmap {
     ///
     /// Distinct from `load_base` which OR's into the existing base — the
     /// caller wants the disk state to BECOME the base, not merge with it.
+    ///
+    /// **Loaded-guard (sort reload-after-promote fix):** do not adopt the disk
+    /// bitmap when this VB is already resident WITH DATA (`is_loaded &&
+    /// !base.is_empty()`). In that state the in-memory base is authoritative:
+    /// writes land in memory first and disk is a lagging snapshot, so the base
+    /// may hold bits promoted (merged) out of the diff but not yet persisted —
+    /// the periodic sort-promote (`merge_dirty`) folds a SET into the base
+    /// ~every 5s, while the save that would put it on disk is a separate cycle.
+    /// Blindly replacing the base with a disk snapshot that predates the promote
+    /// silently drops the bit (the diff is already empty post-promote, so
+    /// nothing restores it).
+    ///
+    /// Two cases MUST still adopt disk, so both are excluded from the guard:
+    /// (1) a genuinely unloaded layer (`!is_loaded`, base emptied by
+    /// `clear_base_and_unload`); and (2) the fresh-boot placeholder — a
+    /// `SortField::new` seeds every layer via `new_empty` (`is_loaded == true`
+    /// but the base is EMPTY), and the eager time-bucket sort restore reloads
+    /// those from disk. The `!base.is_empty()` term keeps that boot path working
+    /// while still protecting a populated in-memory base.
     pub fn replace_base_preserve_diff(&mut self, bitmap: RoaringBitmap) {
+        if self.is_loaded && !self.base.is_empty() {
+            // Resident with real data: keep the authoritative in-memory base
+            // rather than regress to a potentially-stale disk snapshot.
+            return;
+        }
         self.base = Arc::new(bitmap);
         self.is_loaded = true;
         // diff is intentionally preserved.
@@ -767,5 +791,63 @@ mod tests {
         assert!(!vb.is_loaded());
         vb.mark_loaded();
         assert!(vb.is_loaded());
+    }
+
+    #[test]
+    fn replace_base_preserve_diff_on_unloaded_adopts_disk() {
+        // Genuine unload→reload flow: base emptied, reload adopts disk truth.
+        let mut vb = VersionedBitmap::new_unloaded();
+        vb.insert(7); // op arrived while unloaded → diff
+        let mut disk = RoaringBitmap::new();
+        disk.insert(1);
+        disk.insert(2);
+        vb.replace_base_preserve_diff(disk);
+        assert!(vb.is_loaded());
+        // Disk base adopted, queued diff preserved.
+        assert!(vb.fused_contains(1));
+        assert!(vb.fused_contains(2));
+        assert!(vb.fused_contains(7));
+    }
+
+    #[test]
+    fn replace_base_preserve_diff_boot_placeholder_adopts_disk() {
+        // Boot restore: `SortField::new` seeds layers via `new_empty`, which is
+        // is_loaded=TRUE with an EMPTY base. The eager time-bucket sort restore
+        // then reloads them from disk — the guard must NOT skip this (the
+        // `!base.is_empty()` term), or boot would leave the layer empty.
+        let mut vb = VersionedBitmap::new_empty(); // is_loaded=true, empty base
+        assert!(vb.is_loaded());
+        let mut disk = RoaringBitmap::new();
+        disk.insert(5);
+        disk.insert(6);
+        vb.replace_base_preserve_diff(disk);
+        assert!(vb.fused_contains(5));
+        assert!(vb.fused_contains(6));
+    }
+
+    #[test]
+    fn replace_base_preserve_diff_does_not_clobber_promoted_loaded_base() {
+        // Regression guard: sort reload-after-promote loss.
+        // A SET is applied to the diff, then promoted (merged) into the BASE —
+        // the diff is now empty and the bit lives ONLY in the in-memory base,
+        // not yet persisted to disk. A reload with a STALE disk snapshot (that
+        // predates the promote) must NOT drop the bit.
+        let mut vb = VersionedBitmap::new_empty(); // loaded, empty base
+        assert!(vb.is_loaded());
+        vb.insert(42); // activation SET → diff
+        assert!(vb.is_dirty());
+        vb.merge(); // sort-promote folds SET into base
+        assert!(!vb.is_dirty());
+        assert!(vb.base().contains(42));
+
+        // Stale disk snapshot: does NOT contain slot 42 (save ran before promote).
+        let stale_disk = RoaringBitmap::new();
+        vb.replace_base_preserve_diff(stale_disk);
+
+        // Pre-fix this replaced the base with the empty stale disk and lost 42.
+        assert!(
+            vb.fused_contains(42),
+            "promoted-into-base bit must survive a reload with stale disk"
+        );
     }
 }
