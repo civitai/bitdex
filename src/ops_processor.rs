@@ -1954,9 +1954,54 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
              membership[{}] shadow[{shadow_state}] source_sort_present={sort_present:?}",
             engine.filter_value_state_debug(&verify_field, pid as u64, slot),
         );
-        // Orphan: re-drive the full doc via the activation replay path. Sent
-        // through the mutation channel (the flush thread is the sole ArcSwap
-        // writer — never mutate staging directly here).
+        // ── Post-publish re-read + revert-signal (OBSERVATIONAL diagnostic) ──
+        // Complements the VB-state line above and pins the specimen's true
+        // cause. STRICTLY OBSERVATIONAL: this only LOGS a classification; the
+        // re-drive below still fires exactly as before, so a real orphan can
+        // never be masked. (a) Drain the flush thread's pending publishes
+        // (`force_publish_blocking` barrier) and query once more: if the slot is
+        // PRESENT after the barrier the first miss was publish-visibility lag
+        // (the batch WAS applied, just published late — not a true drop). (b)
+        // Dump recent remove-ops for this slot from the flush thread's ring: a
+        // FilterRemove/SortClear/AliveRemove hit is a REVERT signal; an empty
+        // result with a still-absent re-read points at NON-APPLY.
+        //
+        // Barrier safety: `force_publish_blocking` runs on the WAL-reader thread
+        // (this verifier), sends a FlushCommand to the flush thread and waits on
+        // a bounded channel with a 500ms cap — no lock is held across the wait,
+        // it targets a different thread, and the verifier processes orphans
+        // sequentially, so it cannot self-deadlock or stack. It's the rare
+        // (~0.3%) orphan path only, and `execute_query` above already triggers a
+        // (100ms-capped) ForcePublish via ensure_fields_loaded — this is a
+        // slightly longer barrier for a cleaner read.
+        let diag_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let publish_barrier =
+            engine.force_publish_blocking(std::time::Duration::from_millis(500));
+        let reread_present = match engine.execute_query(&query) {
+            Ok(r) => r.ids.iter().any(|&id| id == slot as i64),
+            Err(_) => false,
+        };
+        let recent_removes =
+            engine.recent_removes_for_slot(slot, diag_now_ms.saturating_sub(5_000));
+        let classification = if reread_present {
+            "PUBLISH-LAG (present after barrier; batch applied, published late — not a true drop)"
+        } else if recent_removes.is_empty() {
+            "NON-APPLY (still absent after barrier, no revert ops seen)"
+        } else {
+            "REVERT (still absent after barrier, remove ops hit this slot)"
+        };
+        tracing::warn!(
+            target: "activation",
+            "verify-diag: slot {slot} {verify_field}={pid} barrier_ok={publish_barrier} reread_present={reread_present} class=\"{classification}\" recent_removes={recent_removes:?}"
+        );
+        // Orphan: re-drive the full doc via the activation replay path (fires
+        // regardless of the diagnostic classification — idempotent, and the
+        // backstop must never skip a genuine orphan). Sent through the mutation
+        // channel (the flush thread is the sole ArcSwap writer — never mutate
+        // staging directly here).
         let document = crate::mutation::Document {
             fields: doc.fields.clone(),
         };
@@ -3720,6 +3765,32 @@ mod tests {
     /// `isPublished` shadow false and `publishedAt` sort layer at 0 — excluded
     /// from `isPublished=true` feeds. When any recompute touches such a slot,
     /// the net must flip `isPublished=true` and write the `publishedAt` layer.
+    /// Activation-orphan diagnostic ring: `recent_removes_for_slot` must filter
+    /// by slot AND by the `since_ms` window, and format alive vs filter/sort
+    /// records. This backs the non-apply-vs-revert probe in the verifier.
+    #[test]
+    fn recent_removes_ring_filters_by_slot_and_window() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        // Empty ring → no records.
+        assert!(engine.recent_removes_for_slot(42, 0).is_empty());
+        engine.push_remove_record_for_test(42, "filter", "postId", 1_000);
+        engine.push_remove_record_for_test(42, "sort", "publishedAt", 1_100);
+        engine.push_remove_record_for_test(7, "alive", "", 1_050);
+        // Slot 42 within window → both its records, not slot 7's.
+        let recs = engine.recent_removes_for_slot(42, 1_000);
+        assert_eq!(recs.len(), 2, "got {recs:?}");
+        assert!(recs.iter().any(|r| r == "filter:postId@1000"));
+        assert!(recs.iter().any(|r| r == "sort:publishedAt@1100"));
+        // `since` excludes older records.
+        let recs2 = engine.recent_removes_for_slot(42, 1_050);
+        assert_eq!(recs2, vec!["sort:publishedAt@1100".to_string()]);
+        // alive record for slot 7 formats without a field.
+        assert_eq!(
+            engine.recent_removes_for_slot(7, 0),
+            vec!["alive@1050".to_string()]
+        );
+    }
+
     #[test]
     fn test_recompute_safety_net_completes_lost_activation() {
         let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
