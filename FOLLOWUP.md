@@ -1,5 +1,95 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Query freshness guarantee is illusory — the 100ms ForcePublish barrier times out 93-98% (2026-07-15)
+
+MEASURED in prod (v1.1.46, both pods): `ensure_fields_loaded`'s ForcePublish barrier is capped at
+**100ms**, but median sort-promotes run **158ms (bitdex-0) / 208ms (bitdex-1)** — so the barrier
+times out on **93-98% of promotes** (13/14 and 112/114 observed). A query that triggers a per-value
+lazy-load during a promote therefore reads PRE-publish state. The barrier exists to make a query see
+prior writes; it essentially never succeeds, so that guarantee is illusory today.
+
+REAL-WORLD COST IS SMALL — deliberately NOT fixed: the effect is sub-second staleness on a
+just-published post for a query that happens to lazy-load mid-promote; it self-resolves on the next
+read. It is a freshness lag, NOT data loss. This is what made the post-activation verifier raise
+FALSE orphans (fixed separately, verifier-side — see below).
+
+WHY NOT JUST RAISE THE CAP: the barrier sits on the USER query path, so raising it trades user query
+latency for freshness — a bad deal for a sub-second lag. And the root cause isn't a tuning knob:
+the 158-208ms promote is ~30 dirty layers × ~12-14ms **clone** each (e.g. L13 base=59.4M
+clone=14121μs) = the Arc CoW clone-cascade at 59M-element sort layers. Making 100ms sufficient means
+attacking that clone cost, i.e. `docs/design/write-pipeline-overhaul.md` territory.
+
+⇒ Logged as a KNOWN LIMITATION, deferred to the write-pipeline overhaul. Revisit if the freshness
+gap ever produces a user-visible complaint, or fold it into the overhaul's success criteria.
+
+## PERF: sort promote dominates the flush cycle (clone-dominated) (2026-07-15)
+
+`sort-promote` (merge_dirty on staging.sorts) dominates every other flush phase by ~20-40×:
+observed `[flush-slow]` breakdowns show apply/cache/compact/tb/publish all ~0-10ms while promote
+is 100-185ms, across ~30 dirty layers, driven by per-layer CoW clones of 59M-element bases
+(~12-14ms each, e.g. L13 base=59.4M clone=14121μs). Same rate both pods (11.4-11.7 promotes/min,
+dirty_layers median 30). It's the underlying cost several other things (the query barrier above,
+the verifier's false orphans) are downstream of. Not urgent: no correctness impact, flush keeps up
+(lag=0). The write-pipeline overhaul's snapshot-only design is the structural answer; a cheaper
+interim would be reducing dirty-layer count or avoiding full-base clones per merge.
+
+⚠️ MEASUREMENT CAVEAT — do NOT quote promote timings as precise per-cycle costs. `[flush-slow]`'s
+fields DO NOT SUM: an observed line reads `total=142ms ... promote=184.9ms` — a component exceeding
+its own total. So `promote` is measured over some overlapping/async/cumulative span, not a clean
+per-cycle attribution. The DIRECTION (promote dominates; clones are the cost) is well supported;
+the exact "158-208ms per cycle" figure is not. Note that the barrier finding above does NOT rest on
+this field — it's observed directly by the v1.1.46 diagnostic (a 500ms barrier succeeds while the
+verifier's 100ms one fails on the same slot in the same window). Fix the accounting if you ever need
+promote numbers to be trustworthy.
+
+## OBSERVABILITY GAP: the v1.1.44 persist-ring cost is unmeasurable (2026-07-15)
+
+The v1.1.44 activation-verify ring persists to `meta/activation_verify.bin` on the flush thread each
+activation cycle. Review flagged a cost caveat (full-ring snapshot+serialize under lock; bounded by
+ring_cap 262144, normally tiny since it drains every WAL batch — only a starved WAL reader makes it
+large). That caveat CANNOT currently be watched: there is no log line (grep for persist/ring/
+serialize/activation_verify.bin = 0 hits), `[flush-slow]`'s breakdown has no persist field (its
+vocabulary is total/apply/promote/cache/compact/tb/publish/post_apply_total), and no metric exists
+(only activation_verify_checked_total / redriven_total / publish_lag_total). So it's a declared BLIND
+SPOT, not a monitored risk — if the cost ever mattered it would surface only as unattributed
+inflation in `[flush-slow] total`. Interim proxy: alarm on `[flush-slow] total` >400ms (observed band
+is p50 118ms / p90 142ms / max 151ms). Fix = add a persist-duration field to the flush-slow breakdown
+or a dedicated metric.
+
+## Residual activation-orphan — whole-batch op loss (root cause NARROWED, fix pending) — 2026-07-15
+
+~0.3% of scheduled-post activations (both pods) land as orphans: activate_due sets the
+ALIVE bit, but ~150ms later the whole batch's filter+sort ops (postId, isPublished,
+publishedAt) are absent from the published snapshot. **The v1.1.43 verify-at-activation
+backstop catches + re-drives every one — ZERO data loss.** Non-urgent.
+
+Root cause converged (full detail: memory `project_activation_orphan_residual_2026_07_15.md`;
+branch `hunt/whole-batch-op-loss` off v1.1.45): NOT the main-loop flush (that publishes
+alive+ops together, verified) and NOT save-and-unload (prod logs: is_loading=false, no
+unload lines). It's a NON-main-loop publish — a ForcePublish command-handler
+(`concurrent_engine.rs` 3032/3050/3239/3272/3387/3457/3466) or the force_publish_blocking
+5s-timeout aftermath — storing a `staging.clone()` inconsistent with the just-applied
+batch (missing filter+sort diffs, keeping alive). PRIME suspect: the verifier's own
+`ensure_fields_loaded` (postId eq P) triggers a ForcePublish that republishes a staging
+that lost the batch. Conclusive specimen: bitdex-1 04:01:00, slots 136717883+136717882
+(postId 29781934), has_membership=true@activation but all fields absent@verify, shadow
+diff_sets=0/clears=3 base 109.8M loaded.
+
+POD ASYMMETRY (decisive, sky-verified): redriven bitdex-1=4 / bitdex-0=0 (comparable
+exposure). ALL orphans on the STANDBY; ZERO on the active pod. HAProxy active-passive →
+bitdex-0 serves all users → **ZERO prod-user impact**. Correlates the clobber with a
+COLD→FRESH VB disk load (only on the traffic-starved standby); the warm active pod keeps
+VBs resident so activation sets land hot and survive. Next trace must exercise the
+cold-VB + concurrent-activation + query-triggered-load + ForcePublish combination
+(cross-thread), NOT a sequential same-engine load (which hunter's repro did — it passed).
+
+NEXT UNIT: trace the ForcePublish + force_publish-timeout path (what happens to in-flight
+coalescer ops + staging on timeout; can ForcePublish publish a batch-losing clone) →
+deterministic repro (activation batch concurrent with ForcePublish → assert ops survive)
+→ fix (serialize ForcePublish vs flush apply, or drain pending before clone) → Opus
+review → v1.1.46 (image-only). Also watch: `deferred-reach` (#313) scanning 90,648
+deferred slots (>10k warn) on bitdex-1 — backlog growing, investigate if it keeps climbing.
+
 ## Desc tie-band pagination — FIXED in PR #304 (2026-07-09 night)
 
 Core sort bug, present since the bifurcation engine: descending keyset pagination dropped
