@@ -63,9 +63,13 @@ pub struct MetricsBridge {
     /// Post-activation verifier: slots examined / re-driven. Label: index.
     pub activation_verify_checked_total: prometheus::IntCounterVec,
     pub activation_verify_redriven_total: prometheus::IntCounterVec,
-    /// Post-activation verifier: apparent orphans the post-publish barrier
+    /// Post-activation verifier: apparent orphans the post-publish re-read
     /// proved present (published late — re-drive suppressed). Label: index.
     pub activation_verify_publish_lag_total: prometheus::IntCounterVec,
+    /// Post-activation verifier: absent slots re-driven without a completed
+    /// barrier (drop vs over-long lag unproven — not a confirmed drop).
+    /// Label: index.
+    pub activation_verify_inconclusive_total: prometheus::IntCounterVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.

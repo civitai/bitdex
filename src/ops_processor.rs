@@ -1846,20 +1846,57 @@ pub enum OrphanVerdict {
     /// Present after the barrier: the activation batch was applied and
     /// published late. Nothing was lost, so nothing needs re-driving.
     PublishLag,
-    /// Absent after the barrier with no remove ops against the slot: the
-    /// batch's field ops never reached the published snapshot.
+    /// Absent, but the barrier never completed, so "absent" was never
+    /// established against a published snapshot: this is a genuine drop and a
+    /// publish lag longer than the barrier, indistinguishable. Re-driven like
+    /// any unproven slot, but NOT counted as a confirmed drop.
+    Inconclusive,
+    /// Absent after a COMPLETED barrier with no remove ops against the slot:
+    /// the batch's field ops never reached the published snapshot.
     NonApply,
-    /// Absent after the barrier, and remove ops hit the slot: something
-    /// undid the activation.
+    /// Absent after a COMPLETED barrier, and remove ops hit the slot:
+    /// something undid the activation.
     Revert,
 }
 
 impl OrphanVerdict {
-    pub fn classify(reread_present: bool, has_recent_removes: bool) -> Self {
-        match (reread_present, has_recent_removes) {
-            (true, _) => Self::PublishLag,
-            (false, false) => Self::NonApply,
-            (false, true) => Self::Revert,
+    /// `barrier_ok` is whether `force_publish_blocking` actually COMPLETED.
+    /// It gates only the absent branch: a positive re-read proves the slot
+    /// present however the barrier went, but a negative one proves nothing
+    /// unless a publish is known to have landed first. The barrier times out
+    /// often enough in prod (observed 1-in-2 in one window) that treating a
+    /// timed-out absent read as a confirmed drop would make
+    /// `redriven_total` — the alarm-worthy counter — cry wolf on lag.
+    ///
+    /// ── THE TRADE: a false POSITIVE swapped for a false NEGATIVE ──
+    /// This does NOT make the verifier better at finding drops. It makes
+    /// `redriven_total` SOUND (every count is a real drop — no phantoms) at
+    /// the cost of SENSITIVITY (roughly half of real drops are missed). A
+    /// REAL drop that happens during a slow promote has `barrier_ok == false`
+    /// and lands in `inconclusive`, NOT `redriven` — so an alarm wired to
+    /// `redriven_total` stays SILENT on it. Do not read `redriven_total` as
+    /// "all real drops"; read it as "drops we can prove". `inconclusive` is
+    /// the bucket where the unproven ones — real and benign alike — pile up.
+    ///
+    /// That trade is only acceptable because `Inconclusive` still re-drives:
+    /// the data is repaired either way, so what is lost is DETECTION, not
+    /// safety. An alarm that fires on every long promote gets muted, and a
+    /// muted alarm detects nothing at all.
+    ///
+    /// ── Do NOT "fix" this by raising the barrier cap ──
+    /// Barrier tuning is an ASYMPTOTE, not a solution. 100ms fails ~95% of
+    /// promotes; 500ms fails ~50%; the promote is a CoW clone-cascade with no
+    /// fixed ceiling, so no cap makes `barrier_ok == false` go away. Each
+    /// increment only buys more WAL-reader stall in exchange for a diminishing
+    /// slice of that tail. The structural answer is a LATER PASS (re-check the
+    /// slot once the publish has certainly landed, off this thread) rather
+    /// than a longer WAIT — that is v1.1.48 work, tracked in FOLLOWUP.md.
+    pub fn classify(barrier_ok: bool, reread_present: bool, has_recent_removes: bool) -> Self {
+        match (barrier_ok, reread_present, has_recent_removes) {
+            (_, true, _) => Self::PublishLag,
+            (false, false, _) => Self::Inconclusive,
+            (true, false, false) => Self::NonApply,
+            (true, false, true) => Self::Revert,
         }
     }
     /// Whether the slot must be re-driven. Every verdict that does not PROVE
@@ -1867,26 +1904,45 @@ impl OrphanVerdict {
     pub fn redrives(self) -> bool {
         !matches!(self, Self::PublishLag)
     }
+    /// Whether a re-drive under this verdict is a CONFIRMED drop, i.e. counts
+    /// toward `redriven_total`. `Inconclusive` re-drives too, but its verdict
+    /// is unknown, so it routes to `inconclusive_total` instead — keeping
+    /// `redriven_total` a signal an operator can alarm on.
+    pub fn is_confirmed_drop(self) -> bool {
+        matches!(self, Self::NonApply | Self::Revert)
+    }
     pub fn description(self) -> &'static str {
         match self {
             Self::PublishLag => {
-                "PUBLISH-LAG (present after barrier; batch applied, published late — not a true drop, re-drive skipped)"
+                "PUBLISH-LAG (present after re-read; batch applied, published late — not a true drop, re-drive skipped)"
             }
-            Self::NonApply => "NON-APPLY (still absent after barrier, no revert ops seen)",
-            Self::Revert => "REVERT (still absent after barrier, remove ops hit this slot)",
+            Self::Inconclusive => {
+                "INCONCLUSIVE (absent, but barrier timed out — drop vs over-long publish lag unproven; re-driven anyway)"
+            }
+            Self::NonApply => "NON-APPLY (still absent after completed barrier, no revert ops seen)",
+            Self::Revert => {
+                "REVERT (still absent after completed barrier, remove ops hit this slot)"
+            }
         }
     }
 }
 
 /// What one `verify_recent_activations` pass did.
+///
+/// `redriven`, `publish_lag` and `inconclusive` are mutually exclusive and
+/// together account for every checked slot that was not already indexed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VerifyOutcome {
     /// Activated slots examined (had a membership value to verify).
     pub checked: usize,
-    /// Genuine orphans re-driven from their stored doc.
+    /// Confirmed orphans re-driven from their stored doc: absent after a
+    /// COMPLETED publish barrier. The alarm-worthy count.
     pub redriven: usize,
-    /// Apparent orphans the barrier proved present — published late, skipped.
+    /// Apparent orphans the re-read proved present — published late, skipped.
     pub publish_lag: usize,
+    /// Absent slots re-driven without a completed barrier — drop vs over-long
+    /// publish lag unproven. Watch, don't alarm.
+    pub inconclusive: usize,
 }
 
 /// Post-activation verifier (deferred activation-miss backstop, 2026-07-14).
@@ -1931,6 +1987,7 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
     let mut checked = 0usize;
     let mut redriven = 0usize;
     let mut publish_lag = 0usize;
+    let mut inconclusive = 0usize;
     let mut requeue: Vec<u32> = Vec::new();
     for slot in slots {
         let doc = match engine.get_document(slot) {
@@ -2025,18 +2082,25 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
         //
         // So barrier properly (`publish_barrier_ms`, default 2s — sized over a
         // promote, unlike the 100ms query-path cap) and re-read. (a) PRESENT
-        // after the barrier ⇒ publish lag: the batch landed, nothing was ever
-        // lost, and the re-drive would be a no-op re-apply of data already
-        // arriving — count it and skip. (b) Still ABSENT ⇒ a genuine orphan:
-        // re-drive, and the recent remove-op ring tells us which kind — a
-        // FilterRemove/SortClear/AliveRemove hit is a REVERT signal; an empty
-        // ring points at NON-APPLY.
+        // ⇒ publish lag: the batch landed, nothing was ever lost, and the
+        // re-drive would be a no-op re-apply of data already arriving — count
+        // it and skip. This holds whether or not the barrier completed: a set
+        // bit is proof on its own. (b) ABSENT after a COMPLETED barrier ⇒ a
+        // confirmed orphan: re-drive, and the recent remove-op ring tells us
+        // which kind — a FilterRemove/SortClear/AliveRemove hit is a REVERT
+        // signal; an empty ring points at NON-APPLY. (c) ABSENT but the
+        // barrier TIMED OUT ⇒ INCONCLUSIVE: this barrier is not immune to the
+        // problem it was added to solve — prod shows it completing (+54ms) and
+        // timing out (+501ms, the full cap) at roughly 1-in-2 in one window —
+        // and an absent read behind a timed-out barrier is a drop and a lag
+        // longer than the barrier, indistinguishable. Re-drive (see below) but
+        // keep it out of `redriven_total` so that counter stays alarm-worthy.
         //
         // The suppression cannot mask a real orphan by construction: a dropped
         // slot is still absent after the barrier (no publish can produce a bit
-        // nothing ever set), so it still gets re-driven. Only slots PROVEN
-        // present — i.e. never lost — are skipped. Prod v1.1.46 classified
-        // 2/2 apparent orphans as publish lag.
+        // nothing ever set), so it still gets re-driven — as does an
+        // inconclusive one. Only slots PROVEN present — i.e. never lost — are
+        // skipped. Prod v1.1.46 classified 2/2 apparent orphans as publish lag.
         //
         // Barrier safety: `force_publish_blocking` runs on the WAL-reader thread
         // (this verifier), sends a FlushCommand to the flush thread and waits on
@@ -2058,7 +2122,11 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
         };
         let recent_removes =
             engine.recent_removes_for_slot(slot, diag_now_ms.saturating_sub(5_000));
-        let verdict = OrphanVerdict::classify(reread_present, !recent_removes.is_empty());
+        let verdict = OrphanVerdict::classify(
+            publish_barrier,
+            reread_present,
+            !recent_removes.is_empty(),
+        );
         tracing::warn!(
             target: "activation",
             "verify-diag: slot {slot} {verify_field}={pid} barrier_ok={publish_barrier} reread_present={reread_present} class=\"{}\" recent_removes={recent_removes:?}",
@@ -2068,7 +2136,9 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
             publish_lag += 1;
             continue;
         }
-        // Real orphan: re-drive the full doc via the activation replay path.
+        // Not proven present: re-drive the full doc via the activation replay
+        // path — confirmed orphan or inconclusive alike, since re-driving is
+        // idempotent and only the counter routing differs.
         // Sent through the mutation channel (the flush thread is the sole
         // ArcSwap writer — never mutate staging directly here).
         let document = crate::mutation::Document {
@@ -2107,7 +2177,11 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
             target: "activation",
             "verify: slot {slot} activated but ABSENT from {verify_field} {pid} — re-drove from stored doc"
         );
-        redriven += 1;
+        if verdict.is_confirmed_drop() {
+            redriven += 1;
+        } else {
+            inconclusive += 1;
+        }
     }
     if !requeue.is_empty() {
         engine.requeue_activation_verify(&requeue);
@@ -2132,11 +2206,18 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
                 .with_label_values(&[&bridge.index_name])
                 .inc_by(publish_lag as u64);
         }
+        if inconclusive > 0 {
+            bridge
+                .activation_verify_inconclusive_total
+                .with_label_values(&[&bridge.index_name])
+                .inc_by(inconclusive as u64);
+        }
     }
     VerifyOutcome {
         checked,
         redriven,
         publish_lag,
+        inconclusive,
     }
 }
 
@@ -5450,6 +5531,18 @@ mod tests {
             outcome.publish_lag, 0,
             "a slot still absent after the barrier is a real orphan, not publish lag"
         );
+        // ...and it is re-driven exactly once, under whichever absent verdict:
+        // the three counters partition the not-already-indexed slots.
+        assert_eq!(
+            outcome.redriven + outcome.inconclusive,
+            1,
+            "the absent orphan is re-driven exactly once, and counted exactly once"
+        );
+        assert_eq!(
+            outcome.inconclusive, 0,
+            "the 2s barrier completes on an idle test engine, so the absent orphan \
+             is a CONFIRMED drop rather than inconclusive"
+        );
 
         // The re-drive was sent through the mutation channel; wait for apply.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -5501,29 +5594,124 @@ mod tests {
     /// that PROVES the slot present skips the re-drive. Every other verdict —
     /// including the ambiguous ones — re-drives, so a genuine orphan cannot be
     /// mistaken for publish lag.
+    ///
+    /// Covers the full (barrier_ok × reread_present) square, since the barrier
+    /// is NOT reliably longer than a publish (prod: completes at +54ms, times
+    /// out at +501ms, ~1-in-2 in one window) and its outcome changes what an
+    /// absent read is allowed to mean.
     #[test]
     fn test_orphan_verdict_only_suppresses_proven_present() {
+        // ── present ⇒ PublishLag, however the barrier went ────────────────
+        // A set bit is proof on its own: nothing can publish a bit that was
+        // never set, so a present slot was never lost.
         assert_eq!(
-            OrphanVerdict::classify(true, false),
+            OrphanVerdict::classify(true, true, false),
             OrphanVerdict::PublishLag
         );
         assert_eq!(
-            OrphanVerdict::classify(true, true),
+            OrphanVerdict::classify(true, true, true),
             OrphanVerdict::PublishLag,
             "present after the barrier is present — remove ops don't make a live slot an orphan"
         );
         assert_eq!(
-            OrphanVerdict::classify(false, false),
+            OrphanVerdict::classify(false, true, false),
+            OrphanVerdict::PublishLag,
+            "a positive re-read proves presence even when the barrier timed out"
+        );
+        assert_eq!(
+            OrphanVerdict::classify(false, true, true),
+            OrphanVerdict::PublishLag
+        );
+
+        // ── absent + barrier COMPLETED ⇒ confirmed drop, kind by removes ──
+        assert_eq!(
+            OrphanVerdict::classify(true, false, false),
             OrphanVerdict::NonApply
         );
-        assert_eq!(OrphanVerdict::classify(false, true), OrphanVerdict::Revert);
+        assert_eq!(
+            OrphanVerdict::classify(true, false, true),
+            OrphanVerdict::Revert
+        );
 
+        // ── absent + barrier TIMED OUT ⇒ Inconclusive, either way ─────────
+        // Absent was never established against a published snapshot, so a drop
+        // and an over-long publish lag are indistinguishable — and the remove
+        // ring can't break the tie (a Revert conclusion needs the same proof of
+        // publish that NonApply does).
+        assert_eq!(
+            OrphanVerdict::classify(false, false, false),
+            OrphanVerdict::Inconclusive,
+            "absent behind a timed-out barrier is not proof of a drop"
+        );
+        assert_eq!(
+            OrphanVerdict::classify(false, false, true),
+            OrphanVerdict::Inconclusive
+        );
+
+        // ── SAFETY: everything not proven present still re-drives ─────────
         assert!(
             !OrphanVerdict::PublishLag.redrives(),
             "a slot proven present was never lost — re-driving it is wasted work"
         );
         assert!(OrphanVerdict::NonApply.redrives());
         assert!(OrphanVerdict::Revert.redrives());
+        assert!(
+            OrphanVerdict::Inconclusive.redrives(),
+            "an unproven slot must still be re-driven — the re-drive is idempotent, \
+             so the cost of being wrong is a no-op, not a lost post"
+        );
+    }
+
+    /// Counter routing: `redriven_total` must mean "a confirmed drop appeared"
+    /// so an operator can alarm on it. An Inconclusive re-drives, but it is not
+    /// proof of a drop, so it must route to `inconclusive_total` and leave
+    /// `redriven_total` alone — otherwise a publish lag longer than the barrier
+    /// (routinely half of them, in prod) would fire that alarm falsely.
+    #[test]
+    fn test_verdict_counter_routing_is_exclusive_and_exhaustive() {
+        // Exactly one counter per verdict, and each is the intended one.
+        let route = |v: OrphanVerdict| -> (bool, bool, bool) {
+            // (publish_lag, redriven, inconclusive) — mirrors the increment
+            // arms in verify_recent_activations.
+            if !v.redrives() {
+                (true, false, false)
+            } else if v.is_confirmed_drop() {
+                (false, true, false)
+            } else {
+                (false, false, true)
+            }
+        };
+        assert_eq!(route(OrphanVerdict::PublishLag), (true, false, false));
+        assert_eq!(route(OrphanVerdict::NonApply), (false, true, false));
+        assert_eq!(route(OrphanVerdict::Revert), (false, true, false));
+        assert_eq!(
+            route(OrphanVerdict::Inconclusive),
+            (false, false, true),
+            "an inconclusive re-drive must NOT touch redriven_total"
+        );
+
+        for v in [
+            OrphanVerdict::PublishLag,
+            OrphanVerdict::NonApply,
+            OrphanVerdict::Revert,
+            OrphanVerdict::Inconclusive,
+        ] {
+            let (lag, red, inc) = route(v);
+            assert_eq!(
+                u8::from(lag) + u8::from(red) + u8::from(inc),
+                1,
+                "{v:?} must land in exactly one counter"
+            );
+            // The counters are consistent with the safety property: everything
+            // counted as anything other than publish lag was re-driven.
+            assert_eq!(red || inc, v.redrives(), "{v:?}: counted-as vs re-driven disagree");
+        }
+
+        // Only a CONFIRMED drop is alarm-worthy.
+        assert!(!OrphanVerdict::Inconclusive.is_confirmed_drop());
+        assert!(!OrphanVerdict::PublishLag.is_confirmed_drop());
+        assert!(OrphanVerdict::NonApply.is_confirmed_drop());
+        assert!(OrphanVerdict::Revert.is_confirmed_drop());
     }
 
     /// FALSE ORPHAN (prod v1.1.46: 2/2 classified apparent orphans were this):
