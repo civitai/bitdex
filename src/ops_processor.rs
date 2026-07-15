@@ -2013,9 +2013,13 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
         // ── Post-publish re-read: is this a real orphan, or publish lag? ──
         // The first query above is not proof of a drop. It runs
         // execute_query → ensure_fields_loaded, whose ForcePublish barrier is
-        // capped at 100ms, while a sort promote takes 158-208ms at the median
-        // in prod — so the barrier times out on 93-98% of promotes and the
-        // query reads PRE-publish state. A slot whose activation batch was
+        // capped at 100ms, while a sort promote routinely runs longer than
+        // that in prod — so the barrier times out on the large majority of
+        // promotes (93-98% observed) and the query reads PRE-publish state.
+        // (Directly observed: the 500ms barrier below succeeds while the
+        // 100ms one fails on the same slot in the same window. Do NOT quote
+        // a precise promote duration here — [flush-slow]'s fields do not sum,
+        // so that field is not a trustworthy per-cycle cost. See FOLLOWUP.md.) A slot whose activation batch was
         // applied and is merely publishing late then looks identical to one
         // that was dropped.
         //
