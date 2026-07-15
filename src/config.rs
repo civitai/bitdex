@@ -349,11 +349,25 @@ impl Config {
                     f.name
                 )));
             }
-            // Validate eviction: only on multi_value fields
+            // Validate eviction: allowed on any field that lazy-loads per value,
+            // i.e. multi_value (always per-value) OR single_value with
+            // per_value_lazy=true (e.g. postId/postedToId, high-cardinality FK
+            // columns whose per-value bitmaps otherwise accumulate unbounded).
+            //
+            // The gate mirrors the `lazy_value_fields` inclusion condition in
+            // ConcurrentEngine (`field_type == MultiValue || per_value_lazy`):
+            // only fields on that lazy-reload path can be safely evicted, since
+            // a query re-loads the evicted value's bitmap from ShardStore on
+            // next access. Eager single_value fields (e.g. userId) are NOT
+            // per_value_lazy — they load as a whole and would not reload a
+            // single evicted value — so eviction stays rejected for them.
             if let Some(ref eviction) = f.eviction {
-                if f.field_type != FilterFieldType::MultiValue {
+                let evictable = f.field_type == FilterFieldType::MultiValue
+                    || f.per_value_lazy;
+                if !evictable {
                     return Err(BitdexError::Config(format!(
-                        "filter field '{}': eviction is only supported on multi_value fields",
+                        "filter field '{}': eviction is only supported on multi_value \
+                         fields or single_value fields with per_value_lazy=true",
                         f.name
                     )));
                 }
@@ -1635,5 +1649,73 @@ ms_to_seconds = true
         // Ensure other defaults are preserved
         assert_eq!(restored.cache.decay_rate, CacheConfig::default().decay_rate);
         assert!(restored.validate().is_ok());
+    }
+
+    // ── Single-value per_value_lazy eviction (RSS warm-growth fix B) ──────────
+
+    /// eviction is ACCEPTED on a single_value field when per_value_lazy=true
+    /// (e.g. postId/postedToId) — those fields lazy-load per value and so can
+    /// safely reload an evicted value's bitmap from ShardStore on next query.
+    #[test]
+    fn test_validation_accepts_eviction_on_single_value_per_value_lazy() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "postId".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: Some(EvictionConfig { idle_seconds: 7200.0 }),
+                eager_load: false,
+                per_value_lazy: true,
+                max_range_scan_values: None,
+            }],
+            ..Config::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "eviction must be allowed on single_value per_value_lazy fields"
+        );
+    }
+
+    /// eviction is still REJECTED on a single_value field that is NOT
+    /// per_value_lazy (e.g. an eager FK like userId): it loads as a whole and
+    /// would not reload an individual evicted value, so evicting would drop
+    /// data with no reload path.
+    #[test]
+    fn test_validation_rejects_eviction_on_eager_single_value() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "userId".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: Some(EvictionConfig { idle_seconds: 7200.0 }),
+                eager_load: true,
+                per_value_lazy: false,
+                max_range_scan_values: None,
+            }],
+            ..Config::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "eviction must stay rejected on non-per_value_lazy single_value fields"
+        );
+    }
+
+    /// eviction remains ACCEPTED on multi_value fields (regression guard for
+    /// the existing tagIds/modelVersionIds behavior).
+    #[test]
+    fn test_validation_accepts_eviction_on_multi_value() {
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "tagIds".into(),
+                field_type: FilterFieldType::MultiValue,
+                behaviors: None,
+                eviction: Some(EvictionConfig { idle_seconds: 300.0 }),
+                eager_load: false,
+                per_value_lazy: false,
+                max_range_scan_values: None,
+            }],
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }
