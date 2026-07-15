@@ -1,35 +1,115 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
-## Verifier orphan detection is only ~50% sensitive — needs a later pass, not a longer barrier (2026-07-15)
+## CI never compiles `tests/` — 178 integration tests are invisible, and one is already broken (2026-07-15)
 
-v1.1.47 added the `Inconclusive` verdict so `bitdex_activation_verify_redriven_total` counts only
-drops proven absent after a COMPLETED publish barrier. That makes the counter SOUND (safe to alarm
-on — no phantoms) but only ~50% SENSITIVE: the verifier's own barrier (`publish_barrier_ms`) times
-out often — prod shows the diagnostic landing +54ms when it completes vs +501ms when it gives up at
-the cap, ~1-in-2 in one window — and a REAL drop during a slow promote lands in
-`activation_verify_inconclusive_total`, NOT `redriven_total`. **An alarm on `redriven_total` will
-stay silent on roughly half of genuine drops.** No data is at risk: `Inconclusive` still re-drives,
-so the repair happens either way. What is missing is DETECTION.
+`.github/workflows/test.yml` runs ONLY:
+```
+cargo test --lib
+cargo test --features pg-sync --lib
+cargo check --features server                       # not --tests
+cargo check --features server,pg-sync,heap-prof --bin bitdex-server
+```
+Nothing compiles the `tests/` directory. **29 files / 178 `#[test]` fns never build or run in CI.**
 
-WHY NOT JUST RAISE `publish_barrier_ms`: it's an asymptote, not a knob. 100ms fails ~95% of
-promotes, 500ms ~50%, and the promote is the same CoW clone-cascade as the entry below — no fixed
-ceiling, so no cap drives `barrier_ok == false` to zero. Each increment buys a diminishing slice of
-the tail in exchange for WAL-reader stall. (Distinct from the query-path 100ms barrier below: this
-one is off the user path, so the tradeoff differs, but the underlying cost is shared.)
+**Already-rotted proof:** `tests/bulk_load_fixture_test.rs:24` does `use bitdex_v2::pg_sync::single_pass;` — `pg_sync` exports no `single_pass`. The file cannot compile. CI is green anyway, and has been. Found incidentally while reviewing an unrelated change; nobody would otherwise notice.
 
-⇒ STRUCTURAL FIX (v1.1.48 candidate): re-check inconclusive slots on a LATER PASS instead of waiting
-longer — requeue them and re-read once the publish has certainly landed, off the WAL reader. That
-collapses `inconclusive` back into a definite verdict without stalling anything, restoring
-sensitivity while keeping `redriven_total` sound. Watch `inconclusive_total`'s rate to size the work;
-a rising rate means the barrier is undersized, not that data is being lost.
+**Why this matters more than one dead file:** the tests exist, look maintained, and read as coverage. Anyone adding an integration test to `tests/` reasonably assumes CI runs it. It doesn't. That's coverage theatre — worse than no tests, because it's trusted.
+
+**Related, same root:** the `server`-feature lib tests also never run (no `--features server --lib` line), so ~60 `src/metrics.rs` tests are equally invisible.
+
+**Fix:** add `cargo test --features server,pg-sync` (no `--lib`, so integration tests build+run) to the gate. Expect it RED initially — at minimum `bulk_load_fixture_test.rs` won't compile, `test_min_tracked_value_after_expansion` DEADLOCKS (must be `#[ignore]`d), and `query_stream_full_channel_drops_oldest` is a known Windows-timing flake. Triage each: fix, `#[ignore]`, or delete. Deleting a rotted test is honest; leaving it to look like coverage is not.
+
+## /debug/memory mixes STABLE and NOISY fields with no distinction — it manufactures trends (2026-07-15)
+
+Two engineers independently drew false conclusions from this endpoint within ten minutes of each
+other, in opposite directions, by comparing single samples of fields that happen to be noisy. The
+endpoint presents stable counters and volatile derived values side by side with nothing marking
+which is which. **Measured spreads (8-10 samples, ~4s apart, same pod, steady state):**
+
+| field | spread | safe to compare across time? |
+|---|---|---|
+| `untracked_live_gap` (= allocated − tracked_total) | **0.35 GB** | YES — stablest; both terms stable |
+| `tracked_total` | 0.70 GB | YES |
+| `allocated` | 0.74-0.94 GB | YES-ish — **median-of-N**, it spikes (observed 21.5 median vs 23.5 single outlier) |
+| `rss_bytes` | 1.70 GB | NO without median-of-N |
+| `untracked` (= rss − tracked_total) | **1.95 GB** | **NO** — noisiest; inherits rss's swing |
+| `fragmentation` (= resident − active) | **2.5 GB** (2.3→4.8 in 30s) | **NO** — see below |
+
+Root cause: jemalloc's background decay purges dirty pages, so `resident` oscillates hard; every
+field DERIVED from resident (`rss_bytes`, `untracked`, `fragmentation`) inherits and amplifies that
+swing. Fields derived from `allocated` (`untracked_live_gap`) are stable because both terms are.
+
+**Guidance:** to measure the tracker's blind spot use **`untracked_live_gap`** (live heap the
+serialized-size tracker misses) — NOT `untracked`, which is rss-minus-accounting and sweeps in
+fragmentation + metadata + mapped overhead (none of it live heap, all of it noisy). For any
+comparison across time, median-of-N. Never threshold a derived difference without first sampling its
+variance.
+
+**Suggested fix (#317 follow-up):** annotate the endpoint itself — mark each field stable vs
+volatile (or emit `_median`/`_p50` variants), so the next reader can't make this mistake by reading
+it the obvious way. The endpoint currently invites the error.
+
+## Verifier orphan detection is under-sensitive — needs a later pass, not a longer barrier (2026-07-15)
+
+CORRECTED 2026-07-15 (was titled "only ~50% sensitive"). The original quoted a barrier-timeout rate
+of "~50% / ~1-in-2". **That number was n=2 and is RETRACTED** — as n grew it fell (1/2 → 2/5 → 2/6 →
+2/7) toward roughly 25-30%, and no n worth quoting exists yet. The rate is deliberately absent below:
+the argument never needed it, and quoting one is how it spread. A barrier that misses even 1-in-4
+publishes is a defect; the exact rate changes nothing about the fix.
+
+`Inconclusive` (v1.1.48) makes `bitdex_activation_verify_redriven_total` SOUND — a slot is counted
+only when the publish barrier COMPLETED and the slot was still absent, so no phantoms. It is not
+fully SENSITIVE: the verifier's barrier (`publish_barrier_ms`) times out at a material rate, and a
+REAL drop during a slow promote would land in `activation_verify_inconclusive_total`, NOT
+`redriven_total`. **An alarm on `redriven_total` alone can stay silent on a genuine drop.** No data
+is at risk — `Inconclusive` still re-drives, so repair happens either way. What is missing is
+DETECTION, not repair.
+
+WHY NOT JUST RAISE `publish_barrier_ms` — the economics, not the size, are why it fails: **every
+extra ms is paid as WAL-reader stall**, so you can never buy enough. The promote is an unbounded CoW
+clone-cascade with no fixed ceiling, so no cap drives `barrier_ok == false` to zero; each increment
+buys a diminishing slice of the tail for real stall. **A deferred re-check inverts this: waiting
+costs NOTHING** — the slot sits in a ring while the WAL reader keeps working. Same "wait longer"
+lever, opposite economics. That, not the wait itself, is what escapes the asymptote.
+
+⇒ STRUCTURAL FIX (v1.1.49): re-check on a LATER PASS instead of waiting longer — off the WAL reader.
+**This is a SWAP, not a deletion, and the scheduler IS the work:** the ring (`activation_verify`) is
+a bare `VecDeque<u32>` with **no time dimension**, drained every WAL batch, so a naive "just requeue"
+yields a delay of ~0 — a hot re-check loop that reads pre-publish state exactly like the barrier
+does, and re-drives false drops. It needs `ready_at_ms` + `passes` per entry and a `drain_ready`.
+Design: N=10s re-check delay, k=2 passes. **N is grounded in the worst lag ever OBSERVED (897ms,
+583ms) ⇒ ~11×; NOT in the `[flush-slow] promote=` field, which is a broken instrument (it doesn't
+sum — `total=142ms` with `promote=184.9ms`) — see the entry below.** The decider is the asymmetry:
+N too short = a FALSE REAL-DROP that corrupts `redriven_total`, the very metric this protects; N too
+long = slow repair, harmless behind the v1.1.43 backstop. Err high. k=2 is SAFETY margin (a lag
+between N and 2N gets a second chance rather than becoming a false drop), NOT measurement.
+
+**Do NOT size this work from `inconclusive_total`'s rate** (the original entry said to — it can't):
+it fires only on `barrier_ok=false AND reread_present=false`, and `reread_present=false` has occurred
+ZERO times, with zero confirmed drops ever. `inconclusive_total = 0` cannot distinguish "the barrier
+hid nothing" from "there was nothing to hide" — an ambiguous quiet counter, unresolvable by waiting,
+because the resolving event has never occurred. It is also strictly dominated: a T+10s re-check sees
+everything the 500ms barrier could, with ~20× the margin and no stall. **v1.1.49 DELETES
+`Inconclusive` and `inconclusive_total`** — the barrier's removal deletes `barrier_ok`, and with it
+the ambiguity `Inconclusive` existed to hold. Its protection carries forward as k=2; its uncertainty
+("was N long enough?") moves from a per-slot verdict to a `verify_passes_to_present` histogram, which
+is where a property of the TUNING belongs. Nothing it did is lost.
 
 ## Query freshness guarantee is illusory — the 100ms ForcePublish barrier times out 93-98% (2026-07-15)
 
 MEASURED in prod (v1.1.46, both pods): `ensure_fields_loaded`'s ForcePublish barrier is capped at
-**100ms**, but median sort-promotes run **158ms (bitdex-0) / 208ms (bitdex-1)** — so the barrier
-times out on **93-98% of promotes** (13/14 and 112/114 observed). A query that triggers a per-value
-lazy-load during a promote therefore reads PRE-publish state. The barrier exists to make a query see
-prior writes; it essentially never succeeds, so that guarantee is illusory today.
+**100ms** and times out on **93-98% of promotes** — **13/14 and 112/114 timeouts COUNTED DIRECTLY**,
+which is what this finding rests on. A query that triggers a per-value lazy-load during a promote
+therefore reads PRE-publish state. The barrier exists to make a query see prior writes; it
+essentially never succeeds, so that guarantee is illusory today.
+
+⚠️ The promote figures below (**158ms / 208ms**) come from `[flush-slow] promote=`, a **BROKEN
+instrument — its fields do not sum** (`total=142ms` with `promote=184.9ms`); see the measurement
+caveat in the PERF entry below. They are quoted here only as a plausible ORDER-OF-MAGNITUDE reason
+the 100ms cap is exceeded. **Do not build a decision on them** — the 93-98% rate above is counted
+directly and needs no such support. (This caveat is repeated here rather than left to the entry
+below because a number and its caveat must travel together; the split is exactly how the figure got
+laundered into an N=10s justification it could not support.)
 
 REAL-WORLD COST IS SMALL — deliberately NOT fixed: the effect is sub-second staleness on a
 just-published post for a query that happens to lazy-load mid-promote; it self-resolves on the next
@@ -64,6 +144,27 @@ the exact "158-208ms per cycle" figure is not. Note that the barrier finding abo
 this field — it's observed directly by the v1.1.46 diagnostic (a 500ms barrier succeeds while the
 verifier's 100ms one fails on the same slot in the same window). Fix the accounting if you ever need
 promote numbers to be trustworthy.
+
+SECOND, INDEPENDENT CONFIRMATION (2026-07-15, ava, prod): two consecutive `[flush-slow]` breakouts
+**2 seconds apart both reported `promote=256.3ms` — the identical value to the decimal.** A genuine
+per-cycle cost does not repeat exactly across consecutive cycles. This reaches the same conclusion by
+a different route than the `total=142ms / promote=184.9ms` contradiction above: **whatever `promote=`
+measures, it is not this cycle's promote.** Two independent routes to the same defect ⇒ treat the
+field as broken, not merely suspicious.
+
+⚠️ AND THE BAND USED TO JUDGE IT WAS CONTAMINATED — `grep 'total='` ALSO MATCHES `post_apply_total=`.
+That mixes a 100-900ms metric with a 3-26ms one (34 values scraped from 17 lines). Anchor on
+`[flush-slow] total=` instead. Clean split, n=17:
+| series | min | p50 | p90 | p95 | max |
+|---|---|---|---|---|---|
+| `total=` | 113 | 135 | 151 | **158** | 158 |
+| `post_apply_total=` (the contaminant) | 1 | 6 | — | — | 26 |
+The tell was `min=1` in a band of ~100ms values, and it was read straight past. The 400ms outlier
+threshold **survives** (p95=158 ≪ 400, so the 456/485/524/583/897ms events are genuine outliers,
+~1 per 9min, cause unknown) — but it survives **BY LUCK**: the pollution happened to land where the
+sort didn't move the percentiles much. **Right-for-the-wrong-reason is indistinguishable from right
+until you check.** Any threshold derived from a grep band: verify the band contains only the series
+you think it does, before trusting the percentile.
 
 ## OBSERVABILITY GAP: the v1.1.44 persist-ring cost is unmeasurable (2026-07-15)
 
