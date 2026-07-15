@@ -290,6 +290,11 @@ pub struct Metrics {
     /// Should be ~0 in steady state; a nonzero rate means orphans are being
     /// produced (investigate the activation replay). Label: index.
     pub activation_verify_redriven_total: IntCounterVec,
+    /// Apparent orphans that the post-publish barrier proved PRESENT — the
+    /// batch was applied and merely published late, so the re-drive is
+    /// suppressed. Not a data-loss signal: it measures publish-visibility lag
+    /// against the verifier's read. Label: index.
+    pub activation_verify_publish_lag_total: IntCounterVec,
 
     // -- 11c CPU floor attribution (2026-04-30) --
     /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
@@ -1299,6 +1304,14 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let activation_verify_publish_lag_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_activation_verify_publish_lag_total",
+                "Apparent orphans proven present by the verifier's post-publish barrier (published late, re-drive suppressed — publish-visibility lag, not data loss)",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         // 11c CPU floor attribution (2026-04-30): WAL apply per-batch + mem-scanner tick.
         // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
@@ -1550,6 +1563,7 @@ impl Metrics {
         registry.register(Box::new(deferred_fanout_reached_total.clone())).unwrap();
         registry.register(Box::new(activation_verify_checked_total.clone())).unwrap();
         registry.register(Box::new(activation_verify_redriven_total.clone())).unwrap();
+        registry.register(Box::new(activation_verify_publish_lag_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
@@ -1705,6 +1719,7 @@ impl Metrics {
             deferred_fanout_reached_total,
             activation_verify_checked_total,
             activation_verify_redriven_total,
+            activation_verify_publish_lag_total,
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,

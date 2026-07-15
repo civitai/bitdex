@@ -221,6 +221,19 @@ pub struct ActivationVerifyConfig {
     /// Slots drained from the ring and verified per WAL-reader batch.
     #[serde(default = "default_activation_verify_batch_limit")]
     pub batch_limit: usize,
+    /// Cap on the verifier's post-publish barrier: how long an apparent orphan
+    /// waits for the flush thread to publish before the verifier decides it is
+    /// a real orphan and re-drives it.
+    ///
+    /// Sized well above a sort promote (prod medians 158ms active / 208ms
+    /// standby, tail ~440ms), because a barrier shorter than a promote reads
+    /// pre-publish state and calls a published-late slot an orphan — the false
+    /// orphans this exists to stop. It runs on the WAL reader, only on the
+    /// ~0.3% apparent-orphan path, and returns as soon as the publish lands, so
+    /// the cap is a bound and not a cost. Distinct from `ensure_fields_loaded`'s
+    /// 100ms barrier, which sits on the user query path and is NOT this knob.
+    #[serde(default = "default_activation_verify_publish_barrier_ms")]
+    pub publish_barrier_ms: u64,
 }
 fn default_activation_retry_secs() -> u64 {
     30
@@ -231,6 +244,9 @@ fn default_activation_verify_ring_cap() -> usize {
 fn default_activation_verify_batch_limit() -> usize {
     4_096
 }
+fn default_activation_verify_publish_barrier_ms() -> u64 {
+    2_000
+}
 impl Default for ActivationVerifyConfig {
     fn default() -> Self {
         Self {
@@ -238,6 +254,7 @@ impl Default for ActivationVerifyConfig {
             retry_secs: default_activation_retry_secs(),
             ring_cap: default_activation_verify_ring_cap(),
             batch_limit: default_activation_verify_batch_limit(),
+            publish_barrier_ms: default_activation_verify_publish_barrier_ms(),
         }
     }
 }

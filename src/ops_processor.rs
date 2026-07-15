@@ -1838,6 +1838,57 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
     (checked, healed, cursor)
 }
 
+/// What the verifier concluded about an apparent orphan once the post-publish
+/// barrier re-read came back. Only `PublishLag` is benign — it means the slot
+/// was present all along and the first read was early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    /// Present after the barrier: the activation batch was applied and
+    /// published late. Nothing was lost, so nothing needs re-driving.
+    PublishLag,
+    /// Absent after the barrier with no remove ops against the slot: the
+    /// batch's field ops never reached the published snapshot.
+    NonApply,
+    /// Absent after the barrier, and remove ops hit the slot: something
+    /// undid the activation.
+    Revert,
+}
+
+impl OrphanVerdict {
+    pub fn classify(reread_present: bool, has_recent_removes: bool) -> Self {
+        match (reread_present, has_recent_removes) {
+            (true, _) => Self::PublishLag,
+            (false, false) => Self::NonApply,
+            (false, true) => Self::Revert,
+        }
+    }
+    /// Whether the slot must be re-driven. Every verdict that does not PROVE
+    /// the slot present re-drives — a genuine orphan can never be suppressed.
+    pub fn redrives(self) -> bool {
+        !matches!(self, Self::PublishLag)
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PublishLag => {
+                "PUBLISH-LAG (present after barrier; batch applied, published late — not a true drop, re-drive skipped)"
+            }
+            Self::NonApply => "NON-APPLY (still absent after barrier, no revert ops seen)",
+            Self::Revert => "REVERT (still absent after barrier, remove ops hit this slot)",
+        }
+    }
+}
+
+/// What one `verify_recent_activations` pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifyOutcome {
+    /// Activated slots examined (had a membership value to verify).
+    pub checked: usize,
+    /// Genuine orphans re-driven from their stored doc.
+    pub redriven: usize,
+    /// Apparent orphans the barrier proved present — published late, skipped.
+    pub publish_lag: usize,
+}
+
 /// Post-activation verifier (deferred activation-miss backstop, 2026-07-14).
 ///
 /// Drains recently-activated slots (queued by the flush thread after replay)
@@ -1850,15 +1901,19 @@ pub fn overdue_deferred_sweep<S: BitmapSink>(
 /// full-overwrite sort layers, idempotent filter inserts, so re-driving a
 /// healthy slot (or one that a concurrent organic op already fixed) is a no-op.
 ///
+/// An apparent orphan is not taken at face value: the first read can simply be
+/// ahead of the publish, so the slot is re-read after a barrier and only
+/// re-driven if it is still absent (see `OrphanVerdict`).
+///
 /// Runs on the WAL reader between batches (query + doc reads stay off the flush
-/// thread). Returns `(checked, redriven)`.
-pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (usize, usize) {
+/// thread).
+pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> VerifyOutcome {
     // The membership field — the filter field the activation fan-out groups on
     // (e.g. postId) — is config-driven; no field name is baked into the logic.
     // Absent (or not a configured filter) → the verifier is disabled.
     let verify_field = match engine.config().activation_verify.membership_field.clone() {
         Some(f) if !f.is_empty() => f,
-        _ => return (0, 0),
+        _ => return VerifyOutcome::default(),
     };
     if !engine
         .config()
@@ -1866,15 +1921,16 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
         .iter()
         .any(|f| f.name == verify_field)
     {
-        return (0, 0);
+        return VerifyOutcome::default();
     }
     let slots = engine.drain_activation_verify(limit);
     if slots.is_empty() {
-        return (0, 0);
+        return VerifyOutcome::default();
     }
     let registry = FieldRegistry::from_config(engine.config());
     let mut checked = 0usize;
     let mut redriven = 0usize;
+    let mut publish_lag = 0usize;
     let mut requeue: Vec<u32> = Vec::new();
     for slot in slots {
         let doc = match engine.get_document(slot) {
@@ -1954,54 +2010,63 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
              membership[{}] shadow[{shadow_state}] source_sort_present={sort_present:?}",
             engine.filter_value_state_debug(&verify_field, pid as u64, slot),
         );
-        // ── Post-publish re-read + revert-signal (OBSERVATIONAL diagnostic) ──
-        // Complements the VB-state line above and pins the specimen's true
-        // cause. STRICTLY OBSERVATIONAL: this only LOGS a classification; the
-        // re-drive below still fires exactly as before, so a real orphan can
-        // never be masked. (a) Drain the flush thread's pending publishes
-        // (`force_publish_blocking` barrier) and query once more: if the slot is
-        // PRESENT after the barrier the first miss was publish-visibility lag
-        // (the batch WAS applied, just published late — not a true drop). (b)
-        // Dump recent remove-ops for this slot from the flush thread's ring: a
+        // ── Post-publish re-read: is this a real orphan, or publish lag? ──
+        // The first query above is not proof of a drop. It runs
+        // execute_query → ensure_fields_loaded, whose ForcePublish barrier is
+        // capped at 100ms, while a sort promote takes 158-208ms at the median
+        // in prod — so the barrier times out on 93-98% of promotes and the
+        // query reads PRE-publish state. A slot whose activation batch was
+        // applied and is merely publishing late then looks identical to one
+        // that was dropped.
+        //
+        // So barrier properly (`publish_barrier_ms`, default 2s — sized over a
+        // promote, unlike the 100ms query-path cap) and re-read. (a) PRESENT
+        // after the barrier ⇒ publish lag: the batch landed, nothing was ever
+        // lost, and the re-drive would be a no-op re-apply of data already
+        // arriving — count it and skip. (b) Still ABSENT ⇒ a genuine orphan:
+        // re-drive, and the recent remove-op ring tells us which kind — a
         // FilterRemove/SortClear/AliveRemove hit is a REVERT signal; an empty
-        // result with a still-absent re-read points at NON-APPLY.
+        // ring points at NON-APPLY.
+        //
+        // The suppression cannot mask a real orphan by construction: a dropped
+        // slot is still absent after the barrier (no publish can produce a bit
+        // nothing ever set), so it still gets re-driven. Only slots PROVEN
+        // present — i.e. never lost — are skipped. Prod v1.1.46 classified
+        // 2/2 apparent orphans as publish lag.
         //
         // Barrier safety: `force_publish_blocking` runs on the WAL-reader thread
         // (this verifier), sends a FlushCommand to the flush thread and waits on
-        // a bounded channel with a 500ms cap — no lock is held across the wait,
-        // it targets a different thread, and the verifier processes orphans
-        // sequentially, so it cannot self-deadlock or stack. It's the rare
-        // (~0.3%) orphan path only, and `execute_query` above already triggers a
-        // (100ms-capped) ForcePublish via ensure_fields_loaded — this is a
-        // slightly longer barrier for a cleaner read.
+        // a bounded channel — no lock is held across the wait, it targets a
+        // different thread, and the verifier processes orphans sequentially, so
+        // it cannot self-deadlock or stack. It returns as soon as the publish
+        // lands (the cap is a bound, not a cost) and only the rare (~0.3%)
+        // apparent-orphan path pays it.
         let diag_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let publish_barrier =
-            engine.force_publish_blocking(std::time::Duration::from_millis(500));
+        let publish_barrier = engine.force_publish_blocking(std::time::Duration::from_millis(
+            engine.config().activation_verify.publish_barrier_ms,
+        ));
         let reread_present = match engine.execute_query(&query) {
             Ok(r) => r.ids.iter().any(|&id| id == slot as i64),
             Err(_) => false,
         };
         let recent_removes =
             engine.recent_removes_for_slot(slot, diag_now_ms.saturating_sub(5_000));
-        let classification = if reread_present {
-            "PUBLISH-LAG (present after barrier; batch applied, published late — not a true drop)"
-        } else if recent_removes.is_empty() {
-            "NON-APPLY (still absent after barrier, no revert ops seen)"
-        } else {
-            "REVERT (still absent after barrier, remove ops hit this slot)"
-        };
+        let verdict = OrphanVerdict::classify(reread_present, !recent_removes.is_empty());
         tracing::warn!(
             target: "activation",
-            "verify-diag: slot {slot} {verify_field}={pid} barrier_ok={publish_barrier} reread_present={reread_present} class=\"{classification}\" recent_removes={recent_removes:?}"
+            "verify-diag: slot {slot} {verify_field}={pid} barrier_ok={publish_barrier} reread_present={reread_present} class=\"{}\" recent_removes={recent_removes:?}",
+            verdict.description(),
         );
-        // Orphan: re-drive the full doc via the activation replay path (fires
-        // regardless of the diagnostic classification — idempotent, and the
-        // backstop must never skip a genuine orphan). Sent through the mutation
-        // channel (the flush thread is the sole ArcSwap writer — never mutate
-        // staging directly here).
+        if !verdict.redrives() {
+            publish_lag += 1;
+            continue;
+        }
+        // Real orphan: re-drive the full doc via the activation replay path.
+        // Sent through the mutation channel (the flush thread is the sole
+        // ArcSwap writer — never mutate staging directly here).
         let document = crate::mutation::Document {
             fields: doc.fields.clone(),
         };
@@ -2057,8 +2122,18 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
                 .with_label_values(&[&bridge.index_name])
                 .inc_by(redriven as u64);
         }
+        if publish_lag > 0 {
+            bridge
+                .activation_verify_publish_lag_total
+                .with_label_values(&[&bridge.index_name])
+                .inc_by(publish_lag as u64);
+        }
     }
-    (checked, redriven)
+    VerifyOutcome {
+        checked,
+        redriven,
+        publish_lag,
+    }
 }
 
 /// Field-name label for the zero-match fan-out counter. Low-cardinality by
@@ -5359,9 +5434,18 @@ mod tests {
 
         // Queue both and run the verifier.
         engine.push_activation_verify_for_test(&[orphan, healthy]);
-        let (checked, redriven) = verify_recent_activations(&engine, 100);
-        assert_eq!(checked, 2, "both slots have a postId doc value → both checked");
-        assert_eq!(redriven, 1, "only the orphan (absent from postId) is re-driven");
+        let outcome = verify_recent_activations(&engine, 100);
+        assert_eq!(outcome.checked, 2, "both slots have a postId doc value → both checked");
+        assert_eq!(
+            outcome.redriven, 1,
+            "only the orphan (absent from postId) is re-driven"
+        );
+        // SAFETY PROPERTY: a slot genuinely absent after the barrier is a real
+        // orphan and must never be mistaken for publish lag and skipped.
+        assert_eq!(
+            outcome.publish_lag, 0,
+            "a slot still absent after the barrier is a real orphan, not publish lag"
+        );
 
         // The re-drive was sent through the mutation channel; wait for apply.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -5406,6 +5490,164 @@ mod tests {
         assert!(
             pub_true.contains(&(orphan as i64)),
             "orphan must be in postId AND isPublished=true after re-drive, got {pub_true:?}"
+        );
+    }
+
+    /// The suppression's safety property, at the decision level: ONLY a re-read
+    /// that PROVES the slot present skips the re-drive. Every other verdict —
+    /// including the ambiguous ones — re-drives, so a genuine orphan cannot be
+    /// mistaken for publish lag.
+    #[test]
+    fn test_orphan_verdict_only_suppresses_proven_present() {
+        assert_eq!(
+            OrphanVerdict::classify(true, false),
+            OrphanVerdict::PublishLag
+        );
+        assert_eq!(
+            OrphanVerdict::classify(true, true),
+            OrphanVerdict::PublishLag,
+            "present after the barrier is present — remove ops don't make a live slot an orphan"
+        );
+        assert_eq!(
+            OrphanVerdict::classify(false, false),
+            OrphanVerdict::NonApply
+        );
+        assert_eq!(OrphanVerdict::classify(false, true), OrphanVerdict::Revert);
+
+        assert!(
+            !OrphanVerdict::PublishLag.redrives(),
+            "a slot proven present was never lost — re-driving it is wasted work"
+        );
+        assert!(OrphanVerdict::NonApply.redrives());
+        assert!(OrphanVerdict::Revert.redrives());
+    }
+
+    /// FALSE ORPHAN (prod v1.1.46: 2/2 classified apparent orphans were this):
+    /// a slot whose activation batch HAS been applied but is not yet published
+    /// reads as absent, and must NOT be re-driven — the post-publish barrier
+    /// proves it present, so it counts as publish lag instead.
+    ///
+    /// The unpublished-but-applied state is staged the way prod produces it: a
+    /// mutation sits in the channel while the flush thread has yet to publish
+    /// it. The flush cycle is widened so that window is observable (at the 50µs
+    /// default it closes before the verifier can read), and the attempt is
+    /// retried if the flush thread publishes first and leaves no lag to see.
+    #[test]
+    fn test_verify_publish_lag_slot_is_not_redriven() {
+        let mut config = safety_net_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.activation_verify.membership_field = Some("postId".into());
+        // Hold the flush thread's publish long enough to read ahead of it.
+        config.flush_interval_us = 100_000;
+        // The barrier must outlast the widened cycle (prod's 2s default is
+        // sized against a ~200ms promote, not a 100ms-1s test flush loop).
+        config.activation_verify.publish_barrier_ms = 5_000;
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let post_id: i64 = 5150;
+        let slot: u32 = 80;
+
+        let postid_ids = |engine: &ConcurrentEngine| -> Vec<i64> {
+            let q = crate::query::BitdexQuery {
+                filters: vec![crate::query::FilterClause::Eq(
+                    "postId".into(),
+                    crate::query::Value::Integer(post_id),
+                )],
+                sort: None,
+                limit: 1000,
+                offset: None,
+                cursor: None,
+                skip_cache: true,
+            };
+            engine.execute_query(&q).map(|r| r.ids).unwrap_or_default()
+        };
+
+        // Alive, doc carries the postId, postId bitmap not yet set — the state
+        // an activated slot is in until its batch publishes.
+        {
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: slot as i64,
+                creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                    Op::Set { field: "publishedAt".into(), value: json!(now - 10) },
+                ],
+            }];
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.write_set(slot, "postId", &json!(post_id));
+            dw.flush();
+        }
+        wait_for_alive_slot(&engine, slot, 5_000);
+        assert!(
+            !postid_ids(&engine).contains(&(slot as i64)),
+            "setup: postId must not be published yet"
+        );
+
+        let filter_op = |slots: Vec<u32>, insert: bool| {
+            if insert {
+                crate::write_coalescer::MutationOp::FilterInsert {
+                    field: "postId".into(),
+                    value: post_id as u64,
+                    slots,
+                }
+            } else {
+                crate::write_coalescer::MutationOp::FilterRemove {
+                    field: "postId".into(),
+                    value: post_id as u64,
+                    slots,
+                }
+            }
+        };
+
+        let mut lag_observed = false;
+        for _ in 0..5 {
+            // The activation batch's postId insert: in the channel, applied by
+            // the flush thread, not yet published.
+            engine
+                .mutation_sender()
+                .send(filter_op(vec![slot], true))
+                .unwrap();
+            engine.push_activation_verify_for_test(&[slot]);
+            let outcome = verify_recent_activations(&engine, 100);
+            assert_eq!(
+                outcome.redriven, 0,
+                "a slot the barrier proves present was never lost — re-driving it is the \
+                 false-orphan wolf-cry this fix removes"
+            );
+            if outcome.publish_lag == 1 {
+                lag_observed = true;
+                break;
+            }
+            // The flush thread published before the verifier's first read, so
+            // there was no lag to observe (outcome: healthy, checked only).
+            // Undo the insert and try again.
+            engine
+                .mutation_sender()
+                .send(filter_op(vec![slot], false))
+                .unwrap();
+            assert!(engine.force_publish_blocking(std::time::Duration::from_secs(5)));
+        }
+        assert!(
+            lag_observed,
+            "never caught the verifier reading ahead of the publish — the test staged \
+             no publish-lag window, so it proved nothing"
+        );
+        // And the batch did land on its own: no re-drive was needed.
+        assert!(
+            postid_ids(&engine).contains(&(slot as i64)),
+            "the applied batch must be published after the barrier"
         );
     }
 
@@ -5491,9 +5733,9 @@ mod tests {
             "orphan still not in postId after restart (bitmap was never set)"
         );
 
-        let (checked, redriven) = verify_recent_activations(&engine2, 100);
-        assert_eq!(checked, 1, "the reloaded ring must present the orphan");
-        assert_eq!(redriven, 1, "the reloaded orphan must be re-driven");
+        let outcome = verify_recent_activations(&engine2, 100);
+        assert_eq!(outcome.checked, 1, "the reloaded ring must present the orphan");
+        assert_eq!(outcome.redriven, 1, "the reloaded orphan must be re-driven");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {

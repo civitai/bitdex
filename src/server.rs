@@ -1633,13 +1633,14 @@ impl BitdexServer {
                                 if !engine.is_loading_mode() {
                                     let batch_limit =
                                         engine.config().activation_verify.batch_limit;
-                                    let (checked, redriven) =
+                                    let outcome =
                                         crate::ops_processor::verify_recent_activations(
                                             &engine, batch_limit,
                                         );
-                                    if redriven > 0 {
+                                    if outcome.redriven > 0 {
                                         eprintln!(
-                                            "post-activation verify: re-drove {redriven} orphaned slot(s) of {checked} checked"
+                                            "post-activation verify: re-drove {} orphaned slot(s) of {} checked",
+                                            outcome.redriven, outcome.checked
                                         );
                                     }
                                 }
@@ -1977,6 +1978,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
             activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
             activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
+            activation_verify_publish_lag_total: state.metrics.activation_verify_publish_lag_total.clone(),
             wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
             bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
             query_total: state.metrics.query_total.clone(),
@@ -2344,6 +2346,7 @@ async fn handle_create_index(
         deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
         activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
         activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
+            activation_verify_publish_lag_total: state.metrics.activation_verify_publish_lag_total.clone(),
         wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
         bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
         query_total: state.metrics.query_total.clone(),
