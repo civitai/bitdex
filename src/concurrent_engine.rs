@@ -70,6 +70,11 @@ pub struct MetricsBridge {
     /// barrier (drop vs over-long lag unproven — not a confirmed drop).
     /// Label: index.
     pub activation_verify_inconclusive_total: prometheus::IntCounterVec,
+    /// Post-activation verifier ring depth: all pending, and the drainable
+    /// subset. The ONLY verifier signals in which a strand appears as a
+    /// presence rather than an absence. Label: index.
+    pub activation_verify_pending: prometheus::IntGaugeVec,
+    pub activation_verify_ready: prometheus::IntGaugeVec,
     /// 11c CPU floor attribution: WAL apply per-batch duration.
     pub wal_apply_batch_seconds: prometheus::HistogramVec,
     /// 11c CPU floor attribution: bitmap memory scanner tick duration.
@@ -300,6 +305,72 @@ enum LazyLoad {
         slots: crate::slot::SlotAllocator,
     },
 }
+/// A slot awaiting post-activation verification, tagged with the publish count
+/// observed when it was queued.
+///
+/// The tag is what lets the verifier prove — rather than assume — that the
+/// slot's activation batch is visible before judging it absent. The flush
+/// thread applies the batch, reads the publish count as `enqueued_at_publish`,
+/// then publishes and increments. So once the live count exceeds
+/// `enqueued_at_publish`, the batch is provably in the published snapshot and
+/// "absent" means absent.
+///
+/// This replaces a force-publish barrier the verifier used to run inline: it
+/// waited a bounded time for a publish it could not make happen faster, timed
+/// out on a large share of them, and then had to guess. Observing a publish
+/// costs nothing and cannot time out. See `drain_activation_verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingVerify {
+    pub slot: u32,
+    pub gate: VerifyGate,
+}
+
+/// What a pending slot is waiting for before it can be judged.
+///
+/// Not a bare `u64`: a slot restored from disk has NOTHING to wait for — its
+/// state is already in the boot snapshot — and no count can express that,
+/// because the gate is "count has moved PAST my tag" and the counter starts at
+/// 0. Encoding "nothing to wait for" as a number would mean either stranding
+/// restored slots on a quiet index (no writes ⇒ no publish ⇒ no verification,
+/// silently) or loosening the comparison for everyone and letting live slots be
+/// judged before their batch is published. The two cases are genuinely
+/// different, so they are two variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyGate {
+    /// Verifiable now. Used for slots rehydrated at boot: whatever happened to
+    /// them happened before the restart, and the restored state is already in
+    /// the snapshot the verifier will read — there is no in-flight batch.
+    Ready,
+    /// Verifiable once the publish count EXCEEDS this value — the slot's
+    /// activation batch was applied by the cycle that recorded it, and becomes
+    /// visible when that cycle publishes.
+    ///
+    /// The value MUST be read on the flush thread while queueing (before that
+    /// cycle's publish), never at drain time — a value read at drain would
+    /// already include the publish it is meant to be waiting for, silently
+    /// inverting the check into "always ready".
+    AfterPublish(u64),
+}
+
+impl VerifyGate {
+    /// Whether this slot may be judged, given the live publish count.
+    fn is_open(self, published: u64) -> bool {
+        match self {
+            Self::Ready => true,
+            // STRICTLY greater, and the strictness is the whole gate. A slot is
+            // tagged with the seq that is CURRENTLY published, and its own batch
+            // publishes at `c + 1`. So `published == c` is the state every live
+            // slot occupies between enqueue and its own publish: relaxing this to
+            // `>=` opens the gate the instant the slot is queued and hands the
+            // verifier pre-publish state — the false-orphan bug this gate exists
+            // to remove, restored in one character.
+            // Pinned by ops_processor::tests::
+            // test_gate_is_closed_at_the_slots_own_publish_seq, which fails under `>=`.
+            Self::AfterPublish(c) => published > c,
+        }
+    }
+}
+
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
 /// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
@@ -310,6 +381,16 @@ pub struct InnerEngine {
     pub slots: crate::slot::SlotAllocator,
     pub filters: crate::filter::FilterIndex,
     pub sorts: crate::sort::SortIndex,
+    /// Monotonic id of the publish that produced this snapshot, stamped by the
+    /// flush thread immediately before the `ArcSwap` store.
+    ///
+    /// It lives in here — rather than in an atomic beside the ArcSwap — so that
+    /// it is published by the same atomic store as the state it describes. A
+    /// reader gets the seq and the data it certifies from one load, and no
+    /// reordering can let the number run ahead of the contents. The
+    /// post-activation verifier relies on that to tell "this slot's batch is
+    /// live" from "I am reading too early"; see `published_seq`.
+    pub publish_seq: u64,
 }
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
@@ -504,7 +585,7 @@ pub struct ConcurrentEngine {
     /// activation can leave an unverified orphan — bounded and rare, further
     /// bounded by the overdue sweep; the read-miss re-defer removes the known
     /// cause. See `push_activation_verify` / `drain_activation_verify`.
-    activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>>,
+    activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<PendingVerify>>>,
     /// Diagnostic ring of recently-applied remove-shaped ops (alive/filter/sort),
     /// used by the activation-orphan verifier to distinguish a whole-batch
     /// NON-APPLY from an explicit REVERT of a just-activated slot. Bounded
@@ -1140,6 +1221,10 @@ impl ConcurrentEngine {
             slots,
             filters,
             sorts,
+            // Boot: this process has published nothing yet. Restored slots are
+            // gated `Ready` rather than on a seq precisely because this counter
+            // is process-local and starts over here.
+            publish_seq: 0,
         };
         // Flush thread owns a staging clone; readers see published snapshots
         let mut staging = inner_engine.clone();
@@ -1215,10 +1300,44 @@ impl ConcurrentEngine {
         // before a crash — not yet verified — are re-checked on restart
         // (closes the in-memory ring's boot-gap; the overdue sweep can't see
         // an activation orphan). Idempotent: re-verifying a healthy slot no-ops.
-        let seeded_verify: std::collections::VecDeque<u32> = meta_store
+        //
+        // RE-STAMP, don't restore: every rehydrated slot comes back as
+        // `VerifyGate::Ready`.
+        //
+        // Two reasons, and both are load-bearing. First, a restored slot has
+        // NOTHING to wait for — its state was published before the restart and
+        // is already in the snapshot built below, so there is no in-flight batch
+        // and gating it on a future publish would strand it on any index quiet
+        // enough not to write (no writes ⇒ nothing dirty ⇒ no publish ⇒ no
+        // verification, silently). Second, `flush_publish_count` is
+        // process-local and starts at 0, so a count carried over from the
+        // previous process would name a value this one may never reach — the
+        // same permanent, unsignalled stranding. Silent non-verification is the
+        // one failure mode with nothing attached to it: no log line, no counter,
+        // no alarm. A slot that quietly stops being watched looks exactly like a
+        // slot with nothing wrong.
+        //
+        // Correct in both directions: if the pre-restart batch was genuinely
+        // lost, the slot reads absent after the next publish and is re-driven;
+        // if it landed, it reads present and is dropped. The `!is_loading_mode`
+        // gate on the verifier keeps it out of the restore window meanwhile.
+        // Re-stamping is also why the on-disk format stays a plain slot list —
+        // no tag to serialize, so no version bump and no migration.
+        // Pinned by ops_processor::tests::
+        // test_activation_verify_ring_survives_restart (which enqueues at a HIGH
+        // count precisely so that persisting the tag would strand it).
+        let seeded_verify: std::collections::VecDeque<PendingVerify> = meta_store
             .as_ref()
             .and_then(|ms| ms.load_activation_verify().ok())
-            .map(std::collections::VecDeque::from)
+            .map(|slots| {
+                slots
+                    .into_iter()
+                    .map(|slot| PendingVerify {
+                        slot,
+                        gate: VerifyGate::Ready,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         if !seeded_verify.is_empty() {
             eprintln!(
@@ -1226,7 +1345,7 @@ impl ConcurrentEngine {
                 seeded_verify.len()
             );
         }
-        let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<u32>>> =
+        let activation_verify: Arc<parking_lot::Mutex<std::collections::VecDeque<PendingVerify>>> =
             Arc::new(parking_lot::Mutex::new(seeded_verify));
         let flush_activation_verify = Arc::clone(&activation_verify);
         // Diagnostic remove-op ring (activation-orphan non-apply-vs-revert probe).
@@ -1862,12 +1981,43 @@ impl ConcurrentEngine {
                             // exclude them. Bounded ring: drop oldest when over cap
                             // (the overdue sweep + doc/bitmap fixes bound the
                             // orphan population if a burst overflows).
+                            //
+                            // Each slot is tagged with the publish count read
+                            // HERE — on the flush thread, in the same cycle that
+                            // applied its ops (via `coalescer.push_ops` above),
+                            // and BEFORE this cycle's `inner.store` publishes
+                            // them. The verifier waits for the count to pass that
+                            // tag, which is precisely when the batch becomes
+                            // visible, so it never reads pre-publish state and
+                            // never has to guess how long a promote took.
+                            //
+                            // Reading the count at DRAIN time instead would be
+                            // silently wrong: it would already include this
+                            // cycle's publish, making every slot look ready
+                            // immediately — the check would still compile, still
+                            // pass its own unit tests, and do nothing.
+                            // Pinned by ops_processor::tests::
+                            // test_gate_is_closed_at_the_slots_own_publish_seq.
+                            //
+                            // ⚠️ THREAD CONFINEMENT IS LOAD-BEARING HERE. This is
+                            // sound because the apply above, this tag, and the
+                            // `inner.store` below all happen on the SINGLE flush
+                            // thread within ONE loop iteration, with no publish
+                            // in between — so the next publish is necessarily the
+                            // one carrying this batch. Add ANY store of `staging`
+                            // between here and the apply and the bug returns
+                            // quietly: that store stamps `flush_cycle`, which is
+                            // already > this tag, so the gate opens and hands the
+                            // verifier a correctly-stamped snapshot that does not
+                            // contain the batch. The seq would be honest and the
+                            // verdict still wrong. Don't publish in this span.
                             {
                                 let cap = flush_config.activation_verify.ring_cap;
+                                let gate = VerifyGate::AfterPublish(inner.load().publish_seq);
                                 let mut q = flush_activation_verify.lock();
                                 for &slot in &activated {
                                     if !redefer_on_read_miss.contains(&slot) {
-                                        q.push_back(slot);
+                                        q.push_back(PendingVerify { slot, gate });
                                     }
                                 }
                                 while q.len() > cap {
@@ -2810,6 +2960,16 @@ impl ConcurrentEngine {
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                            //
+                            // Stamp the seq that certifies this snapshot's contents,
+                            // HERE: after the batch is applied (`apply_prepared_traced`
+                            // above) and immediately before the store, so the two are
+                            // one act. The verifier releases a slot when the published
+                            // seq passes the value recorded at its enqueue, so a seq
+                            // that ran ahead of the ops would promise a batch the
+                            // snapshot doesn't carry — a false real-drop. Stamping
+                            // earlier in the cycle would reintroduce exactly that.
+                            staging.publish_seq = flush_cycle;
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3120,8 +3280,32 @@ impl ConcurrentEngine {
                                 // the verify ring is a recovery hint, not the
                                 // authoritative deferred state, and re-verifying a
                                 // stale/healthy slot on boot is an idempotent no-op.
-                                let verify_snapshot: Vec<u32> =
-                                    flush_activation_verify.lock().iter().copied().collect();
+                                // Slots only. The publish-count tags are
+                                // deliberately NOT persisted, and serializing
+                                // them would be a silent, permanent bug:
+                                // `flush_publish_count` is PROCESS-LOCAL and
+                                // restarts at 0, while this file outlives the
+                                // process. A slot tagged at, say, 5000 and
+                                // restored verbatim would wait for a count that
+                                // restarts below it — `count > 5000` is false
+                                // forever — so it would sit in the ring
+                                // unverified for the life of the pod, with no
+                                // log line, no counter, and no alarm. A slot
+                                // that quietly stops being watched looks exactly
+                                // like a slot with nothing wrong.
+                                //
+                                // "We're losing information, serialize the tag"
+                                // is the reasonable-sounding change that causes
+                                // it. The loader re-stamps instead (see the
+                                // seeding site), which is why this stays a plain
+                                // slot list needing no format version.
+                                // Pinned by ops_processor::tests::
+                                // test_activation_verify_ring_survives_restart.
+                                let verify_snapshot: Vec<u32> = flush_activation_verify
+                                    .lock()
+                                    .iter()
+                                    .map(|p| p.slot)
+                                    .collect();
                                 if let Err(e) = ms.write_activation_verify(&verify_snapshot) {
                                     eprintln!(
                                         "Warning: failed to persist activation-verify ring \
@@ -3528,6 +3712,22 @@ impl ConcurrentEngine {
                                     slots,
                                     filters: new_filters,
                                     sorts: new_sorts,
+                                    // CARRY the seq forward. An unload changes
+                                    // what is resident, not which publish we are
+                                    // on, so rebuilding staging must not rewind
+                                    // it. `publish_seq: 0` here compiles and
+                                    // reads fine, and the damage is transient
+                                    // rather than permanent — `flush_cycle` never
+                                    // rewinds, so the next cycle stamps a higher
+                                    // seq and the gate recovers. The cost is the
+                                    // window: while the seq is behind, no slot
+                                    // drains, the ring keeps taking activations,
+                                    // and once it passes `ring_cap` the oldest
+                                    // entries are evicted off the front —
+                                    // silently dropping slots that were never
+                                    // verified. Pinned by ops_processor::tests::
+                                    // test_unload_does_not_rewind_publish_seq.
+                                    publish_seq: staging.publish_seq,
                                 };
                                 flush_unified_cache.clear();
                                 inner.store(Arc::new(staging.clone()));
@@ -8336,12 +8536,36 @@ impl ConcurrentEngine {
         );
     }
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
+    ///
+    /// Relaxed, and reporting-only. Nothing about correctness may depend on this
+    /// counter: `flush_publish_count` lives BESIDE the snapshot, so it can drift
+    /// from what is actually published. The verifier uses `published_seq`, which
+    /// rides INSIDE the snapshot and therefore cannot. Keep it that way.
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
             self.flush_publish_count.load(Ordering::Relaxed),
             self.flush_duration_nanos.load(Ordering::Relaxed),
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
         )
+    }
+    /// The sequence number of the currently published snapshot — the verifier's
+    /// proof of what is live.
+    ///
+    /// The flush thread applies a batch, stamps the seq, and publishes, all in
+    /// one cycle. Because the seq rides INSIDE `InnerEngine`, it and the state it
+    /// describes are published by a single atomic store: the seq cannot advance
+    /// without the snapshot advancing, and cannot describe a snapshot that isn't
+    /// live. So for a slot enqueued while seq `S` was published, seeing
+    /// `published_seq() > S` PROVES its batch is visible — no barrier, no wait,
+    /// no guess at how long a promote takes.
+    ///
+    /// This is why there is no memory-ordering contract to get right here: it's
+    /// one `ArcSwap` load, and the seq comes back attached to the very snapshot
+    /// it certifies. An earlier design kept the counter beside the snapshot and
+    /// ordered the two by hand; that ordering could be broken by a refactor
+    /// without any test noticing, because the window is nanoseconds wide.
+    pub fn published_seq(&self) -> u64 {
+        self.snapshot().publish_seq
     }
     /// Per-phase flush timing in nanoseconds:
     /// `(apply, cache, publish, timebucket, compact, opslog, sort_promote)`.
@@ -8864,14 +9088,52 @@ impl ConcurrentEngine {
         out.dedup();
         out
     }
-    /// Drain up to `limit` recently-activated slots awaiting post-activation
-    /// verification (see the `activation_verify` field). FIFO — the WAL reader
-    /// calls this between batches to re-check each slot is indexed under its
-    /// own postId.
+    /// Drain up to `limit` activated slots whose activation batch is PROVABLY
+    /// published, and which are therefore safe to judge.
+    ///
+    /// A slot is released only once the publish count has moved past the value
+    /// recorded when it was queued (see `PendingVerify` and
+    /// `published_seq`). Slots still waiting on their publish stay in
+    /// the ring; they are not orphans, and the verifier must not see them —
+    /// reading a slot before its batch is published is exactly how a healthy
+    /// post gets reported as a dropped one.
+    ///
+    /// Stops at the first slot whose gate is closed, so the cost is proportional
+    /// to what is returned rather than to the ring's depth.
+    ///
+    /// That short-circuit is an OPTIMISATION resting on the ring being ordered in
+    /// practice — activations are queued by the single flush thread reading a
+    /// monotonic seq, and requeues re-tag under the ring lock — not on a property
+    /// anything enforces. It is safe either way: the gate is evaluated per entry,
+    /// so an out-of-order tag can only make the drain stop EARLY, parking slots
+    /// for another pass. It can never release a slot before its own publish, and
+    /// it can never drop one. Do not upgrade this to a claim that ordering is
+    /// guaranteed — it isn't, and the code doesn't need it to be.
     pub fn drain_activation_verify(&self, limit: usize) -> Vec<u32> {
+        let published = self.published_seq();
         let mut q = self.activation_verify.lock();
-        let n = limit.min(q.len());
-        q.drain(..n).collect()
+        let mut out = Vec::new();
+        while out.len() < limit {
+            match q.front() {
+                Some(p) if p.gate.is_open(published) => {
+                    out.push(p.slot);
+                    q.pop_front();
+                }
+                // Not yet published, or ring empty — everything behind it was
+                // queued no earlier, so nothing further is ready.
+                _ => break,
+            }
+        }
+        out
+    }
+    /// Number of slots whose batch is published and which are ready to verify.
+    /// Counterpart to `activation_verify_len` (all pending, published or not).
+    /// Exported as `bitdex_activation_verify_ready` — see that metric's docs for
+    /// why ring DEPTH is the only verifier signal a strand shows up in.
+    pub fn activation_verify_ready_len(&self) -> usize {
+        let published = self.published_seq();
+        let q = self.activation_verify.lock();
+        q.iter().take_while(|p| p.gate.is_open(published)).count()
     }
     /// Diagnostic: describe a filter value's in-memory VersionedBitmap state for
     /// a slot, in the published snapshot. Used by the post-activation verifier to
@@ -8906,22 +9168,53 @@ impl ConcurrentEngine {
     }
     /// Re-queue slots for a later verify pass (e.g. the doc wasn't readable
     /// this pass). Appended to the back so the ring keeps rotating.
+    ///
+    /// Re-tagged with the CURRENT publish count, so a requeued slot waits for a
+    /// further publish before it is looked at again. That keeps the ring's
+    /// ordering non-decreasing (every existing entry was tagged no later than
+    /// now), which is what lets `drain_activation_verify` stop at the first
+    /// unpublished entry.
     pub fn requeue_activation_verify(&self, slots: &[u32]) {
         if slots.is_empty() {
             return;
         }
+        // Take the lock FIRST, then read the seq. Reading it before locking lets
+        // two requeues interleave — A reads seq 5, B reads seq 6 and appends,
+        // then A appends 5 behind it — and the ring goes decreasing. That is
+        // benign for safety (a lower tag only ever releases EARLIER than its
+        // neighbour, and never before its own publish), but `drain` stops at the
+        // first closed gate, so an out-of-order tag can park the entries behind
+        // it for an extra pass. Cheap to just not have.
         let mut q = self.activation_verify.lock();
-        q.extend(slots.iter().copied());
+        let gate = VerifyGate::AfterPublish(self.published_seq());
+        q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
-    /// Number of slots pending post-activation verification.
+    /// Number of slots pending post-activation verification, published or not.
+    /// See `activation_verify_ready_len` for the drainable subset.
     pub fn activation_verify_len(&self) -> usize {
         self.activation_verify.lock().len()
     }
-    /// Test-only: enqueue slots for verification directly.
+    /// Test-only: enqueue slots that are immediately verifiable.
     #[cfg(test)]
     pub fn push_activation_verify_for_test(&self, slots: &[u32]) {
+        self.push_activation_verify_gated_for_test(slots, VerifyGate::Ready);
+    }
+    /// Test-only: read the ring without draining it.
+    ///
+    /// Exists so a test can assert what the PRODUCTION enqueue site actually
+    /// stamped, rather than what a test handed it. Every gate test that builds
+    /// its own gate verifies `is_open` as arithmetic and says nothing about the
+    /// one line that decides the argument — which is where the gate can be
+    /// turned off without any of them noticing.
+    #[cfg(test)]
+    pub fn activation_verify_peek_for_test(&self) -> Vec<PendingVerify> {
+        self.activation_verify.lock().iter().copied().collect()
+    }
+    /// Test-only: enqueue slots behind an explicit gate.
+    #[cfg(test)]
+    pub fn push_activation_verify_gated_for_test(&self, slots: &[u32], gate: VerifyGate) {
         let mut q = self.activation_verify.lock();
-        q.extend(slots.iter().copied());
+        q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
     /// Diagnostic: recent remove-shaped ops (alive/filter/sort) applied to a
     /// slot at or after `since_ms` (wall-clock millis), newest last. Used by the
@@ -8964,7 +9257,10 @@ impl ConcurrentEngine {
     #[cfg(test)]
     pub fn persist_activation_verify_for_test(&self) {
         if let Some(ref ms) = self.meta_store {
-            let snapshot: Vec<u32> = self.activation_verify.lock().iter().copied().collect();
+            // Slots only, mirroring the flush thread's persist: tags are
+            // per-boot and re-stamped on load.
+            let snapshot: Vec<u32> =
+                self.activation_verify.lock().iter().map(|p| p.slot).collect();
             ms.write_activation_verify(&snapshot).expect("persist verify ring");
         }
     }
@@ -10048,12 +10344,21 @@ impl ConcurrentEngine {
                 self.pending_sort_loads.lock().insert(sc.name.clone());
             }
         }
+        // Carry the publish seq across the rebuild — an unload changes what is
+        // resident, not which publish we are on. Rewinding it stalls the gate
+        // until `flush_cycle` climbs back past it (transient, not permanent),
+        // and the cost is the window: the ring keeps filling while nothing
+        // drains, and past `ring_cap` the front is evicted — unverified slots
+        // dropped with no log line and no counter. Read before `snap` goes.
+        // Pinned by ops_processor::tests::test_unload_does_not_rewind_publish_seq.
+        let publish_seq = snap.publish_seq;
         // Drop our reference to the old snapshot before sending to flush thread.
         drop(snap);
         let unloaded = InnerEngine {
             slots,
             filters: new_filters,
             sorts: new_sorts,
+            publish_seq,
         };
         // Phase 3: Route through flush thread — replaces both staging and
         // published snapshot atomically. Flush thread drains any pending

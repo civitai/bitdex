@@ -2201,6 +2201,20 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> Ver
     }
     #[cfg(feature = "server")]
     if let Some(bridge) = engine.metrics_bridge_handle() {
+        // Ring depth, sampled EVERY pass — including passes that drain nothing,
+        // which is the case worth seeing. Unconditional on purpose: every other
+        // signal here is a counter that reports a strand by going quiet, and
+        // quiet is what a clean result looks like too. Depth is the only one
+        // where a strand is a rising line rather than an absence, so it must not
+        // be gated behind "did anything happen".
+        bridge
+            .activation_verify_pending
+            .with_label_values(&[&bridge.index_name])
+            .set(engine.activation_verify_len() as i64);
+        bridge
+            .activation_verify_ready
+            .with_label_values(&[&bridge.index_name])
+            .set(engine.activation_verify_ready_len() as i64);
         if checked > 0 {
             bridge
                 .activation_verify_checked_total
@@ -5432,6 +5446,319 @@ mod tests {
         );
     }
 
+    // NOTE — there is deliberately NO test here pinning "the seq must not
+    // advance before the snapshot it describes." That invariant existed in an
+    // earlier design that kept the publish count in an atomic BESIDE the
+    // ArcSwap, ordered against the store by hand. A test was written for it and
+    // then mutated (increment moved above the store): the test stayed GREEN,
+    // because the violation window is nanoseconds and any observational test
+    // polls straight past it. A test that cannot fail is worse than no test —
+    // it is the reason the next person stops looking.
+    //
+    // The invariant is now carried by `InnerEngine::publish_seq`: the seq is
+    // published by the same atomic store as the state it certifies, so the
+    // mutation is not expressible and there is nothing left to pin.
+
+    /// A test engine that has published at least once, so slots tagged 0 are
+    /// drainable. An IDLE engine never publishes — nothing is dirty, so the
+    /// count legitimately stays at 0 — which is itself the design working: with
+    /// no publish, nothing is provably visible and nothing may be judged.
+    #[cfg(test)]
+    fn engine_past_first_publish(config: crate::config::Config) -> ConcurrentEngine {
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(1)),
+        );
+        engine
+            .put(1, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.published_seq() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+    }
+
+    /// THE GATE, tested at the only value that discriminates: `published == c`.
+    ///
+    /// Every live slot sits at exactly this value between being enqueued and its
+    /// own batch publishing — the flush thread tags it with the seq that is
+    /// CURRENTLY published, and the batch lands at `c + 1`. So `published == c`
+    /// means "my batch has NOT published yet", and the gate must be CLOSED.
+    ///
+    /// This is the assertion the earlier version of this test lacked, while
+    /// carrying this name. It gated at `AfterPublish(u64::MAX)` (closed under
+    /// both `>` and `>=`) and `AfterPublish(0)` with `published > 0` (open under
+    /// both) — two values that agree, and never the one that disagrees. Relaxing
+    /// the gate to `>=` therefore left 79 tests green while making it a total
+    /// no-op: every slot drainable the instant it is queued, verifier reading
+    /// pre-publish state, false orphans restored in one character. A test named
+    /// for an invariant it does not pin is worse than no test, because it is
+    /// trusted — this one fails under `>=`.
+    #[test]
+    fn test_gate_is_closed_at_the_slots_own_publish_seq() {
+        let engine = engine_past_first_publish(safety_net_config());
+
+        // The live-slot state, reproduced exactly: tag == currently-published seq.
+        let live = engine.published_seq();
+        engine.push_activation_verify_gated_for_test(
+            &[42],
+            crate::concurrent_engine::VerifyGate::AfterPublish(live),
+        );
+
+        // THE DISCRIMINATING ASSERTION. `>` keeps this closed; `>=` opens it.
+        assert_eq!(
+            engine.drain_activation_verify(100),
+            Vec::<u32>::new(),
+            "a slot tagged with the CURRENTLY published seq has not had its own \
+             batch published yet — the gate must be CLOSED. If this returns the \
+             slot, the gate is a no-op: it hands the verifier pre-publish state \
+             and manufactures the false orphans it exists to prevent."
+        );
+        assert_eq!(engine.activation_verify_len(), 1, "still queued, not dropped");
+        assert_eq!(engine.activation_verify_ready_len(), 0, "and not counted ready");
+
+        // Now let its batch publish. The gate must OPEN — it delays judgement,
+        // it never prevents it.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(43)),
+        );
+        engine
+            .put(43, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.published_seq() <= live {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            engine.drain_activation_verify(100),
+            vec![42],
+            "once the seq passes the tag the batch is provably live, so the slot \
+             MUST be released — a gate that never opens is a stranded slot"
+        );
+    }
+
+    /// THE ENQUEUE SITE — the one production line that decides what the gate is
+    /// asked. Everything else about the gate is arithmetic; this is the argument.
+    ///
+    /// The other gate tests each build their gate BY HAND and hand it to
+    /// `is_open`. That verifies the operator and says nothing about
+    /// `VerifyGate::AfterPublish(inner.load().publish_seq)` at the enqueue site —
+    /// so the gate can be switched off there without any of them noticing:
+    ///   `VerifyGate::Ready`                          -> 1234 passed, 0 failed
+    ///   `AfterPublish(seq.saturating_sub(1))`        -> 1234 passed, 0 failed
+    /// Under either, every live slot is drainable before its own batch publishes
+    /// and the whole gate is a no-op, silently. Same miss as the `>=` hole one
+    /// seam over: the operator got pinned, the argument didn't.
+    ///
+    /// So drive a REAL activation through the flush thread and assert the tag it
+    /// actually received. Deterministic by quiescence: the slot is scheduled a
+    /// couple of seconds out, the engine is left idle so nothing publishes (an
+    /// idle engine has nothing dirty), and the live seq is therefore stable at
+    /// `P` when the activation cycle reads it. The tag must be exactly `P` —
+    /// `Ready` fails, `P-1` fails.
+    #[test]
+    fn test_enqueue_site_tags_with_the_live_publish_seq() {
+        let mut config = safety_net_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.activation_verify.membership_field = Some("postId".into());
+        let engine = ConcurrentEngine::new(config).unwrap();
+
+        let slot: u32 = 77;
+        let post_id: i64 = 5150;
+        let now = unit_now_secs() as i64;
+        // Two seconds out: deferred now, activates later — the gap is what makes
+        // the seq quiescent and the assertion exact.
+        let activate_at = now + 2;
+
+        let meta = FieldMeta::from_config(engine.config());
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(activate_at) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        // The activation replay reads the stored doc; without postId it has no
+        // membership value and the slot is never queued.
+        dw.write_set(slot, "postId", &json!(post_id));
+        dw.flush();
+
+        assert!(
+            !engine.is_slot_alive(slot),
+            "setup: a future publishedAt must defer, not activate"
+        );
+
+        // Let the deferral settle, then read the seq while nothing is publishing.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let live_seq = engine.published_seq();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            engine.published_seq(),
+            live_seq,
+            "setup: an idle engine must not publish, or the seq below isn't stable"
+        );
+
+        // Now let it activate for real — flush thread, production path.
+        wait_for_alive_slot(&engine, slot, 6_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while engine.activation_verify_peek_for_test().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the activation never queued the slot for verification"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let pending = engine.activation_verify_peek_for_test();
+        let entry = pending
+            .iter()
+            .find(|p| p.slot == slot)
+            .expect("the activated slot must be queued for verification");
+
+        // THE ASSERTION. Not `Ready` — a slot with an in-flight batch has
+        // something to wait for. Not `P-1` — that is already passed, so the gate
+        // is open before the batch lands. Exactly `P`: the seq that was live when
+        // the batch was applied, so the gate opens on the publish that carries it.
+        assert_eq!(
+            entry.gate,
+            crate::concurrent_engine::VerifyGate::AfterPublish(live_seq),
+            "the enqueue site must tag an activation with the seq that was live \
+             when its batch was applied (expected AfterPublish({live_seq})). \
+             `Ready` or any lower tag opens the gate before the batch publishes, \
+             which hands the verifier pre-publish state and makes the entire gate \
+             a silent no-op — the bug it exists to prevent."
+        );
+    }
+
+    /// The publish seq must never RUN BACKWARDS — pinning bug 3.
+    ///
+    /// The two `InnerEngine` rebuild sites (field unload) construct a fresh
+    /// struct, so they must carry `publish_seq` across. Writing `publish_seq: 0`
+    /// there compiles, reads perfectly well, and rewinds the gate. Unlike the
+    /// seq-vs-snapshot ordering — which this design made *inexpressible* — this
+    /// mistake IS expressible, so it gets a test rather than a comment.
+    ///
+    /// The damage is transient, not permanent: `flush_cycle` keeps climbing, so
+    /// the gate recovers within a cycle. The cost is the window — while the seq
+    /// is behind, nothing drains, the ring keeps taking activations, and past
+    /// `ring_cap` the front is evicted, silently dropping unverified slots.
+    #[test]
+    fn test_unload_does_not_rewind_publish_seq() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = safety_net_config();
+        config.storage.bitmap_path = Some(dir.path().join("bitmaps"));
+        config.merge_interval_ms = 200;
+        let docstore_path = dir.path().join("docs");
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+
+        // Get the seq off the floor so a rewind to 0 is actually a decrease.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "id".to_string(),
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(11)),
+        );
+        engine
+            .put(11, &crate::mutation::Document { fields })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.published_seq() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published after a write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = engine.published_seq();
+        assert!(before > 0, "precondition: seq is off the floor");
+
+        // Unload rebuilds InnerEngine — the seq must survive the rebuild.
+        // BOTH rebuild sites, because there are two and they are reached by
+        // different commands: `save_and_unload` sends SyncUnloaded, while
+        // `exit_loading_mode_and_save_unload` sends ExitLoadingSaveUnload and
+        // rebuilds staging inside the flush loop. Driving only the first leaves
+        // the second comment-guarded — verified by mutating each site alone:
+        // with only `save_and_unload` here, `publish_seq: 0` at the flush-loop
+        // site SURVIVES. Two sites, two paths, or the pin is half a pin.
+        engine.save_and_unload().unwrap();
+        engine.enter_loading_mode();
+        engine.exit_loading_mode_and_save_unload().unwrap();
+
+        // Watch across the rebuild's publish. Monotonic means monotonic: not
+        // "recovers shortly", not "usually" — never lower, at any observation.
+        let watch = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        while std::time::Instant::now() < watch {
+            let now = engine.published_seq();
+            assert!(
+                now >= before,
+                "publish seq went BACKWARDS across an unload ({now} < {before}). \
+                 An unload changes what is resident, not which publish we are on. \
+                 While the seq is behind, the gate opens for nothing: the ring \
+                 fills with activations that never drain, and past ring_cap the \
+                 oldest are evicted — unverified slots dropped with no log line, \
+                 no counter and no alarm."
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The ring's ordering is STRUCTURAL, and the drain relies on it: it stops at
+    /// the first unpublished entry, which is only sound if nothing behind that
+    /// entry can be ready. Tags come from a single flush thread reading a
+    /// monotonic counter, so the ring is always non-decreasing — no config knob
+    /// can perturb it (unlike a time-based delay, where a hot-reloaded interval
+    /// could). Cheap to hold, so hold it: otherwise the short-circuit silently
+    /// becomes "drop slots on the floor" or gets "fixed" into a full scan on
+    /// every WAL batch.
+    #[test]
+    fn test_drain_stops_at_first_unpublished_and_keeps_the_rest() {
+        let engine = engine_past_first_publish(safety_net_config());
+
+        // Ready, ready, NOT-ready, ready — in ring order.
+        use crate::concurrent_engine::VerifyGate::AfterPublish;
+        engine.push_activation_verify_gated_for_test(&[1, 2], AfterPublish(0));
+        engine.push_activation_verify_gated_for_test(&[3], AfterPublish(u64::MAX));
+        engine.push_activation_verify_gated_for_test(&[4], AfterPublish(0));
+
+        let drained = engine.drain_activation_verify(100);
+        assert_eq!(
+            drained,
+            vec![1, 2],
+            "the drain must stop at the first unpublished slot rather than skip it"
+        );
+        assert_eq!(
+            engine.activation_verify_len(),
+            2,
+            "the unpublished slot AND everything behind it stay queued — a slot \
+             must never be silently discarded by the short-circuit"
+        );
+    }
+
     /// Post-activation verifier (deferred activation-miss backstop): an ALIVE
     /// slot whose stored doc carries a postId but whose postId FILTER bitmap was
     /// never set (the orphan signature — activated but the postId insert dropped)
@@ -5924,7 +6251,18 @@ mod tests {
             );
             // Queue for verification and persist the ring (what the flush thread
             // does on an activation cycle), then let a merge persist bitmaps.
-            engine.push_activation_verify_for_test(&[orphan]);
+            //
+            // Tagged with a HIGH publish count, the way a real slot enqueued
+            // after thousands of flush cycles would be. Realistic, but NOT what
+            // makes this test able to fail — Mutation H hardcodes the tag at the
+            // LOAD site, so the test would fail at AfterPublish(0) too. What
+            // makes it able to fail is the re-stamp on load being the only thing
+            // that clears a tag the new process cannot reach; the fixture just
+            // looks like production while doing it.
+            engine.push_activation_verify_gated_for_test(
+                &[orphan],
+                crate::concurrent_engine::VerifyGate::AfterPublish(5_000),
+            );
             engine.persist_activation_verify_for_test();
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(engine);
@@ -5938,8 +6276,29 @@ mod tests {
             "orphan still not in postId after restart (bitmap was never set)"
         );
 
+        // Deliberately NOT waiting for a publish: a restored slot has no
+        // in-flight batch, so it must be verifiable immediately. Requiring a
+        // publish here would strand it on any index quiet enough not to write.
+        assert_eq!(
+            engine2.published_seq(),
+            0,
+            "precondition: a freshly booted, idle engine has published nothing — \
+             which is exactly the state a restored slot must be verifiable in"
+        );
+
         let outcome = verify_recent_activations(&engine2, 100);
-        assert_eq!(outcome.checked, 1, "the reloaded ring must present the orphan");
+        // THE REHYDRATE SEAM: the slot was enqueued at count 5000, but this
+        // process's counter restarted at 0. It is verifiable only because the
+        // loader re-stamped the tag. Persist the tag verbatim instead and this
+        // assertion reads checked=0 — the slot stranded in the ring forever,
+        // silently, which is the failure with no signal attached.
+        assert_eq!(
+            outcome.checked, 1,
+            "a slot restored from the persisted ring must still be verified — if this \
+             is 0, its publish-count tag survived the restart and now names a count \
+             this process will never reach, so the slot is stranded unverified with \
+             no log, no counter and no alarm"
+        );
         assert_eq!(outcome.redriven, 1, "the reloaded orphan must be re-driven");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
