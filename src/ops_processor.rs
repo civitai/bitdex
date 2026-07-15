@@ -4912,6 +4912,174 @@ mod tests {
     /// activation read misses; the slot must NOT go alive and must stay
     /// deferred. Pre-fix this asserts fails: the slot is alive with no bitmaps.
     #[test]
+    fn test_per_value_lazy_insert_survives_lazy_load() {
+        // Isolates the lead's per_value_lazy hypothesis: an insert to a
+        // per_value_lazy field for a value NEVER on disk (like an activation
+        // replay's postId insert for a dump-deferred slot) creates an UNLOADED
+        // VersionedBitmap with the slot in its diff. A subsequent query on that
+        // value triggers the per-value lazy load. Assert the slot survives.
+        let dir = tempfile::TempDir::new().unwrap();
+        let docstore_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+        let mut config = Config::default();
+        config.storage.bitmap_path = Some(bitmap_path);
+        config.filter_fields = vec![
+            FilterFieldConfig {
+                name: "nsfwLevel".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None, eviction: None, eager_load: true,
+                per_value_lazy: false, max_range_scan_values: None,
+            },
+            FilterFieldConfig {
+                name: "postId".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None, eviction: None, eager_load: false,
+                per_value_lazy: true, max_range_scan_values: None,
+            },
+        ];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "existedAt".into(), source_type: "uint32".into(),
+            encoding: "linear".into(), bits: 32, eager_load: false, computed: None,
+        }];
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let post_id: i64 = 29783080;
+        let slot: u32 = 500;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(post_id) },
+                Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                Op::Set { field: "existedAt".into(), value: json!(1000) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, slot, 5_000);
+
+        // Query postId=P → per-value lazy load engages. Slot must survive.
+        let q = crate::query::BitdexQuery {
+            filters: vec![crate::query::FilterClause::Eq(
+                "postId".into(),
+                crate::query::Value::Integer(post_id),
+            )],
+            sort: None, limit: 100, offset: None, cursor: None, skip_cache: true,
+        };
+        let res = engine.execute_query(&q).unwrap();
+        assert!(
+            res.ids.contains(&(slot as i64)),
+            "per_value_lazy postId insert must survive the lazy load, got {:?}",
+            res.ids
+        );
+    }
+
+    /// The lead's exact specimen shape: postId=P is PARTIALLY on disk (an
+    /// earlier alive image of the post), then the engine restarts (P becomes
+    /// per_value_lazy unloaded, on disk), then a NEW slot's postId=P is inserted
+    /// in-memory (the activation replay for a dump-deferred image), then a query
+    /// on postId=P triggers the per-value lazy load FROM DISK (load_base). If
+    /// that load drops the in-memory-inserted slot, the new slot is absent =
+    /// the orphan. Assert BOTH the on-disk slot and the new in-memory slot are
+    /// present.
+    #[test]
+    fn test_per_value_lazy_ondisk_load_preserves_inmemory_insert() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let docstore_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+        let mut config = Config::default();
+        config.storage.bitmap_path = Some(bitmap_path);
+        config.merge_interval_ms = 100;
+        config.filter_fields = vec![
+            FilterFieldConfig {
+                name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue,
+                behaviors: None, eviction: None, eager_load: true,
+                per_value_lazy: false, max_range_scan_values: None,
+            },
+            FilterFieldConfig {
+                name: "postId".into(), field_type: FilterFieldType::SingleValue,
+                behaviors: None, eviction: None, eager_load: false,
+                per_value_lazy: true, max_range_scan_values: None,
+            },
+        ];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "existedAt".into(), source_type: "uint32".into(),
+            encoding: "linear".into(), bits: 32, eager_load: false, computed: None,
+        }];
+        let post_id: i64 = 29783080;
+        let on_disk_slot: u32 = 100; // earlier alive image, persisted with postId=P
+        let new_slot: u32 = 200;     // dump-deferred image, activation inserts postId=P
+
+        let postid_ids = |engine: &ConcurrentEngine| -> Vec<i64> {
+            let q = crate::query::BitdexQuery {
+                filters: vec![crate::query::FilterClause::Eq(
+                    "postId".into(), crate::query::Value::Integer(post_id))],
+                sort: None, limit: 100, offset: None, cursor: None, skip_cache: true,
+            };
+            engine.execute_query(&q).map(|r| r.ids).unwrap_or_default()
+        };
+
+        // --- Engine 1: persist an alive image with postId=P to disk ---
+        {
+            let engine = ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            let meta = FieldMeta::from_config(engine.config());
+            let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+            let mut dw = DocWriter::new(engine.docstore_arc());
+            let mut batch = vec![EntityOps {
+                entity_id: on_disk_slot as i64, creates_slot: true,
+                ops: vec![
+                    Op::Set { field: "postId".into(), value: json!(post_id) },
+                    Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                    Op::Set { field: "existedAt".into(), value: json!(1000) },
+                ],
+            }];
+            apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+            crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+            dw.flush();
+            wait_for_alive_slot(&engine, on_disk_slot, 5_000);
+            assert!(postid_ids(&engine).contains(&(on_disk_slot as i64)));
+            // Let the merge thread persist filter bitmaps to disk, then drop
+            // (drop joins the merge thread → final persist).
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(engine);
+        }
+
+        // --- Engine 2: reopen (postId=P on disk, lazy/unloaded) ---
+        let engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        // Insert the NEW slot's postId=P in-memory (mimics activation replay).
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: new_slot as i64, creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(post_id) },
+                Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                Op::Set { field: "existedAt".into(), value: json!(2000) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, new_slot, 5_000);
+
+        // Query postId=P → triggers the per-value lazy load of P FROM DISK.
+        let ids = postid_ids(&engine);
+        assert!(
+            ids.contains(&(on_disk_slot as i64)),
+            "on-disk slot must be present after lazy load, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&(new_slot as i64)),
+            "in-memory-inserted slot must SURVIVE the disk lazy-load, got {ids:?}"
+        );
+    }
+
+    #[test]
     fn test_activation_read_miss_redefers_not_orphans() {
         let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
         let now = unit_now_secs();
