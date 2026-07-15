@@ -1664,6 +1664,22 @@ impl ConcurrentEngine {
                                         let doc = crate::mutation::Document {
                                             fields: stored_doc.fields.clone(),
                                         };
+                                        // iii instrumentation signal: does the stored
+                                        // doc carry the verifier's membership field
+                                        // (e.g. postId) at activation? A missing field
+                                        // here would mean an incomplete read
+                                        // (Ok(Some(partial))) — the diagnostic that
+                                        // would confirm a partial-doc drop class on
+                                        // the next occurrence. Logged below; no action
+                                        // taken (a complete doc always emits the
+                                        // membership insert, per the LIFO-merge
+                                        // refutation — we do not re-defer speculatively).
+                                        let has_membership = flush_config
+                                            .activation_verify
+                                            .membership_field
+                                            .as_deref()
+                                            .map(|mf| doc.fields.contains_key(mf))
+                                            .unwrap_or(true);
                                         #[cfg(feature = "pg-sync")]
                                         {
                                             let derived =
@@ -1685,8 +1701,16 @@ impl ConcurrentEngine {
                                             false,
                                             &flush_field_registry,
                                         );
-                                        // iii: op count is the direct signal for a
-                                        // "replayed but produced nothing" activation.
+                                        // iii: per-activation instrumentation. Low
+                                        // volume (~activation rate); target
+                                        // "activation" for rotation-proof pulls. The
+                                        // op count + membership presence are the
+                                        // decisive signals for any residual drop.
+                                        tracing::info!(
+                                            target: "activation",
+                                            "slot {slot} activated: ds_get=ok ops={} doc_fields={} has_membership={has_membership}",
+                                            ops.len(), doc.fields.len(),
+                                        );
                                         if ops.len() <= 1 {
                                             tracing::warn!(
                                                 target: "activation",
