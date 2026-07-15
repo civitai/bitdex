@@ -5432,61 +5432,18 @@ mod tests {
         );
     }
 
-    /// THE ORDERING CONTRACT the verifier's soundness rests on:
-    /// **the publish count must never advance before the snapshot it describes.**
-    ///
-    /// The verifier proves a slot's batch is visible by watching the count pass
-    /// the value recorded at enqueue. That proof lives across two modules and is
-    /// held only by program order inside the flush loop — `inner.store` before
-    /// `flush_pub_count.fetch_add`, one increment site, both in the same cycle.
-    /// A refactor can break that silently and no type will complain, so it is
-    /// pinned here: move the increment above the store and this test fails.
-    ///
-    /// Checks the direction that can actually hurt us. Publishing WITHOUT
-    /// incrementing is safe (the ForcePublish handlers do it, and the verifier
-    /// just waits for the next main-loop publish); incrementing without
-    /// publishing is what would let the verifier read pre-publish state and
-    /// report a healthy post as dropped.
-    #[test]
-    fn test_publish_count_advances_only_after_publish() {
-        let config = safety_net_config();
-        let engine = ConcurrentEngine::new(config).unwrap();
-
-        // Write, then wait for the count to move. Whenever it moves, the write
-        // it covers must already be readable — that is the whole contract.
-        let mut fields = HashMap::new();
-        fields.insert(
-            "id".to_string(),
-            crate::mutation::FieldValue::Single(crate::query::Value::Integer(4242)),
-        );
-        let doc = crate::mutation::Document { fields };
-        let before = engine.publish_count_acquire();
-        engine.put(4242, &doc).unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            // Acquire-load FIRST, then read the snapshot. If the count has moved
-            // past `before`, the publish carrying slot 4242 has landed and the
-            // snapshot read below MUST see it. Reading in this order is what the
-            // Release/Acquire pair makes meaningful — with a Relaxed counter this
-            // would still pass on x86 and could fail elsewhere.
-            if engine.publish_count_acquire() > before {
-                assert!(
-                    engine.is_slot_alive(4242),
-                    "publish count advanced past the write's enqueue value, but the \
-                     write is not visible — the counter is running AHEAD of the \
-                     publish it certifies. The verifier would read pre-publish \
-                     state and report a phantom drop."
-                );
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "publish count never advanced after a write — flush thread stalled?"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
+    // NOTE — there is deliberately NO test here pinning "the seq must not
+    // advance before the snapshot it describes." That invariant existed in an
+    // earlier design that kept the publish count in an atomic BESIDE the
+    // ArcSwap, ordered against the store by hand. A test was written for it and
+    // then mutated (increment moved above the store): the test stayed GREEN,
+    // because the violation window is nanoseconds and any observational test
+    // polls straight past it. A test that cannot fail is worse than no test —
+    // it is the reason the next person stops looking.
+    //
+    // The invariant is now carried by `InnerEngine::publish_seq`: the seq is
+    // published by the same atomic store as the state it certifies, so the
+    // mutation is not expressible and there is nothing left to pin.
 
     /// A test engine that has published at least once, so slots tagged 0 are
     /// drainable. An IDLE engine never publishes — nothing is dirty, so the
@@ -5504,7 +5461,7 @@ mod tests {
             .put(1, &crate::mutation::Document { fields })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while engine.publish_count_acquire() == 0 {
+        while engine.published_seq() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "engine never published after a write"
@@ -5551,7 +5508,7 @@ mod tests {
             crate::concurrent_engine::VerifyGate::AfterPublish(0),
         );
         assert!(
-            engine.publish_count_acquire() > 0,
+            engine.published_seq() > 0,
             "precondition: a publish has happened, so the gate at 0 is passed"
         );
         assert_eq!(
@@ -6113,7 +6070,7 @@ mod tests {
         // in-flight batch, so it must be verifiable immediately. Requiring a
         // publish here would strand it on any index quiet enough not to write.
         assert_eq!(
-            engine2.publish_count_acquire(),
+            engine2.published_seq(),
             0,
             "precondition: a freshly booted, idle engine has published nothing — \
              which is exactly the state a restored slot must be verifiable in"

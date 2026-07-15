@@ -367,6 +367,16 @@ pub struct InnerEngine {
     pub slots: crate::slot::SlotAllocator,
     pub filters: crate::filter::FilterIndex,
     pub sorts: crate::sort::SortIndex,
+    /// Monotonic id of the publish that produced this snapshot, stamped by the
+    /// flush thread immediately before the `ArcSwap` store.
+    ///
+    /// It lives in here — rather than in an atomic beside the ArcSwap — so that
+    /// it is published by the same atomic store as the state it describes. A
+    /// reader gets the seq and the data it certifies from one load, and no
+    /// reordering can let the number run ahead of the contents. The
+    /// post-activation verifier relies on that to tell "this slot's batch is
+    /// live" from "I am reading too early"; see `published_seq`.
+    pub publish_seq: u64,
 }
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
@@ -1197,6 +1207,10 @@ impl ConcurrentEngine {
             slots,
             filters,
             sorts,
+            // Boot: this process has published nothing yet. Restored slots are
+            // gated `Ready` rather than on a seq precisely because this counter
+            // is process-local and starts over here.
+            publish_seq: 0,
         };
         // Flush thread owns a staging clone; readers see published snapshots
         let mut staging = inner_engine.clone();
@@ -1972,9 +1986,7 @@ impl ConcurrentEngine {
                             // test_verify_waits_for_the_publish_of_its_own_batch.
                             {
                                 let cap = flush_config.activation_verify.ring_cap;
-                                let gate = VerifyGate::AfterPublish(
-                                    flush_pub_count.load(Ordering::Acquire),
-                                );
+                                let gate = VerifyGate::AfterPublish(inner.load().publish_seq);
                                 let mut q = flush_activation_verify.lock();
                                 for &slot in &activated {
                                     if !redefer_on_read_miss.contains(&slot) {
@@ -2922,17 +2934,15 @@ impl ConcurrentEngine {
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             //
-                            // ORDERING CONTRACT — the post-activation verifier's
-                            // soundness depends on this store happening BEFORE
-                            // `flush_pub_count.fetch_add` below, in this same cycle.
-                            // The verifier proves a slot's activation batch is
-                            // published by observing the counter advance past the
-                            // value it recorded at enqueue; if the increment ever
-                            // moves above this store, the verifier can read
-                            // pre-publish state and report a phantom drop on
-                            // `redriven_total`. Do not reorder.
-                            // Pinned by ops_processor::tests::
-                            // test_publish_count_advances_only_after_publish.
+                            // Stamp the seq that certifies this snapshot's contents,
+                            // HERE: after the batch is applied (`apply_prepared_traced`
+                            // above) and immediately before the store, so the two are
+                            // one act. The verifier releases a slot when the published
+                            // seq passes the value recorded at its enqueue, so a seq
+                            // that ran ahead of the ops would promise a batch the
+                            // snapshot doesn't carry — a false real-drop. Stamping
+                            // earlier in the cycle would reintroduce exactly that.
+                            staging.publish_seq = flush_cycle;
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3052,24 +3062,7 @@ impl ConcurrentEngine {
                             }
                             // Record flush stats for Prometheus
                             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
-                            // ORDERING CONTRACT — see `inner.store` above. This is the
-                            // ONLY site that advances the publish count, and it must
-                            // stay BELOW that store: the verifier treats "count moved
-                            // past the value I recorded at enqueue" as PROOF that the
-                            // snapshot carrying that batch is live. Two consequences:
-                            //   - Never increment without publishing first (that would
-                            //     make the verifier read pre-publish state and raise a
-                            //     phantom drop on `redriven_total`).
-                            //   - Publishing WITHOUT incrementing is safe — the
-                            //     ForcePublish handlers do exactly that, and the
-                            //     verifier simply waits for the next main-loop publish.
-                            // Release (not Relaxed) so a reader that Acquire-loads this
-                            // counter — see `publish_count_acquire` — is guaranteed to
-                            // see the store above. x86-TSO would hide a Relaxed bug
-                            // here; other ISAs would not.
-                            // Pinned by ops_processor::tests::
-                            // test_publish_count_advances_only_after_publish.
-                            flush_pub_count.fetch_add(1, Ordering::Release);
+                            flush_pub_count.fetch_add(1, Ordering::Relaxed);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
                             // Yield after publish — snapshot is live, let tokio
@@ -3692,6 +3685,15 @@ impl ConcurrentEngine {
                                     slots,
                                     filters: new_filters,
                                     sorts: new_sorts,
+                                    // CARRY the seq forward. Rebuilding staging
+                                    // must never rewind it: the verifier reads
+                                    // "published seq passed my tag", so a seq
+                                    // that went backwards would leave every
+                                    // slot tagged above it waiting on a value
+                                    // that never returns — unverified, silently
+                                    // and permanently. An unload changes what is
+                                    // resident, not which publish we are on.
+                                    publish_seq: staging.publish_seq,
                                 };
                                 flush_unified_cache.clear();
                                 inner.store(Arc::new(staging.clone()));
@@ -8501,10 +8503,10 @@ impl ConcurrentEngine {
     }
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
     ///
-    /// Relaxed — this is the Prometheus/reporting path, where a slightly stale
-    /// count is fine. Do NOT tighten these to serve a correctness consumer:
-    /// `publish_count_acquire` exists for that, so the two uses can't drift into
-    /// each other. See its docs for the ordering that matters.
+    /// Relaxed, and reporting-only. Nothing about correctness may depend on this
+    /// counter: `flush_publish_count` lives BESIDE the snapshot, so it can drift
+    /// from what is actually published. The verifier uses `published_seq`, which
+    /// rides INSIDE the snapshot and therefore cannot. Keep it that way.
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
             self.flush_publish_count.load(Ordering::Relaxed),
@@ -8512,26 +8514,24 @@ impl ConcurrentEngine {
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Publish count, ACQUIRE-loaded — the post-activation verifier's proof that
-    /// a snapshot is live.
+    /// The sequence number of the currently published snapshot — the verifier's
+    /// proof of what is live.
     ///
-    /// The flush thread applies an activation batch, records this counter's value
-    /// `C` while queueing the slot, publishes the snapshot carrying that batch,
-    /// and only then Release-increments the counter. So for a slot enqueued at
-    /// `C`, observing `publish_count_acquire() > C` PROVES its batch is in the
-    /// published snapshot — no barrier, no waiting, no guess about how long a
-    /// promote takes.
+    /// The flush thread applies a batch, stamps the seq, and publishes, all in
+    /// one cycle. Because the seq rides INSIDE `InnerEngine`, it and the state it
+    /// describes are published by a single atomic store: the seq cannot advance
+    /// without the snapshot advancing, and cannot describe a snapshot that isn't
+    /// live. So for a slot enqueued while seq `S` was published, seeing
+    /// `published_seq() > S` PROVES its batch is visible — no barrier, no wait,
+    /// no guess at how long a promote takes.
     ///
-    /// The Acquire is load-bearing, not decoration: it synchronizes-with the
-    /// flush thread's Release increment, which is what makes the preceding
-    /// `inner.store` visible to this thread's subsequent snapshot read. With a
-    /// Relaxed load the counter would still LOOK right on x86 and could read a
-    /// stale snapshot elsewhere — the failure would be an unreproducible phantom
-    /// drop, so the ordering is stated rather than inherited from the ISA.
-    ///
-    /// Deliberately separate from `flush_stats` (Relaxed, reporting-only).
-    pub fn publish_count_acquire(&self) -> u64 {
-        self.flush_publish_count.load(Ordering::Acquire)
+    /// This is why there is no memory-ordering contract to get right here: it's
+    /// one `ArcSwap` load, and the seq comes back attached to the very snapshot
+    /// it certifies. An earlier design kept the counter beside the snapshot and
+    /// ordered the two by hand; that ordering could be broken by a refactor
+    /// without any test noticing, because the window is nanoseconds wide.
+    pub fn published_seq(&self) -> u64 {
+        self.snapshot().publish_seq
     }
     /// Per-phase flush timing in nanoseconds:
     /// `(apply, cache, publish, timebucket, compact, opslog, sort_promote)`.
@@ -9059,7 +9059,7 @@ impl ConcurrentEngine {
     ///
     /// A slot is released only once the publish count has moved past the value
     /// recorded when it was queued (see `PendingVerify` and
-    /// `publish_count_acquire`). Slots still waiting on their publish stay in
+    /// `published_seq`). Slots still waiting on their publish stay in
     /// the ring; they are not orphans, and the verifier must not see them —
     /// reading a slot before its batch is published is exactly how a healthy
     /// post gets reported as a dropped one.
@@ -9074,7 +9074,7 @@ impl ConcurrentEngine {
     /// Requeued slots (see `requeue_activation_verify`) go to the back with a
     /// fresh tag, preserving the same ordering.
     pub fn drain_activation_verify(&self, limit: usize) -> Vec<u32> {
-        let published = self.publish_count_acquire();
+        let published = self.published_seq();
         let mut q = self.activation_verify.lock();
         let mut out = Vec::new();
         while out.len() < limit {
@@ -9094,7 +9094,7 @@ impl ConcurrentEngine {
     /// Diagnostic counterpart to `activation_verify_len` (which counts all
     /// pending, published or not).
     pub fn activation_verify_ready_len(&self) -> usize {
-        let published = self.publish_count_acquire();
+        let published = self.published_seq();
         let q = self.activation_verify.lock();
         q.iter().take_while(|p| p.gate.is_open(published)).count()
     }
@@ -9141,7 +9141,7 @@ impl ConcurrentEngine {
         if slots.is_empty() {
             return;
         }
-        let gate = VerifyGate::AfterPublish(self.publish_count_acquire());
+        let gate = VerifyGate::AfterPublish(self.published_seq());
         let mut q = self.activation_verify.lock();
         q.extend(slots.iter().map(|&slot| PendingVerify { slot, gate }));
     }
@@ -10289,12 +10289,18 @@ impl ConcurrentEngine {
                 self.pending_sort_loads.lock().insert(sc.name.clone());
             }
         }
+        // Carry the publish seq across the rebuild — an unload changes what is
+        // resident, not which publish we are on. Rewinding it would strand every
+        // slot tagged above the new value: waiting forever on a seq that never
+        // comes back, with no log line and no counter. Read before `snap` goes.
+        let publish_seq = snap.publish_seq;
         // Drop our reference to the old snapshot before sending to flush thread.
         drop(snap);
         let unloaded = InnerEngine {
             slots,
             filters: new_filters,
             sorts: new_sorts,
+            publish_seq,
         };
         // Phase 3: Route through flush thread — replaces both staging and
         // published snapshot atomically. Flush thread drains any pending
