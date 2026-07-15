@@ -8848,6 +8848,22 @@ impl ConcurrentEngine {
         let sort_bytes = snap.sorts.bitmap_bytes();
         (slot_bytes, filter_bytes, sort_bytes)
     }
+    /// Estimated *in-memory* filter footprint, per field:
+    /// (name, bitmap_count, serialized_bytes, estimated_inmem_bytes).
+    ///
+    /// The serialized-vs-inmem gap quantifies how much live heap the
+    /// serialized-only tracker (`bitmap_memory_totals`) misses — dominated by
+    /// per-value-bitmap struct/Arc/HashMap overhead, which scales with the
+    /// number of distinct values a serving pod has lazily loaded. Heavy
+    /// (iterates every value bitmap); invoke on demand only.
+    pub fn filter_inmem_report(&self) -> Vec<(String, usize, usize, usize)> {
+        let snap = self.snapshot();
+        snap.filters
+            .per_field_inmem()
+            .into_iter()
+            .map(|(name, count, ser, inmem)| (name.to_string(), count, ser, inmem))
+            .collect()
+    }
     pub fn bitmap_memory_report(
         &self,
     ) -> (usize, usize, usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
