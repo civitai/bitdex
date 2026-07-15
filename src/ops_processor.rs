@@ -1916,6 +1916,44 @@ pub fn verify_recent_activations(engine: &ConcurrentEngine, limit: usize) -> (us
         if indexed {
             continue; // healthy — the slot is in its postId bitmap
         }
+        // VB-state diagnostic (residual activation-miss hunt): capture the exact
+        // membership-bitmap state at the orphan moment, BEFORE the re-drive
+        // rebuilds it. Static tracing + deterministic repros ruled out the
+        // per-value-lazy load clobber; this pins WHICH runtime state produced
+        // the miss on the next prod specimen. Low volume (only on a real
+        // re-drive, ~sub-per-minute). Cross-checks (all config-derived, no
+        // hardcoded field names): alive bit (rules out "never activated"); the
+        // EAGER exists_boolean shadow (e.g. isPublished) vs the LAZY membership
+        // field — if the slot has the eager field but not the lazy one, the drop
+        // is lazy-field-specific; and the deferred source SORT layer (e.g.
+        // publishedAt). "has every field except postId" ⇒ postId-specific;
+        // "missing multiple" ⇒ broader emit/publish loss.
+        let alive = engine.is_slot_alive(slot);
+        let shadow_field = engine
+            .config()
+            .data_schema
+            .fields
+            .iter()
+            .find(|fm| matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean))
+            .map(|fm| fm.target.clone());
+        let shadow_state = shadow_field
+            .as_ref()
+            .map(|f| engine.filter_value_state_debug(f, 1, slot))
+            .unwrap_or_else(|| "none".to_string());
+        let sort_field = engine
+            .config()
+            .deferred_alive
+            .as_ref()
+            .map(|d| d.source_field.clone());
+        let sort_present = sort_field
+            .as_ref()
+            .and_then(|f| engine.sort_slot_present_debug(f, slot));
+        tracing::warn!(
+            target: "activation",
+            "verify: orphan slot {slot} {verify_field}={pid} alive={alive} \
+             membership[{}] shadow[{shadow_state}] source_sort_present={sort_present:?}",
+            engine.filter_value_state_debug(&verify_field, pid as u64, slot),
+        );
         // Orphan: re-drive the full doc via the activation replay path. Sent
         // through the mutation channel (the flush thread is the sole ArcSwap
         // writer — never mutate staging directly here).
@@ -4911,6 +4949,41 @@ mod tests {
     /// deferred-due-now WITHOUT writing its doc, so the flush thread's
     /// activation read misses; the slot must NOT go alive and must stay
     /// deferred. Pre-fix this asserts fails: the slot is alive with no bitmaps.
+    /// The VB-state diagnostic reports the membership bitmap's true state for a
+    /// slot: present + slot_in_fused=true after an insert, and VB=ABSENT for an
+    /// unknown value. This is the lens for the next prod orphan specimen.
+    #[test]
+    fn test_filter_value_state_debug() {
+        let mut config = safety_net_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(), field_type: FilterFieldType::SingleValue,
+            behaviors: None, eviction: None, eager_load: false,
+            per_value_lazy: true, max_range_scan_values: None,
+        });
+        let engine = ConcurrentEngine::new(config).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let post_id: i64 = 4242;
+        let slot: u32 = 90;
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64, creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(post_id) },
+                Op::Set { field: "existedAt".into(), value: json!(1000) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        wait_for_alive_slot(&engine, slot, 5_000);
+
+        let present = engine.filter_value_state_debug("postId", post_id as u64, slot);
+        assert!(present.contains("slot_in_fused=true"), "present state should show fused=true: {present}");
+        let absent = engine.filter_value_state_debug("postId", 999_999, slot);
+        assert!(absent.contains("slot_in_fused=false"), "absent value should show fused=false: {absent}");
+    }
+
     #[test]
     fn test_per_value_lazy_insert_survives_lazy_load() {
         // Isolates the lead's per_value_lazy hypothesis: an insert to a

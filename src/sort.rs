@@ -146,6 +146,14 @@ impl SortField {
         }
     }
 
+    /// Diagnostic: whether the slot has any bit set in any layer — i.e. a
+    /// nonzero reconstructed value. Used by the activation-miss verifier to
+    /// report whether an orphan has its sort fields (a value of 0 or an
+    /// unindexed slot both report false).
+    pub fn slot_has_any_bit(&self, slot: u32) -> bool {
+        self.bit_layers.iter().any(|layer| layer.contains(slot))
+    }
+
     /// Remove a slot from all bit layers. Used by autovac.
     pub fn remove(&mut self, slot: u32) {
         self.invalidate_fused();
