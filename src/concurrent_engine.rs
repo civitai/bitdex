@@ -8709,6 +8709,37 @@ impl ConcurrentEngine {
         let n = limit.min(q.len());
         q.drain(..n).collect()
     }
+    /// Diagnostic: describe a filter value's in-memory VersionedBitmap state for
+    /// a slot, in the published snapshot. Used by the post-activation verifier to
+    /// capture the exact membership-bitmap state at the moment it decides a slot
+    /// is an orphan (residual activation-miss hunt) — pins WHICH state produced
+    /// the miss on the next prod specimen (VB absent / unloaded / empty diff /
+    /// loaded-but-slot-absent) without another round-trip.
+    pub fn filter_value_state_debug(&self, field: &str, value: u64, slot: u32) -> String {
+        let snap = self.snapshot();
+        match snap.filters.get_field(field) {
+            None => format!("field={field} MISSING"),
+            Some(ff) => match ff.get_versioned(value) {
+                None => format!("value={value} VB=ABSENT slot_in_fused=false"),
+                Some(vb) => format!(
+                    "value={value} present is_loaded={} base_len={} diff_sets={} diff_clears={} slot_in_diff_set={} slot_in_fused={}",
+                    vb.is_loaded(),
+                    vb.base_len(),
+                    vb.diff().sets.len(),
+                    vb.diff().clears.len(),
+                    vb.diff().sets.contains(slot),
+                    vb.contains(slot),
+                ),
+            },
+        }
+    }
+    /// Diagnostic companion to `filter_value_state_debug`: whether a slot has a
+    /// nonzero value in a sort field (any bit set in any layer), in the
+    /// published snapshot. `None` if the sort field doesn't exist.
+    pub fn sort_slot_present_debug(&self, field: &str, slot: u32) -> Option<bool> {
+        let snap = self.snapshot();
+        snap.sorts.get_field(field).map(|sf| sf.slot_has_any_bit(slot))
+    }
     /// Re-queue slots for a later verify pass (e.g. the doc wasn't readable
     /// this pass). Appended to the back so the ring keeps rotating.
     pub fn requeue_activation_verify(&self, slots: &[u32]) {
