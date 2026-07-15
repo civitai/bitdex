@@ -285,16 +285,32 @@ pub struct Metrics {
     /// Recently-activated slots examined by the post-activation verifier
     /// (deferred activation-miss backstop). Label: index.
     pub activation_verify_checked_total: IntCounterVec,
-    /// Activated slots found ABSENT from their own postId bitmap and re-driven
-    /// by the verifier — the target counter for the activation-miss orphan.
-    /// Should be ~0 in steady state; a nonzero rate means orphans are being
-    /// produced (investigate the activation replay). Label: index.
+    /// Activated slots found ABSENT from their own postId bitmap after a
+    /// COMPLETED publish barrier, and re-driven by the verifier — the target
+    /// counter for the activation-miss orphan, and the only one that means a
+    /// confirmed drop. Should be ~0 in steady state; a nonzero rate means
+    /// orphans are being produced (investigate the activation replay).
+    /// ALARM-WORTHY: every count is a real drop.
+    ///
+    /// But NOT every real drop is counted here — this is sound, not sensitive.
+    /// A drop during a slow promote can't clear the barrier and lands in
+    /// `inconclusive_total` instead, so an alarm on this counter stays silent
+    /// on roughly half of genuine drops. Read it as "drops we can prove", not
+    /// "all drops"; nonzero here is real, but zero here is not all-clear.
+    /// See FOLLOWUP.md. Label: index.
     pub activation_verify_redriven_total: IntCounterVec,
-    /// Apparent orphans that the post-publish barrier proved PRESENT — the
+    /// Apparent orphans that the post-publish re-read proved PRESENT — the
     /// batch was applied and merely published late, so the re-drive is
     /// suppressed. Not a data-loss signal: it measures publish-visibility lag
     /// against the verifier's read. Label: index.
     pub activation_verify_publish_lag_total: IntCounterVec,
+    /// Absent slots re-driven WITHOUT a completed publish barrier — the
+    /// barrier timed out, so a genuine drop and a publish lag longer than the
+    /// barrier are indistinguishable. Re-driven for safety like any unproven
+    /// slot, but held out of `redriven_total` so that counter stays a
+    /// confident drop signal. Watch, don't alarm: a rising rate here means the
+    /// barrier is undersized, not that data is being lost. Label: index.
+    pub activation_verify_inconclusive_total: IntCounterVec,
 
     // -- 11c CPU floor attribution (2026-04-30) --
     /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
@@ -1299,7 +1315,7 @@ impl Metrics {
         let activation_verify_redriven_total = IntCounterVec::new(
             Opts::new(
                 "bitdex_activation_verify_redriven_total",
-                "Activated slots absent from their own postId and re-driven by the verifier (activation-miss orphan target counter)",
+                "Activated slots absent from their own postId after a COMPLETED publish barrier and re-driven by the verifier (confirmed activation-miss orphans — alarm-worthy)",
             ),
             &["index"],
         )
@@ -1307,7 +1323,15 @@ impl Metrics {
         let activation_verify_publish_lag_total = IntCounterVec::new(
             Opts::new(
                 "bitdex_activation_verify_publish_lag_total",
-                "Apparent orphans proven present by the verifier's post-publish barrier (published late, re-drive suppressed — publish-visibility lag, not data loss)",
+                "Apparent orphans proven present by the verifier's post-publish re-read (published late, re-drive suppressed — publish-visibility lag, not data loss)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let activation_verify_inconclusive_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_activation_verify_inconclusive_total",
+                "Absent slots re-driven by the verifier without a completed publish barrier (drop vs over-long publish lag unproven — watch, do not alarm)",
             ),
             &["index"],
         )
@@ -1564,6 +1588,7 @@ impl Metrics {
         registry.register(Box::new(activation_verify_checked_total.clone())).unwrap();
         registry.register(Box::new(activation_verify_redriven_total.clone())).unwrap();
         registry.register(Box::new(activation_verify_publish_lag_total.clone())).unwrap();
+        registry.register(Box::new(activation_verify_inconclusive_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
@@ -1720,6 +1745,7 @@ impl Metrics {
             activation_verify_checked_total,
             activation_verify_redriven_total,
             activation_verify_publish_lag_total,
+            activation_verify_inconclusive_total,
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,

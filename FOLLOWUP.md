@@ -1,5 +1,28 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Verifier orphan detection is only ~50% sensitive — needs a later pass, not a longer barrier (2026-07-15)
+
+v1.1.47 added the `Inconclusive` verdict so `bitdex_activation_verify_redriven_total` counts only
+drops proven absent after a COMPLETED publish barrier. That makes the counter SOUND (safe to alarm
+on — no phantoms) but only ~50% SENSITIVE: the verifier's own barrier (`publish_barrier_ms`) times
+out often — prod shows the diagnostic landing +54ms when it completes vs +501ms when it gives up at
+the cap, ~1-in-2 in one window — and a REAL drop during a slow promote lands in
+`activation_verify_inconclusive_total`, NOT `redriven_total`. **An alarm on `redriven_total` will
+stay silent on roughly half of genuine drops.** No data is at risk: `Inconclusive` still re-drives,
+so the repair happens either way. What is missing is DETECTION.
+
+WHY NOT JUST RAISE `publish_barrier_ms`: it's an asymptote, not a knob. 100ms fails ~95% of
+promotes, 500ms ~50%, and the promote is the same CoW clone-cascade as the entry below — no fixed
+ceiling, so no cap drives `barrier_ok == false` to zero. Each increment buys a diminishing slice of
+the tail in exchange for WAL-reader stall. (Distinct from the query-path 100ms barrier below: this
+one is off the user path, so the tradeoff differs, but the underlying cost is shared.)
+
+⇒ STRUCTURAL FIX (v1.1.48 candidate): re-check inconclusive slots on a LATER PASS instead of waiting
+longer — requeue them and re-read once the publish has certainly landed, off the WAL reader. That
+collapses `inconclusive` back into a definite verdict without stalling anything, restoring
+sensitivity while keeping `redriven_total` sound. Watch `inconclusive_total`'s rate to size the work;
+a rising rate means the barrier is undersized, not that data is being lost.
+
 ## Query freshness guarantee is illusory — the 100ms ForcePublish barrier times out 93-98% (2026-07-15)
 
 MEASURED in prod (v1.1.46, both pods): `ensure_fields_loaded`'s ForcePublish barrier is capped at
