@@ -5550,6 +5550,112 @@ mod tests {
         );
     }
 
+    /// THE ENQUEUE SITE — the one production line that decides what the gate is
+    /// asked. Everything else about the gate is arithmetic; this is the argument.
+    ///
+    /// The other gate tests each build their gate BY HAND and hand it to
+    /// `is_open`. That verifies the operator and says nothing about
+    /// `VerifyGate::AfterPublish(inner.load().publish_seq)` at the enqueue site —
+    /// so the gate can be switched off there without any of them noticing:
+    ///   `VerifyGate::Ready`                          -> 1234 passed, 0 failed
+    ///   `AfterPublish(seq.saturating_sub(1))`        -> 1234 passed, 0 failed
+    /// Under either, every live slot is drainable before its own batch publishes
+    /// and the whole gate is a no-op, silently. Same miss as the `>=` hole one
+    /// seam over: the operator got pinned, the argument didn't.
+    ///
+    /// So drive a REAL activation through the flush thread and assert the tag it
+    /// actually received. Deterministic by quiescence: the slot is scheduled a
+    /// couple of seconds out, the engine is left idle so nothing publishes (an
+    /// idle engine has nothing dirty), and the live seq is therefore stable at
+    /// `P` when the activation cycle reads it. The tag must be exactly `P` —
+    /// `Ready` fails, `P-1` fails.
+    #[test]
+    fn test_enqueue_site_tags_with_the_live_publish_seq() {
+        let mut config = safety_net_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "postId".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        });
+        config.activation_verify.membership_field = Some("postId".into());
+        let engine = ConcurrentEngine::new(config).unwrap();
+
+        let slot: u32 = 77;
+        let post_id: i64 = 5150;
+        let now = unit_now_secs() as i64;
+        // Two seconds out: deferred now, activates later — the gap is what makes
+        // the seq quiescent and the assertion exact.
+        let activate_at = now + 2;
+
+        let meta = FieldMeta::from_config(engine.config());
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(activate_at) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        // The activation replay reads the stored doc; without postId it has no
+        // membership value and the slot is never queued.
+        dw.write_set(slot, "postId", &json!(post_id));
+        dw.flush();
+
+        assert!(
+            !engine.is_slot_alive(slot),
+            "setup: a future publishedAt must defer, not activate"
+        );
+
+        // Let the deferral settle, then read the seq while nothing is publishing.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let live_seq = engine.published_seq();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            engine.published_seq(),
+            live_seq,
+            "setup: an idle engine must not publish, or the seq below isn't stable"
+        );
+
+        // Now let it activate for real — flush thread, production path.
+        wait_for_alive_slot(&engine, slot, 6_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while engine.activation_verify_peek_for_test().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the activation never queued the slot for verification"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let pending = engine.activation_verify_peek_for_test();
+        let entry = pending
+            .iter()
+            .find(|p| p.slot == slot)
+            .expect("the activated slot must be queued for verification");
+
+        // THE ASSERTION. Not `Ready` — a slot with an in-flight batch has
+        // something to wait for. Not `P-1` — that is already passed, so the gate
+        // is open before the batch lands. Exactly `P`: the seq that was live when
+        // the batch was applied, so the gate opens on the publish that carries it.
+        assert_eq!(
+            entry.gate,
+            crate::concurrent_engine::VerifyGate::AfterPublish(live_seq),
+            "the enqueue site must tag an activation with the seq that was live \
+             when its batch was applied (expected AfterPublish({live_seq})). \
+             `Ready` or any lower tag opens the gate before the batch publishes, \
+             which hands the verifier pre-publish state and makes the entire gate \
+             a silent no-op — the bug it exists to prevent."
+        );
+    }
+
     /// The publish seq must never RUN BACKWARDS — pinning bug 3.
     ///
     /// The two `InnerEngine` rebuild sites (field unload) construct a fresh
@@ -5592,7 +5698,16 @@ mod tests {
         assert!(before > 0, "precondition: seq is off the floor");
 
         // Unload rebuilds InnerEngine — the seq must survive the rebuild.
+        // BOTH rebuild sites, because there are two and they are reached by
+        // different commands: `save_and_unload` sends SyncUnloaded, while
+        // `exit_loading_mode_and_save_unload` sends ExitLoadingSaveUnload and
+        // rebuilds staging inside the flush loop. Driving only the first leaves
+        // the second comment-guarded — verified by mutating each site alone:
+        // with only `save_and_unload` here, `publish_seq: 0` at the flush-loop
+        // site SURVIVES. Two sites, two paths, or the pin is half a pin.
         engine.save_and_unload().unwrap();
+        engine.enter_loading_mode();
+        engine.exit_loading_mode_and_save_unload().unwrap();
 
         // Watch across the rebuild's publish. Monotonic means monotonic: not
         // "recovers shortly", not "usually" — never lower, at any observation.

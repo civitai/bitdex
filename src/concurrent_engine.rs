@@ -9199,6 +9199,17 @@ impl ConcurrentEngine {
     pub fn push_activation_verify_for_test(&self, slots: &[u32]) {
         self.push_activation_verify_gated_for_test(slots, VerifyGate::Ready);
     }
+    /// Test-only: read the ring without draining it.
+    ///
+    /// Exists so a test can assert what the PRODUCTION enqueue site actually
+    /// stamped, rather than what a test handed it. Every gate test that builds
+    /// its own gate verifies `is_open` as arithmetic and says nothing about the
+    /// one line that decides the argument — which is where the gate can be
+    /// turned off without any of them noticing.
+    #[cfg(test)]
+    pub fn activation_verify_peek_for_test(&self) -> Vec<PendingVerify> {
+        self.activation_verify.lock().iter().copied().collect()
+    }
     /// Test-only: enqueue slots behind an explicit gate.
     #[cfg(test)]
     pub fn push_activation_verify_gated_for_test(&self, slots: &[u32], gate: VerifyGate) {
