@@ -145,6 +145,27 @@ this field — it's observed directly by the v1.1.46 diagnostic (a 500ms barrier
 verifier's 100ms one fails on the same slot in the same window). Fix the accounting if you ever need
 promote numbers to be trustworthy.
 
+SECOND, INDEPENDENT CONFIRMATION (2026-07-15, ava, prod): two consecutive `[flush-slow]` breakouts
+**2 seconds apart both reported `promote=256.3ms` — the identical value to the decimal.** A genuine
+per-cycle cost does not repeat exactly across consecutive cycles. This reaches the same conclusion by
+a different route than the `total=142ms / promote=184.9ms` contradiction above: **whatever `promote=`
+measures, it is not this cycle's promote.** Two independent routes to the same defect ⇒ treat the
+field as broken, not merely suspicious.
+
+⚠️ AND THE BAND USED TO JUDGE IT WAS CONTAMINATED — `grep 'total='` ALSO MATCHES `post_apply_total=`.
+That mixes a 100-900ms metric with a 3-26ms one (34 values scraped from 17 lines). Anchor on
+`[flush-slow] total=` instead. Clean split, n=17:
+| series | min | p50 | p90 | p95 | max |
+|---|---|---|---|---|---|
+| `total=` | 113 | 135 | 151 | **158** | 158 |
+| `post_apply_total=` (the contaminant) | 1 | 6 | — | — | 26 |
+The tell was `min=1` in a band of ~100ms values, and it was read straight past. The 400ms outlier
+threshold **survives** (p95=158 ≪ 400, so the 456/485/524/583/897ms events are genuine outliers,
+~1 per 9min, cause unknown) — but it survives **BY LUCK**: the pollution happened to land where the
+sort didn't move the percentiles much. **Right-for-the-wrong-reason is indistinguishable from right
+until you check.** Any threshold derived from a grep band: verify the band contains only the series
+you think it does, before trusting the percentile.
+
 ## OBSERVABILITY GAP: the v1.1.44 persist-ring cost is unmeasurable (2026-07-15)
 
 The v1.1.44 activation-verify ring persists to `meta/activation_verify.bin` on the flush thread each
