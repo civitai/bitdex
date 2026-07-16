@@ -9,6 +9,7 @@ config:
     - { name: availability, field_type: single_value, eager_load: true }
     - { name: postId, field_type: single_value, per_value_lazy: true }
     - { name: postedToId, field_type: single_value, per_value_lazy: true }
+    - { name: model3dId, field_type: single_value, per_value_lazy: true }
     - { name: remixOfId, field_type: single_value }
     - { name: hasMeta, field_type: boolean, eager_load: true }
     - { name: onSite, field_type: boolean, eager_load: true }
@@ -25,12 +26,14 @@ config:
 
   sort_fields:
     - { name: reactionCount, bits: 32, eager_load: true }
-    - name: sortAt
-      bits: 32
-      eager_load: true
-      computed:
-        op: greatest
-        source_fields: [existedAt, publishedAt]
+    # [PR-M5] sortAt is now INGESTED, not engine-computed. The old
+    # `computed: { op: greatest, source_fields: [existedAt, publishedAt] }` block
+    # is removed in the SAME deploy that activates the sortAtUnix->sortAt emission
+    # (sync-config-civitai.yaml) — computed and ingested must NEVER coexist, or a
+    # stale GREATEST would fight the ingested value. Values now arrive via the
+    # data_schema sortAtUnix->sortAt mapping (steady-state ops, ms ÷1000 seconds)
+    # or the dump's `sortAt` seconds column (fallback: sortAt). Layers hold SECONDS.
+    - { name: sortAt, bits: 32, eager_load: true }
     - { name: commentCount, bits: 32, eager_load: true }
     - { name: collectedCount, bits: 32, eager_load: true }
     - { name: existedAt, bits: 32 }
@@ -69,6 +72,7 @@ data_schema:
     - { source: availability, target: availability, value_type: low_cardinality_string, nullable: true }
     - { source: postId, target: postId, value_type: integer, nullable: true }
     - { source: postedToId, target: postedToId, value_type: integer, nullable: true }
+    - { source: model3dId, target: model3dId, value_type: integer, nullable: true }
     - { source: remixOfId, target: remixOfId, value_type: integer, nullable: true }
     - { source: publishedAtUnix, target: isPublished, value_type: exists_boolean }
     - { source: remixOfId, target: isRemix, value_type: exists_boolean }
@@ -83,6 +87,17 @@ data_schema:
     - { source: toolIds, target: toolIds, value_type: integer_array, default: [], filter_only: true }
     - { source: techniqueIds, target: techniqueIds, value_type: integer_array, default: [], filter_only: true }
     - { source: reactionCount, target: reactionCount, value_type: integer, default: 0 }
+    # [PR-B4] PINNED UNIT STATEMENT. Steady-state ops carry `sortAtUnix` in
+    # MILLISECONDS; ms_to_seconds:true divides by 1000 → the sortAt SORT LAYERS
+    # hold SECONDS. The dump carries a `sortAt` column already in SECONDS, hit via
+    # `fallback: sortAt` (a fallback source is NOT ms-converted — it is assumed to
+    # already be in target units, see config.rs resolve). Both paths → SECONDS.
+    # QUERY SIDE: the Civitai builder's `sortAtUnix Gte <seconds>` clause resolves
+    # ONLY through time_buckets (filter_field: sortAtUnix → sort_field: sortAt);
+    # ts_secs_u64 (query.rs:316) leaves the seconds threshold unchanged, and it
+    # snaps to a bucket built from the sortAt seconds layers (executor.rs Gt/Gte).
+    # No ingested `sortAtUnix` filter field exists. Net: SECONDS everywhere except
+    # the wire ms encoding; the builder's seconds-Gte is correct.
     - { source: sortAtUnix, target: sortAt, value_type: integer, fallback: sortAt, ms_to_seconds: true }
     - { source: commentCount, target: commentCount, value_type: integer, default: 0 }
     - { source: collectedCount, target: collectedCount, value_type: integer, default: 0 }
