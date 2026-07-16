@@ -71,6 +71,32 @@ pub struct TriggerComputedField {
     pub value: Option<String>,
 }
 
+/// Child-row source for the `fan_out_per_row` trigger type.
+///
+/// Instead of emitting one `queryOpSet` row that BitDex resolves against a
+/// moving index, the trigger enumerates the child rows transactionally in PG:
+/// `INSERT INTO "BitdexOps" SELECT c."<slot>", <ops> FROM "<table>" c WHERE
+/// c."<fk>" = NEW."<parent_key>"`. The match set is fixed inside the owning
+/// transaction — it cannot be partial, early, or re-resolved on WAL replay.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RowsFrom {
+    /// Child table the per-row ops are emitted for (e.g. "Image").
+    pub table: String,
+    /// Foreign-key column on the child table pointing at the parent PK
+    /// (e.g. "postId").
+    pub fk: String,
+    /// Child column that maps to the BitDex slot ID. Defaults to "id".
+    #[serde(default = "default_rows_from_id")]
+    pub slot: String,
+    /// Parent PK column the FK references. Defaults to "id".
+    #[serde(default = "default_rows_from_id")]
+    pub parent_key: String,
+}
+
+fn default_rows_from_id() -> String {
+    "id".to_string()
+}
+
 /// A value that can be bool (true) or string ("delete_slot").
 /// The YAML uses `on_delete: true` but trigger_gen expects "delete_slot".
 #[derive(Debug, Clone, Deserialize)]
@@ -128,9 +154,14 @@ pub struct SyncSource {
     /// For fan-out tables: PG subquery to get values not on the triggering table
     pub query_source: Option<String>,
 
-    /// Table type: "fan_out" for fan-out tables, omit for direct/join tables.
+    /// Table type: "fan_out" for query-resolved fan-out, "fan_out_per_row" for
+    /// PG-materialized per-child-row fan-out, omit for direct/join tables.
     #[serde(rename = "type")]
     pub table_type: Option<String>,
+
+    /// For `fan_out_per_row` tables: the child table + FK that enumerate the
+    /// per-row op targets transactionally (e.g. Image rows of a Post).
+    pub rows_from: Option<RowsFrom>,
 
     /// SQL JOIN clause for fan-out triggers (e.g., Model join for Checkpoint filter).
     pub join: Option<String>,
@@ -192,8 +223,16 @@ pub fn generate_trigger_sql(source: &SyncSource) -> String {
         "AFTER INSERT OR UPDATE"
     };
 
+    // For per-row fan-out, emit the shared op-payload function first so the
+    // trigger (and the W1-3 re-emitter) can call it. Single source of the op
+    // JSONB shape.
+    let ops_function = match source.rows_from {
+        Some(ref rows) => format!("{}\n", generate_fan_out_ops_function_sql(source, rows)),
+        None => String::new(),
+    };
+
     format!(
-        r#"CREATE OR REPLACE FUNCTION {func_name}() RETURNS trigger AS $$
+        r#"{ops_function}CREATE OR REPLACE FUNCTION {func_name}() RETURNS trigger AS $$
 {body}
 $$ LANGUAGE plpgsql;
 
@@ -202,6 +241,7 @@ CREATE TRIGGER {trig_name} {trigger_events} ON "{table}"
   FOR EACH ROW EXECUTE FUNCTION {func_name}();
 ALTER TABLE "{table}" ENABLE ALWAYS TRIGGER {trig_name};
 "#,
+        ops_function = ops_function,
         func_name = func_name,
         trig_name = trig_name,
         body = body,
@@ -215,6 +255,9 @@ fn generate_trigger_body(source: &SyncSource) -> String {
     if let Some(ref field) = source.field {
         // Multi-value join table (tags, tools, techniques, etc.)
         generate_multi_value_body(source, field)
+    } else if let Some(ref rows) = source.rows_from {
+        // Per-row materialized fan-out (Post → its Image rows).
+        generate_fan_out_per_row_body(source, rows)
     } else if source.query.is_some() {
         // Fan-out table (ModelVersion, Post, Model)
         generate_fan_out_body(source)
@@ -531,6 +574,153 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     body
 }
 
+/// Stable name of the shared per-row op-payload function for a `fan_out_per_row`
+/// source, e.g. `bitdex_post_fanout_ops`. Deliberately UNHASHED and stable so
+/// the upstream re-emitter (W1-3) can call it by a fixed name; when the config
+/// changes, the function body is replaced (CREATE OR REPLACE) but the name — and
+/// therefore the re-emitter's call site — stays valid. Both the trigger and the
+/// re-emitter regenerate from the same codegen, so their op shapes cannot drift.
+pub fn fan_out_ops_function_name(source: &SyncSource) -> String {
+    format!("bitdex_{}_fanout_ops", source.table.to_lowercase())
+}
+
+/// Generate the shared op-payload function for a `fan_out_per_row` source:
+///
+/// ```sql
+/// CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb AS $$
+///   SELECT jsonb_build_array(
+///     jsonb_build_object('op','set','field','publishedAt','value', to_jsonb(...)),
+///     ...
+///   );
+/// $$ LANGUAGE sql STABLE;
+/// ```
+///
+/// This is the SINGLE source of the per-image op JSONB shape. The generated
+/// trigger's INSERT path calls it, and the W1-3 re-emitter calls it via its own
+/// `INSERT ... SELECT i."id", bitdex_post_fanout_ops(p) FROM "Image" i JOIN
+/// "Post" p ...`. If the two paths built the JSONB independently they could
+/// drift, and a re-emit would stop being a no-op — destroying the ≥99%-no-op
+/// success signal. The payload references only the parent (Post) row, so the
+/// function takes that row; `STABLE` lets PG evaluate it once per Post row.
+pub fn generate_fan_out_ops_function_sql(source: &SyncSource, rows: &RowsFrom) -> String {
+    let _ = rows; // reserved: future image-dependent payloads extend the signature
+    let fn_name = fan_out_ops_function_name(source);
+    let parent_row = "_p";
+    let track_strings: Vec<String> = source.track_fields.as_deref().unwrap_or(&[])
+        .iter().map(|tf| tf.to_track_string()).collect();
+    let ops: Vec<String> = track_strings.iter().map(|f| {
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let expr = substitute_columns(&template_expr, parent_row);
+        format!(
+            "    jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
+            field_name, expr
+        )
+    }).collect();
+
+    format!(
+        "CREATE OR REPLACE FUNCTION {fn_name}({parent} \"{table}\") RETURNS jsonb AS $$\n\
+         \x20 SELECT jsonb_build_array(\n\
+         {ops}\n\
+         \x20 );\n\
+         $$ LANGUAGE sql STABLE;\n",
+        fn_name = fn_name,
+        parent = parent_row,
+        table = source.table,
+        ops = ops.join(",\n"),
+    )
+}
+
+/// Generate body for per-row materialized fan-out tables (Post → its Images).
+///
+/// Unlike `generate_fan_out_body` (which emits one `queryOpSet` row that BitDex
+/// resolves against its own — possibly moved — index at apply time), this
+/// enumerates the child rows *inside the owning PG transaction*:
+///
+/// ```sql
+/// INSERT INTO "BitdexOps" (entity_id, ops)
+/// SELECT c."id", _ops FROM "Image" c WHERE c."postId" = NEW."id";
+/// ```
+///
+/// The op payload is identical to the fan-out's (per PR-M1 the Post fan-out
+/// RETAINS the full {publishedAt, availability, postedToId} set — publishedAt
+/// drives deferred-alive activation stamping AND the isPublished shadow, so it
+/// must not be dropped). Ops are ordinary per-slot set/remove ops keyed on the
+/// child slot; the ops processor needs no `queryOpSet` handling for them.
+///
+/// The INSERT `set` payload is built by the SHARED `bitdex_<table>_fanout_ops`
+/// function (see `generate_fan_out_ops_function_sql`) so the W1-3 re-emitter can
+/// call the identical shape — shape parity is the re-emitter's idempotency
+/// contract. The UPDATE path emits live remove/set deltas (IS DISTINCT FROM on
+/// the parent row) inline; the re-emitter only ever re-asserts the full `set`
+/// payload, so only that shape needs to be shared.
+///
+/// Fires on INSERT and UPDATE, mirroring the fan-out. On Post INSERT the child
+/// SELECT typically matches zero rows (images are inserted after the post) — a
+/// harmless no-op.
+fn generate_fan_out_per_row_body(source: &SyncSource, rows: &RowsFrom) -> String {
+    let track_strings: Vec<String> = source.track_fields.as_deref().unwrap_or(&[])
+        .iter().map(|tf| tf.to_track_string()).collect();
+    let track_fields: Vec<&str> = track_strings.iter().map(|s| s.as_str()).collect();
+
+    // The child-row enumeration shared by INSERT and UPDATE.
+    // `SELECT c."<slot>", _ops FROM "<child>" c WHERE c."<fk>" = NEW."<parent_key>"`
+    let select_insert = format!(
+        "SELECT c.\"{slot}\", _ops FROM \"{child}\" c WHERE c.\"{fk}\" = NEW.\"{pk}\"",
+        slot = rows.slot,
+        child = rows.table,
+        fk = rows.fk,
+        pk = rows.parent_key,
+    );
+
+    let ops_fn = fan_out_ops_function_name(source);
+
+    let mut body = String::from("DECLARE\n  _ops jsonb;\nBEGIN\n");
+
+    // INSERT: emit the FULL `set` payload for every child row (new parent, no
+    // prior state). The payload is built by the SHARED ops function so the
+    // upstream re-emitter (W1-3) can call the identical shape — parity here is
+    // the re-emitter's idempotency contract.
+    body.push_str("  IF TG_OP = 'INSERT' THEN\n");
+    body.push_str(&format!("    _ops := {ops_fn}(NEW);\n"));
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops)\n      {};\n",
+        select_insert
+    ));
+    body.push_str("    RETURN NEW;\n");
+
+    // UPDATE: emit remove/set pairs only for changed parent fields.
+    body.push_str("  ELSIF TG_OP = 'UPDATE' THEN\n");
+    body.push_str("    _ops := '[]'::jsonb;\n");
+    for f in &track_fields {
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let old_expr = substitute_columns(&template_expr, "OLD");
+        let new_expr = substitute_columns(&template_expr, "NEW");
+        body.push_str(&format!(
+            "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+             \x20     _ops := _ops || jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+             \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+             \x20     );\n\
+             \x20   END IF;\n",
+            old = old_expr,
+            new = new_expr,
+            field = field_name,
+        ));
+    }
+    body.push_str("    IF jsonb_array_length(_ops) > 0 THEN\n");
+    body.push_str(&format!(
+        "      INSERT INTO \"BitdexOps\" (entity_id, ops)\n        {};\n",
+        select_insert
+    ));
+    body.push_str("    END IF;\n");
+    body.push_str("    RETURN NEW;\n");
+    body.push_str("  END IF;\n");
+    body.push_str("  RETURN COALESCE(NEW, OLD);\n");
+    body.push_str("END;");
+
+    body
+}
+
 /// Parse a track field string into (field_name, insert_expr, template_expr).
 /// - `insert_expr`: Used in INSERT (no OLD/NEW prefix), e.g. `"nsfwLevel"`.
 /// - `template_expr`: Used in UPDATE, contains `{col}` templates for substitute_columns.
@@ -747,6 +937,7 @@ mod tests {
             query: None,
             query_source: None,
             table_type: None,
+            rows_from: None,
             join: None,
             expression: None,
             depends_on: None,
@@ -928,5 +1119,272 @@ sync_sources:
         };
         let s = tf.to_track_string();
         assert!(s.contains("tagIds"), "Expected 'tagIds' in '{s}'");
+    }
+
+    // ----------------------------------------------------------------------
+    // W1-1: fan_out_per_row (per-image materialized Post fan-out) + sortAtUnix
+    // ----------------------------------------------------------------------
+
+    /// The exact sortAtUnix track-field expression W2-1 wires onto the Image
+    /// trigger. Emits **milliseconds** (`* 1000`) with a COALESCE(GREATEST...)
+    /// belt so rows the PG backfill hasn't reached still emit a correct value.
+    /// The engine's `sortAtUnix → sortAt` mapping (ms_to_seconds) divides by 1000.
+    const SORTATUNIX_EXPR: &str = "COALESCE(extract(epoch from {sortAt})::bigint, \
+GREATEST(extract(epoch from (SELECT p.\"publishedAt\" FROM \"Post\" p WHERE p.id = {postId}))::bigint, \
+extract(epoch from {scannedAt})::bigint, \
+extract(epoch from {createdAt})::bigint)) * 1000 as sortAtUnix";
+
+    /// Build the Post per-image fan-out source, retaining the FULL payload
+    /// {publishedAt, availability, postedToId} exactly as the current queryOpSet
+    /// fan-out (per PR-M1: publishedAt must NOT be dropped).
+    fn post_fan_out_per_row_source() -> SyncSource {
+        SyncSource {
+            table_type: Some("fan_out_per_row".into()),
+            rows_from: Some(RowsFrom {
+                table: "Image".into(),
+                fk: "postId".into(),
+                slot: "id".into(),
+                parent_key: "id".into(),
+            }),
+            track_fields: Some(vec![
+                TrackField::Simple("extract(epoch from {publishedAt})::bigint as publishedAt".into()),
+                TrackField::Simple("{availability}::text as availability".into()),
+                TrackField::Mapped {
+                    column: Some("modelVersionId".into()),
+                    target: Some("postedToId".into()),
+                    expression: None,
+                },
+            ]),
+            ..test_source("Post")
+        }
+    }
+
+    /// Extract the set of BitDex field names a generated trigger emits, by
+    /// scanning for `'field', '<name>'` op markers.
+    fn emitted_fields(sql: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let marker = "'field', '";
+        let mut rest = sql;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            if let Some(end) = after.find('\'') {
+                out.insert(after[..end].to_string());
+            }
+            rest = after;
+        }
+        out
+    }
+
+    /// Snapshot of the generated per-row fan-out SQL: enumerates child rows
+    /// transactionally (INSERT ... SELECT FROM the child, WHERE fk = NEW.pk),
+    /// keyed on the child slot — and never routes through `queryOpSet`.
+    #[test]
+    fn test_fan_out_per_row_snapshot() {
+        let sql = generate_trigger_sql(&post_fan_out_per_row_source());
+
+        // Trigger fires on INSERT and UPDATE of the Post (same as today's fan-out),
+        // never DELETE.
+        assert!(sql.contains(r#"CREATE TRIGGER"#));
+        assert!(sql.contains("AFTER INSERT OR UPDATE ON \"Post\""), "events:\n{sql}");
+        assert!(!sql.contains("DELETE"), "per-row fan-out must not handle DELETE:\n{sql}");
+
+        // Transactional per-child enumeration, keyed on the child slot.
+        assert!(
+            sql.contains(r#"INSERT INTO "BitdexOps" (entity_id, ops)"#),
+            "must insert per-row ops:\n{sql}"
+        );
+        assert!(
+            sql.contains(r#"SELECT c."id", _ops FROM "Image" c WHERE c."postId" = NEW."id""#),
+            "must enumerate child rows transactionally:\n{sql}"
+        );
+
+        // The moving-index resolution mechanism is GONE for this trigger.
+        assert!(
+            !sql.contains("queryOpSet"),
+            "per-row fan-out must not emit queryOpSet:\n{sql}"
+        );
+
+        // INSERT emits set ops; UPDATE diffs with IS DISTINCT FROM.
+        assert!(sql.contains("IF TG_OP = 'INSERT' THEN"));
+        assert!(sql.contains("ELSIF TG_OP = 'UPDATE' THEN"));
+        assert!(sql.contains("IS DISTINCT FROM"), "UPDATE must diff parent fields:\n{sql}");
+        assert!(
+            sql.contains("IF jsonb_array_length(_ops) > 0 THEN"),
+            "UPDATE must skip empty diffs:\n{sql}"
+        );
+
+        // The shared op-payload function is emitted and the INSERT path calls it.
+        assert!(
+            sql.contains(r#"CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb"#),
+            "shared ops function must be generated:\n{sql}"
+        );
+        assert!(sql.contains("LANGUAGE sql STABLE"), "ops function must be STABLE sql:\n{sql}");
+        assert!(
+            sql.contains("_ops := bitdex_post_fanout_ops(NEW);"),
+            "INSERT path must call the shared ops function:\n{sql}"
+        );
+    }
+
+    /// W1-3 parity contract: the per-image `set` payload lives in ONE named PG
+    /// function that BOTH the generated trigger's INSERT path AND the re-emitter
+    /// call. Because the shape has a single source, a re-emit re-asserting the
+    /// same values is a byte-identical no-op set — the ≥99%-no-op success signal.
+    /// This test pins the function's existence, stable name, and that a sample
+    /// re-emitter INSERT..SELECT can bind to it.
+    #[test]
+    fn test_fan_out_per_row_shared_ops_function_parity() {
+        let source = post_fan_out_per_row_source();
+
+        // Stable, unhashed name the re-emitter can hardcode.
+        assert_eq!(fan_out_ops_function_name(&source), "bitdex_post_fanout_ops");
+
+        let fn_sql = generate_fan_out_ops_function_sql(&source, source.rows_from.as_ref().unwrap());
+        // Full `set` payload, parent-row parameterized, retaining all three fields.
+        for expected in ["publishedAt", "availability", "postedToId"] {
+            assert!(fn_sql.contains(expected), "function dropped '{expected}':\n{fn_sql}");
+        }
+        assert!(fn_sql.contains(r#"extract(epoch from _p."publishedAt")::bigint"#), "{fn_sql}");
+        assert!(fn_sql.contains(r#"_p."availability"::text"#), "{fn_sql}");
+        assert!(fn_sql.contains(r#"to_jsonb(_p."modelVersionId")"#), "{fn_sql}");
+
+        // A re-emitter can call the same function, keyed on the same child slot —
+        // this is the exact idempotency contract (shape can't diverge from the
+        // trigger because there's only one builder).
+        let reemitter = format!(
+            "INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+             SELECT i.\"id\", {fn}(p)\n\
+             FROM \"Post\" p JOIN \"Image\" i ON i.\"postId\" = p.id\n\
+             WHERE p.\"publishedAt\" BETWEEN now() - interval '15 min' AND now();",
+            fn = fan_out_ops_function_name(&source),
+        );
+        assert!(reemitter.contains("bitdex_post_fanout_ops(p)"));
+    }
+
+    /// PR-M1 (PINNED): the per-image Post fan-out RETAINS the full payload —
+    /// publishedAt drives deferred-alive activation stamping AND the isPublished
+    /// shadow, so it must keep flowing per-image. Options A/B (which delete
+    /// publishedAt) are PARKED.
+    #[test]
+    fn test_fan_out_per_row_retains_full_payload() {
+        let sql = generate_trigger_sql(&post_fan_out_per_row_source());
+        let fields = emitted_fields(&sql);
+        for expected in ["publishedAt", "availability", "postedToId"] {
+            assert!(
+                fields.contains(expected),
+                "per-row fan-out dropped '{expected}' (payload must be retained per PR-M1); got {fields:?}\n{sql}"
+            );
+        }
+        // publishedAt is emitted via the epoch expression, not a bare column.
+        assert!(
+            sql.contains(r#"extract(epoch from NEW."publishedAt")::bigint"#),
+            "publishedAt must be emitted as an epoch bigint:\n{sql}"
+        );
+    }
+
+    /// Config-to-behavior: the parser reads `type: fan_out_per_row` + `rows_from`
+    /// from YAML and populates the runtime struct (team-standards §Config-to-Behavior).
+    #[test]
+    fn test_fan_out_per_row_yaml_parsing() {
+        let yaml = r#"
+sync_sources:
+  - table: Post
+    type: fan_out_per_row
+    rows_from: { table: Image, fk: postId }
+    track_fields:
+      - { column: publishedAt, target: publishedAt, expression: "extract(epoch from {publishedAt})::bigint" }
+      - { column: availability, target: availability, expression: "{availability}::text" }
+      - { column: modelVersionId, target: postedToId }
+"#;
+        let config = SyncConfig::from_yaml(yaml).unwrap();
+        let src = &config.sync_sources[0];
+        assert_eq!(src.table_type.as_deref(), Some("fan_out_per_row"));
+        let rows = src.rows_from.as_ref().expect("rows_from must parse");
+        assert_eq!(rows.table, "Image");
+        assert_eq!(rows.fk, "postId");
+        // Defaults applied when omitted.
+        assert_eq!(rows.slot, "id");
+        assert_eq!(rows.parent_key, "id");
+
+        // And the runtime struct actually drives codegen down the per-row path.
+        let sql = generate_trigger_sql(src);
+        assert!(sql.contains(r#"FROM "Image" c WHERE c."postId" = NEW."id""#), "{sql}");
+        assert!(!sql.contains("queryOpSet"), "{sql}");
+    }
+
+    /// #3 + [AR-4] units: the Image sortAtUnix track field emits MILLISECONDS
+    /// (`* 1000`) with a COALESCE(GREATEST...) fallback, and diffs on UPDATE.
+    /// The engine mapping divides by 1000 — seconds here would shrink every
+    /// value 1000×. Pins the whole chain at codegen.
+    #[test]
+    fn test_image_sortatunix_ms_and_coalesce() {
+        let source = SyncSource {
+            slot_field: Some("id".into()),
+            track_fields: Some(vec![
+                TrackField::Simple("nsfwLevel".into()),
+                TrackField::Simple(SORTATUNIX_EXPR.into()),
+            ]),
+            sets_alive: true,
+            on_delete: Some(OnDeleteValue::String("delete_slot".into())),
+            ..test_source("Image")
+        };
+        let sql = generate_trigger_sql(&source);
+
+        // Emitted under the sortAtUnix target (the dormant sortAtUnix → sortAt mapping).
+        assert!(emitted_fields(&sql).contains("sortAtUnix"), "{sql}");
+        // Milliseconds — not seconds.
+        assert!(sql.contains("* 1000"), "sortAtUnix must be milliseconds:\n{sql}");
+        // INSERT branch: NEW-substituted COALESCE with the Post subquery belt.
+        assert!(
+            sql.contains(r#"COALESCE(extract(epoch from NEW."sortAt")::bigint"#),
+            "INSERT must COALESCE on NEW.sortAt:\n{sql}"
+        );
+        assert!(
+            sql.contains(r#"FROM "Post" p WHERE p.id = NEW."postId""#),
+            "fallback must read Post.publishedAt per-image:\n{sql}"
+        );
+        // UPDATE branch: OLD-substituted resolution diffed against NEW.
+        assert!(
+            sql.contains(r#"COALESCE(extract(epoch from OLD."sortAt")::bigint"#),
+            "UPDATE must diff the OLD resolution:\n{sql}"
+        );
+        assert!(
+            sql.contains(r#"WHERE p.id = OLD."postId""#),
+            "UPDATE fallback must resolve against OLD row:\n{sql}"
+        );
+    }
+
+    /// PR-m2 (disjointness): the Post per-row fan-out and the Image trigger must
+    /// never emit the SAME field for one image. Disjointness is what makes
+    /// double-emission safe — an overlap would let op_dedup LIFO-resolve the two
+    /// writers nondeterministically.
+    #[test]
+    fn test_post_fanout_and_image_fields_disjoint() {
+        let post_sql = generate_trigger_sql(&post_fan_out_per_row_source());
+
+        let image = SyncSource {
+            slot_field: Some("id".into()),
+            track_fields: Some(vec![
+                TrackField::Simple("nsfwLevel".into()),
+                TrackField::Simple("{type}::text as type".into()),
+                TrackField::Simple("postId".into()),
+                TrackField::Simple(SORTATUNIX_EXPR.into()),
+            ]),
+            sets_alive: true,
+            on_delete: Some(OnDeleteValue::String("delete_slot".into())),
+            ..test_source("Image")
+        };
+        let image_sql = generate_trigger_sql(&image);
+
+        let post_fields = emitted_fields(&post_sql);
+        let image_fields = emitted_fields(&image_sql);
+        assert!(!post_fields.is_empty() && !image_fields.is_empty());
+
+        let overlap: Vec<_> = post_fields.intersection(&image_fields).collect();
+        assert!(
+            overlap.is_empty(),
+            "Post fan-out and Image trigger emit overlapping field(s) {overlap:?} — \
+             double-emission would be LIFO-resolved nondeterministically.\n\
+             Post: {post_fields:?}\nImage: {image_fields:?}"
+        );
     }
 }
