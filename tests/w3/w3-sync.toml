@@ -1,0 +1,10 @@
+# W3 steady-state sync config (local Docker PG). Paths are repo-relative — run from the repo root.
+postgres_url = "postgresql://bitdex:bitdex@localhost:5433/civitai"
+bitdex_url = "http://localhost:3010"
+data_dir = "data/w3-steady"
+index_dir = "data/w3-steady/indexes/civitai"
+stage_dir = "data/w3-stage-isolated"   # keep isolated from data/load_stage (boot-dump writes here)
+sync_config_path = "deploy/configs/sync-config-civitai.yaml"
+pg_pool_size = 4
+poll_interval_secs = 2
+replica_id = "w3-steady"
