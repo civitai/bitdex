@@ -20,11 +20,23 @@ class per W1-4) — the re-emit heals it from PG's authoritative values within o
 
 **Three load-bearing facts that shape the whole design:**
 
-1. **Activation is engine-driven and load-bearing; the re-emitter is a pure safety net.** A scheduled
-   slot goes live when the flush thread's wall-clock `activate_due(now)` fires (`slot.rs:280-298`),
-   no op required. The re-emitter never drives activation — it heals the rare slot that `activate_due`
-   or a fan-out missed. If the re-emitter is down, correctness is unaffected for the common path;
-   only the rare miss stays unhealed until it returns. [PR-B2]
+1. **Tf activation is a sweep-driven shadow flip, and the re-emitter is a co-driver of it — not a
+   pure safety net.** [CORRECTED from the original `activate_due` framing by prod evidence:
+   `docs/_in/sortat-divergence-specimens-2026-07-16.md` §PR-m5 + the execution plan's corrected
+   [PR-B2].] Prod scheduled slots are **ALIVE with `isPublished=false`** (the fan-out's quarantine
+   branch holds the future `publishedAt` in the doc without applying it) — they are **NOT** in
+   `slot.rs`'s deferred map, so `activate_due` (`slot.rs:280-298`) does not drive them; it only ever
+   drove map-resident slots this flow never creates. At Tf no op arrives (wall-clock just crosses the
+   scheduled time), so the transition — flip `isPublished` false→true **and** fold `publishedAt` into
+   the `sortAt` layer — is driven by the **overdue sweep (600 s)** plus an opportunistic recompute
+   whenever any later op touches the slot. That makes the re-emitter **more load-bearing than a safety
+   net**: a re-emitted `Set publishedAt=<now-past>` is a reliable second activation driver alongside
+   the sweep, and the one that heals a slot the sweep hasn't reached (or whose `sortAt`-layer fold
+   silently failed — the dominant W1-4 class). **W3 empirically confirmed the no-op case** the current
+   engine gets wrong: a scheduled-ahead slot crossing Tf **with no op arriving** had the sweep alone
+   both flip `isPublished` true AND preserve the correct ingested `sortAt` (14/14 in the lifecycle
+   E2E). If the re-emitter is down, the sweep still activates the common path; only slots the sweep
+   misses (or mis-folds) stay unhealed until it returns.
 2. **The unpublish-race ghost is already fenced by the poller's gap machinery — IF emission is a
    single statement.** See §3. This is the [PR-M3] answer, and it is free.
 3. **Idempotency is structural, not incidental:** the re-emit ops are scalar `Set`s to current PG
@@ -366,8 +378,11 @@ No-op rate and heal-detection (success = ≥99% no-ops) — the honest measureme
 
 ## 7. What this design deliberately does NOT do
 
-- **It does not drive activation.** `activate_due` is load-bearing; the re-emitter is the net under
-  it. If the two ever disagree, activation is authoritative and the re-emit is a redundant re-assert.
+- **It is not the sole activation driver.** [Corrected — see fact #1.] The overdue sweep (600 s) is
+  the primary Tf driver (a sweep-driven shadow flip, since prod scheduled slots are alive-with-shadow,
+  not deferred-map-resident, so `activate_due` does not drive them); the re-emitter is a co-driver that
+  heals slots the sweep misses or mis-folds. Where both act on the same slot, the ops are idempotent
+  re-asserts of PG's authoritative values, so agreement is by construction.
 - **It does not touch the ModelVersion/Model fan-outs** (`baseModel`, `poi`). Those keep `queryOpSet`;
   their reconcile is a separate FOLLOWUP.md item (the over-cap silent-skip hole,
   `ops_processor.rs:2523-2540`).
