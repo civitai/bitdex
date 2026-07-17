@@ -48,11 +48,17 @@ CREATE TRIGGER trg_cleanup_bitdex_ops
 -- Part 2: Per-table triggers (generated from sync config YAML)
 -- -----------------------------------------------------------------------
 
--- [1/8] Table: Image → Trigger: bitdex_image_a6ea374e
+-- [1/8] Table: Image → Trigger: bitdex_image_ee936694
 -- Sets alive: yes
 -- On delete: emit delete op
 
-CREATE OR REPLACE FUNCTION bitdex_image_ops_a6ea374e() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_image_sortat_ops(_i "Image") RETURNS jsonb AS $$
+  SELECT jsonb_build_array(
+    jsonb_build_object('op', 'set', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from _i."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = _i."postId"))::bigint, extract(epoch from _i."scannedAt")::bigint, extract(epoch from _i."createdAt")::bigint)) * 1000))
+  );
+$$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION bitdex_image_ops_ee936694() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -75,8 +81,10 @@ BEGIN
       jsonb_build_object('op', 'set', 'field', 'existedAt', 'value', to_jsonb(GREATEST(extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint))),
       jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId"))),
       jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb((SELECT p."availability"::text FROM "Post" p WHERE p.id = NEW."postId"))),
-      jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId")))
+      jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId"))),
+      jsonb_build_object('op', 'set', 'field', 'model3dId', 'value', to_jsonb((SELECT p."model3dId" FROM "Post" p WHERE p.id = NEW."postId")))
     );
+    _ops := _ops || bitdex_image_sortat_ops(NEW);
     INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."id", _ops);
     RETURN NEW;
   ELSIF TG_OP = 'DELETE' THEN
@@ -138,6 +146,12 @@ BEGIN
         jsonb_build_object('op', 'set', 'field', 'height', 'value', to_jsonb(NEW."height"))
       );
     END IF;
+    IF (COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint)) * 1000) IS DISTINCT FROM (COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint)) * 1000) THEN
+      _ops := _ops || jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint)) * 1000)),
+        jsonb_build_object('op', 'set', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint)) * 1000))
+      );
+    END IF;
     IF ((OLD."flags" >> 13) & 1 = 1 AND (OLD."flags" >> 2) & 1 = 0) IS DISTINCT FROM ((NEW."flags" >> 13) & 1 = 1 AND (NEW."flags" >> 2) & 1 = 0) THEN
       _ops := _ops || jsonb_build_array(
         jsonb_build_object('op', 'remove', 'field', 'hasMeta', 'value', to_jsonb((OLD."flags" >> 13) & 1 = 1 AND (OLD."flags" >> 2) & 1 = 0)),
@@ -186,6 +200,12 @@ BEGIN
         jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb((SELECT p."modelVersionId" FROM "Post" p WHERE p.id = NEW."postId")))
       );
     END IF;
+    IF ((SELECT p."model3dId" FROM "Post" p WHERE p.id = OLD."postId")) IS DISTINCT FROM ((SELECT p."model3dId" FROM "Post" p WHERE p.id = NEW."postId")) THEN
+      _ops := _ops || jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'model3dId', 'value', to_jsonb((SELECT p."model3dId" FROM "Post" p WHERE p.id = OLD."postId"))),
+        jsonb_build_object('op', 'set', 'field', 'model3dId', 'value', to_jsonb((SELECT p."model3dId" FROM "Post" p WHERE p.id = NEW."postId")))
+      );
+    END IF;
     IF jsonb_array_length(_ops) > 0 THEN
       INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."id", _ops);
     END IF;
@@ -194,10 +214,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_image_a6ea374e ON "Image";
-CREATE TRIGGER bitdex_image_a6ea374e AFTER INSERT OR UPDATE OR DELETE ON "Image"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_a6ea374e();
-ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_a6ea374e;
+DROP TRIGGER IF EXISTS bitdex_image_ee936694 ON "Image";
+CREATE TRIGGER bitdex_image_ee936694 AFTER INSERT OR UPDATE OR DELETE ON "Image"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_ee936694();
+ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_ee936694;
 
 
 -- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_bcbef3c3
@@ -324,27 +344,27 @@ CREATE TRIGGER bitdex_imageresourcenew_d84d15a8 AFTER INSERT OR DELETE ON "Image
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_d84d15a8;
 
 
--- [6/8] Table: Post → Trigger: bitdex_post_519ce657
--- Type: fan_out
+-- [6/8] Table: Post → Trigger: bitdex_post_8511462a
+-- Type: fan_out_per_row
 
-CREATE OR REPLACE FUNCTION bitdex_post_ops_519ce657() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb AS $$
+  SELECT jsonb_build_array(
+    jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from _p."publishedAt")::bigint)),
+    jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb(_p."availability"::text)),
+    jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb(_p."modelVersionId"))
+  );
+$$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION bitdex_post_ops_8511462a() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
-  _query text;
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    _query := 'postId eq ' || NEW."id"::text;
-    _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint)),
-      jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb(NEW."availability"::text)),
-      jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb(NEW."modelVersionId"))
-    );
-    INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW.id, jsonb_build_array(
-        jsonb_build_object('op', 'queryOpSet', 'query', _query, 'ops', _ops)
-      ));
+    _ops := bitdex_post_fanout_ops(NEW);
+    INSERT INTO "BitdexOps" (entity_id, ops)
+      SELECT c."id", _ops FROM "Image" c WHERE c."postId" = NEW."id";
     RETURN NEW;
   ELSIF TG_OP = 'UPDATE' THEN
-    _query := 'postId eq ' || NEW."id"::text;
     _ops := '[]'::jsonb;
     IF (extract(epoch from OLD."publishedAt")::bigint) IS DISTINCT FROM (extract(epoch from NEW."publishedAt")::bigint) THEN
       _ops := _ops || jsonb_build_array(
@@ -365,9 +385,8 @@ BEGIN
       );
     END IF;
     IF jsonb_array_length(_ops) > 0 THEN
-      INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW.id, jsonb_build_array(
-        jsonb_build_object('op', 'queryOpSet', 'query', _query, 'ops', _ops)
-      ));
+      INSERT INTO "BitdexOps" (entity_id, ops)
+        SELECT c."id", _ops FROM "Image" c WHERE c."postId" = NEW."id";
     END IF;
     RETURN NEW;
   END IF;
@@ -375,10 +394,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_post_519ce657 ON "Post";
-CREATE TRIGGER bitdex_post_519ce657 AFTER INSERT OR UPDATE ON "Post"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_519ce657();
-ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_519ce657;
+DROP TRIGGER IF EXISTS bitdex_post_8511462a ON "Post";
+CREATE TRIGGER bitdex_post_8511462a AFTER INSERT OR UPDATE ON "Post"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_8511462a();
+ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_8511462a;
 
 
 -- [7/8] Table: ModelVersion → Trigger: bitdex_modelversion_22dd59b3
@@ -475,12 +494,12 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_a13d0fe3;
 -- -----------------------------------------------------------------------
 -- Tables created: BitdexOps, bitdex_cursors
 -- Triggers: 8
---   bitdex_image_a6ea374e on "Image"
+--   bitdex_image_ee936694 on "Image"
 --   bitdex_tagsonimagenew_bcbef3c3 on "TagsOnImageNew"
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
 --   bitdex_imageresourcenew_d84d15a8 on "ImageResourceNew"
---   bitdex_post_519ce657 on "Post"
+--   bitdex_post_8511462a on "Post"
 --   bitdex_modelversion_22dd59b3 on "ModelVersion"
 --   bitdex_model_a13d0fe3 on "Model"
 --

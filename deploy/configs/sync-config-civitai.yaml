@@ -36,15 +36,28 @@ dump_phases:
   # the 63GB tags phase is still downloading/processing.
   - name: images
     table: Image
+    # [PR-B3] sortAt: emitted directly as epoch SECONDS (bigint) so it lands in
+    # the sortAt sort layers with no ms conversion (data_schema fallback: sortAt,
+    # which does NOT apply ms_to_seconds). TYPE-CORRECT belt — every COALESCE/
+    # GREATEST operand is a TIMESTAMP, and extract(epoch ...)::bigint wraps the
+    # whole thing (never COALESCE(timestamp, bigint)). i."sortAt" is the value the
+    # model-share trigger maintains as GREATEST(post.publishedAt, scannedAt,
+    # createdAt); the GREATEST here is only the fallback for rows the backfill
+    # hasn't populated yet (COALESCE short-circuits, so the Post subselect runs
+    # only when i."sortAt" IS NULL). Matches the steady-state trigger's sortAtUnix
+    # value ÷ 1000 (W3 asserts dump == trigger on the same rows).
     copy_query: >
-      COPY (SELECT id, url, "nsfwLevel", hash, flags, type::text,
-                   "userId", "blockedFor",
-                   extract(epoch from "scannedAt")::bigint as "scannedAtSecs",
-                   extract(epoch from "createdAt")::bigint as "createdAtSecs",
-                   "postId", width, height
-            FROM "Image")
+      COPY (SELECT i.id, i.url, i."nsfwLevel", i.hash, i.flags, i.type::text,
+                   i."userId", i."blockedFor",
+                   extract(epoch from i."scannedAt")::bigint as "scannedAtSecs",
+                   extract(epoch from i."createdAt")::bigint as "createdAtSecs",
+                   extract(epoch from COALESCE(i."sortAt",
+                     GREATEST((SELECT p."publishedAt" FROM "Post" p WHERE p.id = i."postId"),
+                              i."scannedAt", i."createdAt")))::bigint as "sortAt",
+                   i."postId", i.width, i.height
+            FROM "Image" i)
       TO STDOUT WITH (FORMAT csv)
-    columns: [id, url, nsfwLevel, hash, flags, type, userId, blockedFor, scannedAtSecs, createdAtSecs, postId, width, height]
+    columns: [id, url, nsfwLevel, hash, flags, type, userId, blockedFor, scannedAtSecs, createdAtSecs, sortAt, postId, width, height]
     slot_field: id
     sets_alive: true
     fields:
@@ -57,6 +70,11 @@ dump_phases:
       - { column: hash, target: hash }        # doc-only
       - width                                  # doc-only
       - height                                 # doc-only
+      # sortAt sort layers (SECONDS). Direct mapping — the dump sort path reads
+      # this i64 as-is (data_schema ms_to_seconds is an ops-path concern, not the
+      # dump). Replaces the former `computed: greatest(existedAt, publishedAt)`
+      # sort field in civitai-index.yaml (removed same-deploy, [PR-M5]).
+      - { column: sortAt, target: sortAt }
     computed_fields:
       # From flags bitfield:
       - target: hasMeta
@@ -79,21 +97,28 @@ dump_phases:
           COPY (SELECT id,
                        extract(epoch from "publishedAt")::bigint as "publishedAtSecs",
                        availability::text,
-                       "modelVersionId"
+                       "modelVersionId",
+                       "model3dId"
                 FROM "Post")
           TO STDOUT WITH (FORMAT csv)
-        columns: [id, publishedAtSecs, availability, modelVersionId]
+        columns: [id, publishedAtSecs, availability, modelVersionId, model3dId]
         key: id
         join_on: postId
         fields:
           - { column: publishedAtSecs, target: publishedAt }
           - { column: availability, target: availability }
           - { column: modelVersionId, target: postedToId }
+          # model3dId (Post column, Meili parity). Enriched onto each image via
+          # the postId join, mirroring the steady-state Image trigger's
+          # model3dId INSERT-read subselect.
+          - { column: model3dId, target: model3dId }
         computed_fields:
           - target: isPublished
             expression: "publishedAtSecs != null"
-    # sortAt = GREATEST(existedAt, publishedAt) is defined in index config
-    # as a computed sort field — BitDex resolves it automatically.
+    # sortAt is now INGESTED (copy_query column above), not engine-computed.
+    # The old `computed: greatest(existedAt, publishedAt)` sort field is removed
+    # from civitai-index.yaml in the SAME deploy as this emission flip ([PR-M5]:
+    # computed and ingested must never coexist).
 
   # Phase 2: Tags (63GB, largest — loaded after images so server can serve queries)
   - name: tags
@@ -193,6 +218,32 @@ triggers:
     slot_field: id
     sets_alive: true
     on_delete: true
+    # [PR-B4] PINNED UNIT STATEMENT (emission + query chains — see also civitai-index.yaml):
+    #   EMISSION: sortAtUnix is emitted in MILLISECONDS (`* 1000`). The engine
+    #   data_schema mapping `sortAtUnix -> sortAt` (civitai-index.yaml,
+    #   ms_to_seconds:true) divides by 1000, so the sortAt SORT LAYERS store
+    #   SECONDS. The dump path instead emits a `sortAt` column already in SECONDS
+    #   (data_schema fallback: sortAt — ms_to_seconds is NOT applied to a
+    #   fallback source). Both wire encodings converge on SECONDS in the layers.
+    #   QUERY: the Civitai builder sends `sortAtUnix Gte <seconds>`
+    #   (image.service.ts:3940). That clause is resolved by the time-bucket
+    #   manager (civitai-index.yaml time_buckets.filter_field: sortAtUnix,
+    #   sort_field: sortAt): the threshold is unit-normalized by ts_secs_u64
+    #   (src/query.rs:316 — value already seconds, so passes through unchanged)
+    #   and snapped to a bucket built from the sortAt SECONDS layers
+    #   (src/executor.rs Gt/Gte ~L668, Lt/Lte ~L702). No ingested `sortAtUnix`
+    #   filter field exists — the clause only ever hits the sort layers via the
+    #   bucket. Net: SECONDS on the query side; MILLISECONDS only on the wire,
+    #   divided back on ingest. The builder's seconds-Gte is CORRECT both before
+    #   this change (sortAt computed) and after (sortAt ingested).
+    #
+    # sortAtUnix is emitted via the SHARED bitdex_image_sortat_ops() function so
+    # the W1-3 re-emitter re-asserts the identical value (shape parity). MS units
+    # (`* 1000`) with a COALESCE(GREATEST...) belt for rows the PG backfill hasn't
+    # populated Image.sortAt on yet. Expression is byte-identical to the W1-1
+    # codegen pin (trigger_gen.rs SORTATUNIX_EXPR); COALESCE short-circuits so the
+    # Post subselect only evaluates when Image.sortAt is still NULL.
+    shared_ops_fields: [sortAtUnix]
     track_fields:
       - nsfwLevel
       - { column: type, expression: "{type}::text" }
@@ -203,6 +254,7 @@ triggers:
       - hash
       - width
       - height
+      - 'COALESCE(extract(epoch from {sortAt})::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = {postId}))::bigint, extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)) * 1000 as sortAtUnix'
     computed_fields:
       - target: hasMeta
         expression: "({flags} >> 13) & 1 = 1 AND ({flags} >> 2) & 1 = 0"
@@ -234,6 +286,15 @@ triggers:
         expression: '(SELECT p."availability"::text FROM "Post" p WHERE p.id = {postId})'
       - target: postedToId
         expression: '(SELECT p."modelVersionId" FROM "Post" p WHERE p.id = {postId})'
+      # model3dId (Post column, indexed for Meili parity). INSERT-reads the
+      # parent Post via subselect, exactly like publishedAt's INSERT branch, and
+      # re-resolves on UPDATE-when-changed (e.g. if the image moves posts).
+      # NOT carried on the Post per-image fan-out below: model3dId is set at
+      # post-CREATE, before any image rows exist, and does not change over a
+      # post's lifetime — so the Image INSERT-read fully covers it and a Post
+      # fan-out entry would only add a redundant (disjointness-breaking) writer.
+      - target: model3dId
+        expression: '(SELECT p."model3dId" FROM "Post" p WHERE p.id = {postId})'
 
   - table: TagsOnImageNew
     slot_field: imageId
@@ -260,15 +321,33 @@ triggers:
         expression: "{detected} = false"
         value: "{modelVersionId}"
 
-  # Fan-out triggers (queryOpSet):
+  # Post publish fan-out — PER-IMAGE MATERIALIZED (W1-1 / PR #325).
+  # Replaces the old `type: fan_out` queryOpSet ("postId eq {id}") that BitDex
+  # resolved against its own moving index at apply time (FD #69397: never checked
+  # what it matched). `fan_out_per_row` instead enumerates the Post's Image rows
+  # TRANSACTIONALLY in PG — INSERT INTO "BitdexOps" SELECT i.id, <ops> FROM
+  # "Image" i WHERE i."postId" = NEW.id — so the match set is fixed inside the
+  # publishing txn and cannot be partial/early/re-resolved on WAL replay.
+  #
+  # [PR-M1] RETAINS the full payload {publishedAt, availability, postedToId}.
+  # publishedAt drives BOTH deferred-alive activation stamping AND the isPublished
+  # shadow — do NOT drop it (design §2.2 Options A/B that delete publishedAt are
+  # PARKED). Only Phase 2 ever removes availability/postedToId.
+  #
+  # [PR-m2] These three fields are DISJOINT from sortAtUnix (the only new field
+  # the Image trigger emits): the Post fan-out never emits sortAtUnix, so the two
+  # writers never collide on one image → op_dedup has nothing to LIFO-resolve
+  # nondeterministically. (The Image trigger DOES also INSERT-read
+  # publishedAt/availability/postedToId for the "image added to an already-
+  # published post" case, but that is temporally separated and same-valued — see
+  # test_post_fanout_disjoint_from_sortatunix in sync_config.rs.)
   - table: Post
-    type: fan_out
-    query: "postId eq {id}"
+    type: fan_out_per_row
+    rows_from: { table: Image, fk: postId, slot: id, parent_key: id }
     track_fields:
       - { column: publishedAt, target: publishedAt, expression: "extract(epoch from {publishedAt})::bigint" }
-      # Null handling: if {publishedAt} is NULL, trigger emits remove op (clears the field).
-      # The {field} template resolves to OLD.field for remove ops, NEW.field for set ops.
-      # When OLD is not null and NEW is null → remove. When NEW is not null → set.
+      # Null handling: if {publishedAt} is NULL, the UPDATE branch emits a remove op
+      # (OLD non-null, NEW null). NEW non-null → set. Fan-out reaches every child image.
       - { column: availability, target: availability, expression: "{availability}::text" }
       - { column: modelVersionId, target: postedToId }
 

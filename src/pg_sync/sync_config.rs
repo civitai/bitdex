@@ -804,4 +804,166 @@ triggers: []
             assert!(!enrich.columns.is_empty(), "posts enrichment must have explicit columns");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // W2-1 config-level guards (scheduled-publish plan)
+    // -----------------------------------------------------------------------
+
+    /// Load the production deploy sync config.
+    fn load_deploy_sync_config() -> FullSyncConfig {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/configs/sync-config-civitai.yaml")
+        ).expect("deploy/configs/sync-config-civitai.yaml must exist");
+        // from_yaml now runs SyncSource::validate() on every trigger (c4a4aa7),
+        // so a green parse here also proves the fan_out_per_row/shared_ops_fields
+        // structural rules hold on the real config.
+        FullSyncConfig::from_yaml(&yaml).expect("deploy sync config must parse + validate")
+    }
+
+    /// Extract the set of BitDex field names a generated trigger emits, by
+    /// scanning the generated SQL for `'field', '<name>'` op markers (covers
+    /// both inlined ops and the shared `bitdex_*_ops` functions embedded in the
+    /// trigger SQL).
+    fn emitted_trigger_fields(sql: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        let marker = "'field', '";
+        let mut rest = sql;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            if let Some(end) = after.find('\'') {
+                out.insert(after[..end].to_string());
+            }
+            rest = after;
+        }
+        out
+    }
+
+    /// [W1-1 review minor 3 / PR-m2] Disjointness on the REAL deploy config.
+    ///
+    /// The load-bearing invariant is that the new `sortAtUnix` writer (the Image
+    /// trigger's shared function) and the Post per-image fan-out never emit the
+    /// SAME field for one image — an overlap would let op_dedup LIFO-resolve the
+    /// two writers nondeterministically.
+    ///
+    /// The Image trigger DOES also emit {publishedAt, availability, postedToId}
+    /// (the 2026-07-07 "Mode B" INSERT-read for images added to an already-
+    /// published post). That overlap with the Post fan-out is INTENTIONAL and
+    /// safe: the two writers fire for temporally-separated events and resolve to
+    /// the SAME value (both read Post.publishedAt), so LIFO order is immaterial.
+    /// This test pins that the overlap is EXACTLY that documented set and that
+    /// `sortAtUnix` (and `model3dId`) are strictly disjoint.
+    #[test]
+    fn test_post_fanout_disjoint_from_sortatunix() {
+        use crate::pg_sync::trigger_gen::generate_trigger_sql;
+
+        let config = load_deploy_sync_config();
+        let post = config.triggers.iter().find(|t| t.table == "Post")
+            .expect("Post trigger must exist");
+        let image = config.triggers.iter().find(|t| t.table == "Image")
+            .expect("Image trigger must exist");
+
+        // The Post trigger is the per-image materialized fan-out (not queryOpSet).
+        assert_eq!(post.table_type.as_deref(), Some("fan_out_per_row"),
+            "Post must be fan_out_per_row");
+        assert!(post.rows_from.is_some(), "Post fan_out_per_row must set rows_from");
+        assert!(post.query.is_none(), "Post must not carry a query fan-out anymore");
+
+        let post_fields = emitted_trigger_fields(&generate_trigger_sql(post));
+        let image_fields = emitted_trigger_fields(&generate_trigger_sql(image));
+        assert!(!post_fields.is_empty() && !image_fields.is_empty());
+
+        // Post fan-out emits exactly the retained payload (PR-M1) — and crucially
+        // NOT sortAtUnix.
+        let expected_post: std::collections::HashSet<String> =
+            ["publishedAt", "availability", "postedToId"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(post_fields, expected_post,
+            "Post fan-out must emit exactly {{publishedAt, availability, postedToId}}, got {post_fields:?}");
+
+        // sortAtUnix is emitted by the Image trigger and is DISJOINT from Post.
+        assert!(image_fields.contains("sortAtUnix"), "Image trigger must emit sortAtUnix");
+        assert!(!post_fields.contains("sortAtUnix"),
+            "Post fan-out must NOT emit sortAtUnix — it is the Image trigger's field");
+        // model3dId likewise Image-only (INSERT-read, not carried on the fan-out).
+        assert!(image_fields.contains("model3dId"), "Image trigger must emit model3dId");
+        assert!(!post_fields.contains("model3dId"), "Post fan-out must NOT emit model3dId");
+
+        // The ONLY overlap between the two writers is the documented, safe Mode-B set.
+        let overlap: std::collections::HashSet<String> =
+            post_fields.intersection(&image_fields).cloned().collect();
+        assert_eq!(overlap, expected_post,
+            "the only Post∩Image overlap must be the intentional Mode-B set \
+             {{publishedAt, availability, postedToId}}; any other overlap (esp. \
+             sortAtUnix) would be op_dedup-nondeterministic. Got {overlap:?}");
+    }
+
+    /// [PR-B4 emission side / AR-4] The Image trigger emits sortAtUnix in
+    /// MILLISECONDS via the shared function, on the REAL deploy config. Seconds
+    /// here would shrink every value 1000× once the engine's ms_to_seconds
+    /// mapping divides by 1000.
+    #[test]
+    fn test_image_sortatunix_emitted_ms_on_deploy_config() {
+        use crate::pg_sync::trigger_gen::generate_trigger_sql;
+
+        let config = load_deploy_sync_config();
+        let image = config.triggers.iter().find(|t| t.table == "Image")
+            .expect("Image trigger must exist");
+        assert_eq!(image.shared_ops_fields.as_deref(), Some(&["sortAtUnix".to_string()][..]),
+            "Image must factor sortAtUnix into the shared re-emitter function");
+
+        let sql = generate_trigger_sql(image);
+        assert!(sql.contains("* 1000"), "sortAtUnix must be milliseconds:\n{sql}");
+        assert!(sql.contains("_ops := _ops || bitdex_image_sortat_ops(NEW);"),
+            "INSERT must call the shared sortat ops function (re-emitter parity):\n{sql}");
+        assert!(emitted_trigger_fields(&sql).contains("sortAtUnix"));
+    }
+
+    /// [PR-B4 mapping side + PR-M5] Index config: sortAt is INGESTED not computed,
+    /// the sortAtUnix→sortAt mapping keeps ms_to_seconds + fallback semantics, and
+    /// model3dId is indexed. Parsed generically (the `serde_yaml` FEATURE flag
+    /// that gates Config::from_yaml is not active under --features pg-sync, but the
+    /// crate is available, so we walk the YAML value tree directly).
+    #[test]
+    fn test_index_config_sortat_ingested_and_model3did() {
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/configs/civitai-index.yaml")
+        ).expect("deploy/configs/civitai-index.yaml must exist");
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).expect("civitai-index.yaml must be valid YAML");
+
+        let config = &root["config"];
+
+        // sortAt sort field: present, and NO `computed:` block ([PR-M5]).
+        let sort_fields = config["sort_fields"].as_sequence().expect("sort_fields seq");
+        let sort_at = sort_fields.iter()
+            .find(|f| f["name"].as_str() == Some("sortAt"))
+            .expect("sortAt sort field must exist");
+        assert!(sort_at.get("computed").is_none(),
+            "sortAt must NOT be computed — ingested and computed must never coexist ([PR-M5])");
+
+        // model3dId filter field: single_value, per_value_lazy.
+        let filter_fields = config["filter_fields"].as_sequence().expect("filter_fields seq");
+        let model3did = filter_fields.iter()
+            .find(|f| f["name"].as_str() == Some("model3dId"))
+            .expect("model3dId filter field must exist");
+        assert_eq!(model3did["field_type"].as_str(), Some("single_value"));
+        assert_eq!(model3did["per_value_lazy"].as_bool(), Some(true));
+
+        // time_buckets pins the query-side field/units.
+        let tb = &config["time_buckets"];
+        assert_eq!(tb["filter_field"].as_str(), Some("sortAtUnix"));
+        assert_eq!(tb["sort_field"].as_str(), Some("sortAt"));
+
+        // data_schema: sortAtUnix→sortAt mapping intact (ms_to_seconds + fallback),
+        // and model3dId ingested.
+        let ds_fields = root["data_schema"]["fields"].as_sequence().expect("data_schema.fields seq");
+        let sortat_map = ds_fields.iter()
+            .find(|f| f["source"].as_str() == Some("sortAtUnix") && f["target"].as_str() == Some("sortAt"))
+            .expect("sortAtUnix->sortAt data_schema mapping must exist");
+        assert_eq!(sortat_map["ms_to_seconds"].as_bool(), Some(true),
+            "sortAtUnix->sortAt must divide ms→s (emission is ms)");
+        assert_eq!(sortat_map["fallback"].as_str(), Some("sortAt"),
+            "dump path emits `sortAt` seconds via this fallback (no ms division)");
+        assert!(ds_fields.iter().any(|f| f["target"].as_str() == Some("model3dId")),
+            "model3dId must be in data_schema");
+    }
 }
