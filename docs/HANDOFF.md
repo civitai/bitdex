@@ -267,6 +267,45 @@ Reach agents via mailbox: `node ~/.claude/skills/mailbox/query.mjs send <name> "
 - **Gate 5 (Local Integration):** PARTIAL — crafted data tests pass, real PG integration NOT done
 - **Production readiness:** See `docs/design/production-readiness-checklist.md`
 
+### Scheduled Publish + Ingested `sortAt` (W3 PASSED, W4 rollout gated)
+New agents touching publish, `sortAt`, `isPublished`, or the Post fan-out: read the design chain
+FIRST, in this order:
+1. `docs/design/scheduled-publish-redesign.md` — Justin's failure-class analysis (why publish-as-event
+   kept breaking).
+2. `docs/design/scheduled-publish-design.md` — the design; **§2.D is the DECIDED, EXECUTED direction**
+   (upstream-maximal, engine frozen). Options A/B/C are recorded alternatives, PARKED.
+3. `docs/design/scheduled-publish-execution-plan.md` — the task tracker (waves W1–W4, all reviewer
+   findings folded in as `[PR-n]`).
+4. `docs/design/publish-reemitter.md` — the upstream re-emitter (safety net).
+5. `docs/_in/sortat-divergence-specimens-2026-07-16.md` — W1-4 prod evidence: the dominant bug was
+   **visible-but-misordered** (publishedAt delivered, but the engine's `sortAt` recompute silently
+   failed on 7–28% of recently-published images), NOT the invisible/dropped class (~0 in prod).
+
+**What landed (main):** per-image materialized Post fan-out (`fan_out_per_row`, #325); ingested
+`sortAt` via the `sortAtUnix → sortAt` mapping replacing the engine-computed `GREATEST` (#326);
+dump never trusts the `Image.sortAt` column — it recomputes `GREATEST(...)` (#328, no-backfill); `model3dId`
+indexed for Meili parity (#326). BitDex engine unchanged — config + sidecar trigger codegen +
+model-share only.
+
+**W4 = staged prod rollout, gated on Justin at each step. In flight:** the model-share migration PRs
+(triggers + audit) are in review; **prod hand-apply of the trigger SQL is held for Justin's go**
+(zuri owns the model-share DB apply).
+1. model-share migration triggers deploy (write-only; nothing reads `sortAt` yet). The Post→Image
+   fan-out is **unconditional** (`WHERE postId = NEW.id`, sortAt + updatedAt) — no `IS DISTINCT FROM`
+   guard, or an unpublish that leaves `sortAt` unchanged would drop the `updatedAt` bump and stale
+   Meili's `updatedAt`-keyed incremental sync.
+2. **No `Image.sortAt` backfill** (PR #328 decision): it would be a ~92M-row full-table rewrite for a
+   column nothing reads. The dump recomputes `GREATEST(...)` and never trusts the column; the BEFORE
+   trigger authors it for future writes so it converges lazily. (An optional paced backfill exists but
+   is not required for correctness.)
+3. Audit reconcile clean (PG↔BitDex `sortAt` sampled, alarm proven able to fire on a seeded mismatch).
+4. Regenerated sync triggers deploy (add-only flip; `sortAtUnix` emitted but DORMANT until step 5).
+5. Config cutover deploy (`computed:` → ingested, atomic — the two modes must NEVER coexist) +
+   **redump on BOTH pods** (bitdex-1 too, or a failover reopens the model3dId gap).
+6. Civitai (model-share) query builder deploy (adds the `model3dId` filter).
+Then: (7) re-emitter enabled, (8) shadow-compare window vs Meili, (9) Meili image-feed retirement
+decision (out of this plan's scope — separate call after success criteria hold).
+
 ### Other
 - **Shadow mode comparison** — BitDex runs alongside Meilisearch, results compared. Donovan manages the model-share side (currently offline).
 - **Autovac** — Not started. Slot recycling for deleted documents.

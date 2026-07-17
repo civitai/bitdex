@@ -7,6 +7,14 @@ updated: 2026-03-28
 
 > Distilled from the [working design doc](pg-sync-v2.md) (Justin + Adam, 2026-03-25).
 
+> **Update (2026-07-17) — scheduled-publish effort supersedes two things below.** The Post publish
+> fan-out is no longer a `queryOpSet` — it is a **per-image materialized fan-out** (`type: fan_out_per_row`,
+> PR #325). And `sortAt` is no longer engine-computed — PG authors it and BitDex **ingests it as a plain
+> value** through the `sortAtUnix → sortAt` mapping (PRs #326/#328); the index config's `computed:` block
+> is dropped. ModelVersion/Model fan-outs still use `queryOpSet`. See the "Fan-Out" and "Computed Sort
+> Fields" sections below (both annotated) and the authoritative chain in
+> `scheduled-publish-design.md` (§2.D EXECUTED) + `scheduled-publish-execution-plan.md`.
+
 ## Problem
 
 The V1 outbox poller is 80M rows behind and can never catch up. Each cycle polls 5,000 rows from `BitdexOutbox`, then runs 5 enrichment queries per batch (images + tags + tools + techniques + resources) to assemble full JSON documents before PATCHing to BitDex. At ~2,500 changes/s with enrichment as the bottleneck, steady-state write volume exceeds processing capacity.
@@ -108,7 +116,12 @@ BitDex looks up the `modelVersionIds=456` bitmap, gets all affected slots, appli
 
 The trigger uses `jsonb_agg` to collect MV ids: `SELECT jsonb_agg(id) FROM ModelVersion WHERE modelId = NEW.id`. BitDex ORs the MV bitmaps together, then applies the ops.
 
-**Post publishedAt change:**
+**Post publishedAt change — SUPERSEDED (2026-07-17, PR #325).** The Post fan-out no longer emits a
+`queryOpSet`. The trigger now materializes **one BitdexOps row per image** inside the publishing
+transaction, so the match set is decided by PG (`WHERE "postId" = NEW.id`) and can never be partial,
+early, or re-resolved differently on WAL replay — this closed FD #69397's moving-index race. See
+[Per-Image Post Fan-Out](#per-image-post-fan-out-supersedes-post-queryopset) below. The old queryOpSet
+shape (kept here for history):
 ```json
 [{"op": "queryOpSet", "query": "postId eq 789", "ops": [
   {"op": "remove", "field": "publishedAt", "value": 1711000000},
@@ -178,10 +191,6 @@ sync_sources:
     query: "modelVersionIds eq {id}"
     track_fields: [baseModel]
 
-  - table: Post
-    query: "postId eq {id}"
-    track_fields: [publishedAt, availability]
-
   - table: Model
     query: "modelVersionIds in {modelVersionIds}"
     query_source: "SELECT jsonb_agg(id) as \"modelVersionIds\" FROM \"ModelVersion\" WHERE \"modelId\" = {id}"
@@ -191,6 +200,56 @@ sync_sources:
 - `query`: BitDex query template. `{column}` placeholders are substituted from `NEW` columns.
 - `query_source`: Optional PG subquery for values not on the triggering table. Returns named columns that feed into `query` placeholders.
 - No `slot_field` — slots come from the BitDex query result.
+- **ModelVersion and Model stay on `queryOpSet`** — deliberately. A single MV/Model change can fan out
+  to millions of images (popular checkpoints); materializing those as per-image op rows is off the
+  table. Their risk profile tolerates the race: the values change rarely, and a miss is a stale,
+  diffable filter value, not a missed publish.
+
+### Per-Image Post Fan-Out (supersedes Post `queryOpSet`)
+
+**2026-07-17, PR #325.** The Post trigger is now `type: fan_out_per_row`. Instead of emitting one
+`queryOpSet` row that BitDex resolves against a moving index, the trigger inserts **one BitdexOps row
+per matched image**, resolved transactionally in PG:
+
+```yaml
+  - table: Post
+    type: fan_out_per_row
+    rows_from: { table: Image, fk: postId, slot: id, parent_key: id }
+    track_fields:
+      - { column: publishedAt, target: publishedAt, expression: "extract(epoch from {publishedAt})::bigint" }
+      - { column: availability, target: availability, expression: "{availability}::text" }
+      - { column: modelVersionId, target: postedToId }
+```
+
+- `type: fan_out_per_row` (struct field `table_type: Option<String>`, YAML key `type`) selects the
+  per-row materialized generator over the query-resolved one. It requires `rows_from`.
+- `rows_from` (`{ table, fk, slot, parent_key }`) names the child table, the FK back to the parent, the
+  child column that becomes the BitDex slot, and the parent key. Generated INSERT body:
+  `INSERT INTO "BitdexOps" (entity_id, ops) SELECT c."id", _ops FROM "Image" c WHERE c."postId" = NEW."id"`.
+- The **full publish payload `{publishedAt, availability, postedToId}` is retained** per image (PR-M1):
+  `publishedAt` still drives both deferred-alive activation stamping and the `isPublished` shadow. The
+  Options A/B "delete publishedAt" simplifications are parked, not executed.
+
+**Shared op-building PG functions (PR #325).** The per-image ops are built by deliberately **unhashed,
+`STABLE` SQL functions** so the W1-3 re-emitter can bind to them and never drift from the trigger's op
+shape:
+
+- `bitdex_post_fanout_ops(_p "Post") RETURNS jsonb` — the Post publish payload
+  (`{publishedAt, availability, postedToId}`) for one parent row. (`trigger_gen.rs`
+  `generate_fan_out_ops_function_sql`.)
+- `bitdex_image_sortat_ops(_i "Image") RETURNS jsonb` — the `sortAtUnix` op for one image
+  (see [Computed → Ingested Sort Fields](#computed--ingested-sort-fields)). Named by stripping a
+  trailing `Unix` and lowercasing (`sortAtUnix` → `bitdex_image_sortat_ops`); driven by
+  `shared_ops_fields: [sortAtUnix]` on the Image source. (`trigger_gen.rs`
+  `generate_shared_field_ops_function_sql`.)
+
+The re-emitter (`docs/design/publish-reemitter.md`) calls
+`bitdex_post_fanout_ops(p) || bitdex_image_sortat_ops(i)` on a clock instead of a row UPDATE.
+
+**Disjointness invariant (PR-m2).** The Post fan-out and the Image `sortAt` trigger must never emit the
+same field for one image — disjointness is what makes double-emission safe (an overlap would
+LIFO-resolve nondeterministically under op-dedup). The Post fan-out carries publish fields; the Image
+trigger carries `sortAtUnix`; they do not intersect.
 
 ### Trigger Reconciliation
 
@@ -381,11 +440,39 @@ The `creates_slot` flag on `EntityOps` controls alive bit management:
 
 Peak memory: one table's bitmaps at a time. K8s readiness probe returns 503 during dumps (health probe stays 200). Traffic routes only after all dumps complete.
 
-### Prerequisite: Computed Sort Fields
+### Computed → Ingested Sort Fields
 
-`sortAt = GREATEST(existedAt, publishedAt)` requires BitDex to compute sort values from multiple source fields. `existedAt` comes from Image dumps, `publishedAt` comes from Post dumps — they arrive at different times. BitDex must recompute `sortAt` whenever either source changes.
+**Original design (superseded).** `sortAt = GREATEST(existedAt, publishedAt)` had BitDex compute the
+sort value engine-side from multiple source fields arriving at different times, recomputing whenever
+either changed. That engine-side recompute is exactly what proved unreliable in prod — it silently
+failed to fold `publishedAt` into the sort key on 7–28% of recently-published images (W1-4 evidence,
+`docs/_in/sortat-divergence-specimens-2026-07-16.md`).
 
-This is a separate feature tracked in [computed-sort-fields.md](computed-sort-fields.md).
+**Current design (2026-07-17, PRs #326/#328) — PG authors `sortAt`, BitDex ingests it as a value.**
+
+- The index config's `sortAt` field **drops the `computed:` block** and becomes a plain 32-bit sort
+  field. Values arrive through the already-wired `sortAtUnix → sortAt` data-schema mapping
+  (`value_type: integer, fallback: sortAt, ms_to_seconds: true`). Ingested `sortAtUnix` is
+  **milliseconds**; the mapping divides by 1000; the sort layers hold **seconds**. `computed` and
+  `ingested` must NEVER coexist (PR-M5 / [AR-2]) — a computed recompute would collapse an ingested value.
+- **Steady-state** emits `sortAtUnix` from the Image trigger via `bitdex_image_sortat_ops`, computed
+  inline with a COALESCE belt:
+  `COALESCE(extract(epoch from {sortAt})::bigint, GREATEST(<post.publishedAt>, {scannedAt}, {createdAt})) * 1000`.
+  This may trust `Image.sortAt` **only because** the model-share `image_sort_at_before` BEFORE
+  INSERT/UPDATE trigger recomputes the column on every write, so `NEW."sortAt"` is correct-on-write.
+- **Dump** must NEVER trust the column (PR #328). ~92M historical rows carry stale `now()`-at-migration
+  values in `Image.sortAt` (88.1% mismatch sampled), so the Image dump `copy_query` recomputes a pure
+  `GREATEST(post.publishedAt, scannedAt, createdAt)` from scratch — no COALESCE, no `i."sortAt"` read.
+  This asymmetry (ops may trust the column, dump must not) is pinned by
+  `test_dump_sortat_never_trusts_the_column` in `src/pg_sync/sync_config.rs`. Because the dump
+  recomputes the same formula the old computed slots used, **no backfill of `Image.sortAt` is required
+  for BitDex correctness** — the column stays advisory and converges lazily as rows are touched.
+- `model3dId` (Meili-parity gap field) is added alongside: an Image `computed_fields` entry reading the
+  parent Post, a Post-enrichment column in the dump, and an index filter field
+  (`single_value, per_value_lazy`). Deliberately NOT on the Post fan-out (set at post-create, never
+  changes — a redundant writer would break the disjointness invariant).
+
+Full rationale and rollout in `scheduled-publish-design.md` §2.D and `scheduled-publish-execution-plan.md`.
 
 ---
 

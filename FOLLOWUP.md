@@ -1,5 +1,57 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Scheduled-publish effort — residuals & follow-ups (2026-07-17)
+
+Filed during the scheduled-publish / ingested-`sortAt` wrap-up. All non-blocking; the effort's core
+(per-image Post fan-out, PG-authored `sortAt`, model3dId) landed and passed W3. See
+`docs/design/scheduled-publish-design.md` + `scheduled-publish-execution-plan.md` for the full chain.
+
+### (a) Over-cap fan-out skip is still a silent drop for baseModel/poi
+The `queryOpSet` over-cap skip (a wide fan-out is dropped entirely with only a counter) fires ONLY
+when `BITDEX_QUERY_OP_SET_MAX_FANOUT` is set — default is `usize::MAX`, i.e. uncapped, so nothing is
+skipped today. The **per-image Post fan-out (#325) removed the residual for the Post path entirely**
+(Post ops now resolve transactionally in PG, never as a capped query). ModelVersion (`baseModel`) and
+Model (`poi`) still ride `queryOpSet` and would be exposed if the cap is ever enabled. The durable
+answer for those is a periodic baseModel/poi reconcile against PG (the values are diffable, unlike a
+missed publish) — someday, not now.
+
+### (b) CI-flaky concurrent_engine flush-observation tests — deflaked, one residual
+Root cause: the tests raced a **publish → yield → disk-append** sequence against fixed `sleep`
+timings, so on a slow runner the assertion fired before the disk append landed. PR #330 deflaked them
+(observe the actual event, don't sleep). One residual remains: a **bare `unwrap()` after a timeout**
+that can still panic on a very slow runner — follow-up in flight. **Rule for anyone touching these:
+never use `wait_for_flush` to gate a disk-state assertion** — it gates the flush publish, not the
+subsequent disk append, so it will pass before the file is written.
+
+### (c) Meili query builder still references retired `combinedNsfwLevel`
+`combinedNsfwLevel` was retired upstream and dropped from BitDex scope, but the model-share Meili
+image query builder still emits it (`image.service.ts` around :4003 / :4105). Harmless for BitDex
+parity (BitDex never indexed it), but it should be cleaned from the Meili builder so the two builders
+stay diffable. model-share change, not BitDex.
+
+### (d) Bulk-dump duplicate slot ids → per-field-LIFO "frankenstein" docs (latent)
+If a bulk dump ever contains duplicate slot ids for the same entity, the per-field LIFO tuple resolve
+can assemble a "frankenstein" doc (newest value per field, sourced from different physical rows).
+Latent only — prod ids are unique by construction, so this cannot bite today; noted so a future
+dump-source change that could introduce duplicates gets a dedup guard first.
+
+### (e) ModelVersion publish cascade is linear (~120µs/image)
+The MV publish path cascades to images linearly at ~120µs/image, so a 10k+-image ModelVersion publish
+is a ~1s+ transaction. Acceptable at current sizes. If prod MV publish sizes grow, the mitigation is
+the **statement-level trigger variant** (transition-table UPDATE, one statement) instead of the
+row-level per-image path — same fallback [AR-5] names for the Post fan-out latency gate.
+
+### (f) `stage_dir` isolation — boot-dump COPY can clobber concurrent dump CSVs
+`bitdex-sync pg` boot-dump writes COPY output into `stage_dir`; if another dump runs against the same
+`stage_dir`, the two COPY outputs collide (same filenames). Give each dump run an isolated stage
+directory (or namespace the CSV filenames) before running concurrent dumps against one stage dir.
+
+### (g) already-alive-then-rescheduled population not distinctly pinned in E2E
+The W3 scheduled-post lifecycle E2E covers the two main populations, but the specific variant of a
+slot that was **already alive and then rescheduled** is not distinctly asserted. Low priority: the
+sweep pin is population-agnostic (it re-derives from PG-authored `sortAt` regardless of how the slot
+got there), so a dedicated case would only add belt-and-suspenders coverage.
+
 ## Verifier orphan detection is only ~50% sensitive — needs a later pass, not a longer barrier (2026-07-15)
 
 v1.1.47 added the `Inconclusive` verdict so `bitdex_activation_verify_redriven_total` counts only

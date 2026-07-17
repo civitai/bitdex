@@ -104,6 +104,8 @@ The sync-v2 rewrite replaces the hardcoded V1 bulk loader and outbox poller with
 
 **Steady-State Path (real-time sync):**
 - PG triggers write ops to `BitdexOps` table → `bitdex-sync` (`src/pg_sync/ops_poller.rs`) polls and POSTs to BitDex
+- **Fan-out shape (scheduled-publish effort, 2026-07):** the **Post** publish fan-out is a **per-image materialized** trigger (`type: fan_out_per_row`, PR #325) — it inserts one BitdexOps row per image resolved transactionally in PG (`WHERE postId = NEW.id`), not a `queryOpSet` BitDex resolves against a moving index. **ModelVersion (`baseModel`) and Model (`poi`) still use `queryOpSet`** (a single change can fan out to millions of images). Per-image ops are built by shared, unhashed `STABLE` PG functions `bitdex_post_fanout_ops` / `bitdex_image_sortat_ops` (`src/pg_sync/trigger_gen.rs`) so the upstream re-emitter cannot drift from the triggers.
+- **`sortAt` is ingested, not engine-computed (PRs #326/#328):** PG authors `sortAt = GREATEST(post.publishedAt, scannedAt, createdAt)`; BitDex ingests it as a plain value via the `sortAtUnix → sortAt` mapping (ms→seconds). The index config's `computed:` block is dropped (computed and ingested must never coexist). The dump recomputes the formula and **never trusts the `Image.sortAt` column** (~92M rows carry stale migration values). `model3dId` (Post column) is indexed for Meili parity. See `docs/design/scheduled-publish-design.md` §2.D.
 - `POST /ops` → `src/ops_wal.rs` (append-only WAL with CRC32, fsync per batch)
 - WAL reader thread tails the WAL → `src/ops_processor.rs` applies batches via BitmapSink + DocSink
 - `src/write_coalescer.rs` — Coalesces bitmap writes for flush efficiency

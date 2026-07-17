@@ -138,6 +138,15 @@ design doc, Justin's final approval before merge — per standing rule)
   window); (8) shadow-compare window → success criteria; (9) Meili image-feed retirement decision.
 - **#13** docs continuously; final pass at the end.
 
+> **W4 update (2026-07-17): step (2) backfill is now NO-BACKFILL (PR #328).** Perf review on live prod
+> found the backfill is a disguised full-table rewrite (~92M of 105M rows, 88.1% mismatch, 200–400GB
+> WAL) for a column nothing reads. Decision: the dump recomputes `GREATEST(...)` inline and **never
+> trusts `Image.sortAt`**, and the model-share `image_sort_at_before` BEFORE trigger authors the column
+> for future writes (converges lazily). An optional paced backfill still exists but is not required for
+> correctness, which removes step (2)'s "must complete before step 4" WAL-flood ordering constraint.
+> The redump (step 5) still carries historical values + `model3dId`. model-share migration PRs are in
+> review; prod hand-apply held for Justin's go.
+
 ## Decisions taken (defaults — flag now if wrong)
 
 - Re-emitter lives in Civitai job infra (not pg_cron) unless W1-3 sizing says otherwise.

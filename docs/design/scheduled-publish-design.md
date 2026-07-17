@@ -46,10 +46,26 @@ query, not a forensic investigation.
   recomputed per fan-out slot (`ops_processor.rs:2708-2716`).
 - Scheduled posts ride **deferred-alive** keyed on `publishedAt` (prod: `source_field: publishedAt`,
   sweep DISABLED, verifier `membership_field: postId`).
-- **`Image."sortAt"` in PG is written by NOTHING** (`prisma/schema.prisma:1670`, default `now()`,
-  indexed). Meili recomputes `GREATEST(p.publishedAt, i.scannedAt, i.createdAt)` at index time and
-  gates at query time with `publishedAtUnix <= now` — Meili never needed an activation event.
-  BitDex is the only consumer that turned publish into an event.
+- **`Image."sortAt"` in PG is effectively dead — no prod trigger writes its VALUE** (`prisma/schema.prisma:1670`,
+  default `now()`, indexed). Earlier drafts said "written by NOTHING"; the accurate history (W1
+  migration archaeology + zuri's verification against live prod PG 18.3, 2026-07-16) is that the
+  maintenance machinery WAS built and then neutered:
+  - A **2024 migration built sortAt-maintenance triggers.** The Post-side publish restamping died to a
+    **programmability name-collision** (the function name was reused for another purpose), so prod's
+    surviving `update_image_sort_at` trigger is **neutered to updatedAt-only** — it bumps `updatedAt`
+    (the signal Meili's incremental sync keys on) but no longer writes the `sortAt` value.
+  - The Image-side triggers the repo files imply — `new_image_sort_at` / `update_new_image_sort_at` —
+    **do NOT exist on prod** (verified absent from `pg_trigger` / `pg_proc`; they may be live only on
+    dev). Co-firing triggers on `Post.publishedAt` today (`outbox_post_publish_status`,
+    `bitdex_post_519ce657`, `publish_post_metrics`) none write `Image.sortAt`.
+  - Net: the column carries its `@default(now())` insert value and never moves in prod. This effort's
+    W1-2 migration (model-share) is what finally authors it — a `BEFORE INSERT OR UPDATE` recompute
+    plus a widened, **unconditional** Post→Image fan-out (`WHERE postId = NEW.id`, sortAt + updatedAt;
+    the fan-out must NOT use an `IS DISTINCT FROM` guard, or an unpublish that leaves `sortAt` unchanged
+    would drop the `updatedAt` bump and stale Meili's incremental sync — zuri, PR #3168 review).
+  Meili recomputes `GREATEST(p.publishedAt, i.scannedAt, i.createdAt)` at index time and gates at query
+  time with `publishedAtUnix <= now` — Meili never needed an activation event. BitDex is the only
+  consumer that turned publish into an event.
 
 ### The read path today (image.service.ts:3745)
 
@@ -364,6 +380,27 @@ Confirmation route remains arabella's live `BitdexOps` tail. Note both mechanism
 deletes the machinery C doesn't touch. A is retained above as the reviewed record.
 
 ### 2.D — DECIDED DIRECTION (Justin, 2026-07-15 late): upstream-maximal, BitDex frozen, retire Meili
+
+> **EXECUTED (2026-07-17).** This is the path that shipped. Tracked and built out in
+> `scheduled-publish-execution-plan.md` (waves W1–W4); the bitdex-v2 side merged as PRs #325
+> (per-image Post fan-out), #326 (ingested `sortAt` + `model3dId`), #328 (dump never trusts the
+> column), #329 (W3 full-scale proof, all gates PASS), #330 (test deflake). W4 = staged prod rollout,
+> gated on Justin at each step. Two refinements the items below predate:
+> - **W1-4's dominant-class finding** (`docs/_in/sortat-divergence-specimens-2026-07-16.md`): the
+>   real prod bug was NOT the invisible/dropped class (~0 in prod) but **visible-but-misordered** —
+>   `publishedAt` delivered correctly, yet the engine's `sortAt` recompute silently failed on **7–28%
+>   of recently-published images**, persisting ≥2 days, healed only by redump. Ingested `sortAt`
+>   deletes that mechanism at the root. (See that doc's PR-m5 for the further correction that prod
+>   scheduled slots are ALIVE-with-`isPublished=false`, NOT deferred-map-resident, so Tf activation is
+>   a sweep-driven shadow flip, not `activate_due`.)
+> - **No-backfill decision** (PR #328): a backfill of `Image.sortAt` is a disguised full-table rewrite
+>   (~92M of 105M rows, 88.1% mismatch, 200–400GB WAL) and — since nothing reads the column, every
+>   consumer computes `GREATEST(...)` inline — it is not needed for correctness. Instead: the **dump
+>   recomputes the formula and never trusts the column**, and the model-share `image_sort_at_before`
+>   BEFORE trigger (widened, **unconditional** Post→Image fan-out so Meili's `updatedAt`-keyed
+>   incremental sync never staleness-drops a row) authors the column for future writes so it converges
+>   lazily. The **redump** in W4 step 5 stays (needed for `model3dId` and to carry historical GREATEST
+>   values), superseding item 5's "no redump needed" below.
 
 Priority restated: get it working with **zero-to-minimal BitDex changes**, push moving parts
 upstream; engine simplification (B) parked as future work. The package:
