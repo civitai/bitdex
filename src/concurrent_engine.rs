@@ -13280,7 +13280,7 @@ mod tests {
         // sleeping a fixed interval — the checkpoint lands after a merge cycle,
         // which the scheduler can delay well past 300ms under contention.
         let ms = crate::shard_store_meta::MetaStore::new(bitmap_path.join("shardstore")).unwrap();
-        let persisted = wait_until(15000, || {
+        let persisted = wait_until(60000, || {
             ms.load_cursor("pg-sync-0").ok().flatten().as_deref() == Some("99999")
         });
         assert!(persisted, "merge thread should checkpoint cursor to disk");
@@ -15076,12 +15076,15 @@ mod tests {
         let alive_store = crate::shard_store_bitmap::AliveBitmapStore::new(
             ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
         ).unwrap();
-        let got_alive = wait_until(15000, || {
-            matches!(alive_store.ops_count(&AliveShardKey), Ok(Some(n)) if n > 0)
-        });
+        assert!(
+            wait_until(60000, || {
+                matches!(alive_store.ops_count(&AliveShardKey), Ok(Some(n)) if n > 0)
+            }),
+            "timed out waiting for the flush thread to append alive ops to disk",
+        );
         let alive_ops = alive_store.ops_count(&AliveShardKey).unwrap();
         assert!(
-            got_alive && alive_ops.is_some() && alive_ops.unwrap() > 0,
+            alive_ops.is_some() && alive_ops.unwrap() > 0,
             "alive shard should have ops after insert, got {:?}",
             alive_ops,
         );
@@ -15097,7 +15100,10 @@ mod tests {
             ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
         ).unwrap();
         let bucket_key = FilterBucketKey::from_value("nsfwLevel".to_string(), 1);
-        wait_until(15000, || matches!(filter_store.read(&bucket_key), Ok(Some(_))));
+        assert!(
+            wait_until(60000, || matches!(filter_store.read(&bucket_key), Ok(Some(_)))),
+            "timed out waiting for the flush thread to write the filter bucket to disk",
+        );
         let filter_snap = filter_store.read(&bucket_key).unwrap();
         assert!(filter_snap.is_some(), "filter bucket should exist after insert");
         let filter_snap = filter_snap.unwrap();
@@ -15113,9 +15119,12 @@ mod tests {
         // At least bit 8 should be set for slot 1. Flush appends sort ops to
         // the PACKED per-field shard — the file `load_sort_layers` reads at
         // boot (fix 2026-07-10: legacy per-layer appends were dead writes).
-        wait_until(15000, || {
-            matches!(sort_store.load_sort_layers("reactionCount", 32), Ok(Some(_)))
-        });
+        assert!(
+            wait_until(60000, || {
+                matches!(sort_store.load_sort_layers("reactionCount", 32), Ok(Some(_)))
+            }),
+            "timed out waiting for the flush thread to write the packed sort shard to disk",
+        );
         let layers = sort_store
             .load_sort_layers("reactionCount", 32)
             .unwrap()
@@ -15137,12 +15146,15 @@ mod tests {
                 .unwrap();
         }
         // Poll for the additional inserts' ops to accumulate on disk.
-        let got_more = wait_until(15000, || {
-            alive_store.ops_count(&AliveShardKey).ok().flatten().unwrap_or(0) > 1
-        });
+        assert!(
+            wait_until(60000, || {
+                alive_store.ops_count(&AliveShardKey).ok().flatten().unwrap_or(0) > 1
+            }),
+            "timed out waiting for additional insert ops to accumulate on disk",
+        );
         let alive_ops_after = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(0);
         assert!(
-            got_more && alive_ops_after > 1,
+            alive_ops_after > 1,
             "alive shard should have multiple ops, got {}",
             alive_ops_after,
         );
@@ -15426,7 +15438,7 @@ mod tests {
         wait_for_flush(&engine, test_slots.len() as u64, 5000);
         // Docstore write-through can lag the snapshot publish under load; wait
         // until every slot is actually readable before asserting order.
-        let ready = wait_until(15000, || {
+        let ready = wait_until(60000, || {
             engine
                 .get_documents(test_slots)
                 .map(|b| b.iter().all(|d| d.is_some()))
