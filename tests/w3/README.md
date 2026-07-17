@@ -82,12 +82,34 @@ node tests/w3/w3-lifecycle.mjs                                              # ga
 docker exec -i w3-pg psql -U bitdex -d civitai < tests/w3/w3-latency.sql    # gate 4 latency
 ```
 
+## Amendments (post-#328, 2026-07-16)
+- **#328 (63d9d16): dump `sortAt` is pure `GREATEST(post.publishedAt, scannedAt, createdAt)`, never
+  reads `Image.sortAt`** (no-backfill decision; prod column is 88.1% stale `now()`-at-migration
+  garbage). **Gate 1 remains valid without a re-dump:** `w3-prep2.mjs` computes exactly this pure
+  GREATEST from the staged images↔posts join and never reads a `sortAt` column (staged CSVs have
+  none), so the dumped values are byte-identical to #328's output.
+- **Model-share BEFORE trigger widened to ALL Image updates** (`w3-schema.sql` `ms_image_sortat_trg`
+  is already `BEFORE INSERT OR UPDATE`). The steady-state emission stays COALESCE-shaped
+  (`COALESCE(NEW."sortAt", GREATEST(...))`) — safe ONLY because this widened trigger refreshes
+  `NEW.sortAt` on every write. **Stale-column test (`w3-stale-column.sql`) PASSES:** injected a wrong
+  past `sortAt` (2020-01-01) with the BEFORE trigger disabled → BitDex showed the stale value; then an
+  **nsfwLevel-only** UPDATE through the widened trigger emitted `set sortAtUnix = 1784253406000` (the
+  CORRECT recomputed GREATEST, not the stale column) → BitDex healed to the correct value.
+- **[PR-M2] widened-trigger per-update overhead** (nsfwLevel-only UPDATE now runs the Post subselect):
+  P50 56µs / P99 486µs WITH triggers vs 9µs / 95µs without = **+47µs P50 / +390µs P99**. Sub-ms;
+  negligible at prod write rates.
+- Perf note: bitmap memory at 114.8M reports 0.57GB EAGER-resident (filter 0.12 / sort 0.43 / slot
+  0.02); NOT comparable to the 6.51GB full-RSS 104.6M baseline — `tagIds` is lazy/on-disk here and RSS
+  instrumentation isn't wired in the `fast` build. A true baseline needs a release build + warmed tagIds.
+
 ## Test-data notes (not BitDex defects)
 - Staged `images-small.csv` duplicates every id (50%); `images.csv` (full) has unique ids. Prod image
   ids are unique — dedup to match. Bulk-dump of conflicting duplicate slot ids yields per-field
   "frankenstein" docs (latent bulk-load characteristic; irrelevant to prod).
 - The `hash` blurhash column's base83 alphabet includes `,`, so PG quotes it — `w3-prep2.mjs` splices
   `sortAt` quote-aware to preserve bytes.
-- `bitdex-sync pg`'s boot-dump writes COPY output into `stage_dir`; keep `stage_dir` isolated from a
-  live dump's `load_stage` (the shared path emptied the superseded originals). The minimal
+- **`bitdex-sync pg`'s boot-dump writes COPY output into `stage_dir` — keep it ISOLATED from a live
+  dump's `data/load_stage`.** During W3 this emptied the ORIGINAL `data/load_stage/images.csv` and
+  `posts.csv` (both superseded by the derived `images.w3d.csv` / `posts.w3.csv` — no loss to this
+  work, but a fresh agent must re-pull them from prod or use the derived files). The minimal
   `w3-poller.mjs` avoids the boot-dump entirely.
