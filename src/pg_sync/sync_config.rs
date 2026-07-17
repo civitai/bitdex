@@ -196,9 +196,20 @@ impl FullSyncConfig {
         Self::from_yaml(&contents)
     }
 
-    /// Parse from a YAML string.
+    /// Parse from a YAML string. Validates each trigger source (see
+    /// `SyncSource::validate`) — this is the production entrypoint
+    /// (`from_file` -> here; `bin/pg_sync.rs` reads the deploy config through
+    /// it), so a structurally invalid trigger (e.g. `rows_from` combined with
+    /// `field`/`query`, which `generate_trigger_body`'s dispatch order would
+    /// otherwise resolve silently in the wrong direction) must fail loudly
+    /// here, not just in trigger_gen's own test-only `SyncConfig::from_yaml`.
     pub fn from_yaml(yaml: &str) -> Result<Self, String> {
-        serde_yaml::from_str(yaml).map_err(|e| format!("failed to parse sync config: {e}"))
+        let config: FullSyncConfig = serde_yaml::from_str(yaml)
+            .map_err(|e| format!("failed to parse sync config: {e}"))?;
+        for source in &config.triggers {
+            source.validate()?;
+        }
+        Ok(config)
     }
 
     /// Get the triggers as SyncSource refs (for trigger_gen).
@@ -352,6 +363,56 @@ triggers: []
         assert_eq!(config.index, "test");
         assert!(config.dump_phases.is_empty());
         assert!(config.triggers.is_empty());
+    }
+
+    /// Delta-review MAJOR: `SyncSource::validate()` was previously only wired
+    /// into `trigger_gen::SyncConfig::from_yaml` — a TEST-ONLY type nothing in
+    /// production calls. The real production entrypoint is
+    /// `FullSyncConfig::from_file` -> `from_yaml` (this file), which
+    /// `bin/pg_sync.rs` reads the deploy config through, and the trigger-SQL
+    /// review-file generator (`generate_trigger_sql_review_file`, this file)
+    /// also loads through it. This test pushes a structurally invalid trigger
+    /// (`rows_from` combined with `field` — which `generate_trigger_body`'s
+    /// dispatch order, `field > rows_from > query > direct`, would otherwise
+    /// resolve silently by ignoring `rows_from`) through the REAL production
+    /// type, not the test-only `trigger_gen::SyncConfig`.
+    #[test]
+    fn test_full_sync_config_rejects_invalid_trigger_source() {
+        let yaml = r#"
+index: test
+dump_phases: []
+triggers:
+  - table: Post
+    type: fan_out_per_row
+    field: tagIds
+    value_field: tagId
+    rows_from: { table: Image, fk: postId }
+"#;
+        let err = FullSyncConfig::from_yaml(yaml).expect_err(
+            "FullSyncConfig::from_yaml (the production entrypoint) must reject \
+             rows_from + field, not just trigger_gen's test-only SyncConfig",
+        );
+        assert!(err.contains("field"), "error should name the conflicting key: {err}");
+        assert!(err.contains("Post"), "error should name the offending table: {err}");
+    }
+
+    /// Sanity: a valid fan_out_per_row trigger still parses cleanly through
+    /// the production entrypoint (no false positive from the new validation).
+    #[test]
+    fn test_full_sync_config_accepts_valid_fan_out_per_row_trigger() {
+        let yaml = r#"
+index: test
+dump_phases: []
+triggers:
+  - table: Post
+    type: fan_out_per_row
+    rows_from: { table: Image, fk: postId }
+    track_fields: [publishedAt]
+"#;
+        let config = FullSyncConfig::from_yaml(yaml)
+            .expect("valid fan_out_per_row trigger must parse through FullSyncConfig");
+        assert_eq!(config.triggers.len(), 1);
+        assert_eq!(config.triggers[0].table_type.as_deref(), Some("fan_out_per_row"));
     }
 
     #[test]
