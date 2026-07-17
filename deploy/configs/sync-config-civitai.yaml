@@ -38,22 +38,41 @@ dump_phases:
     table: Image
     # [PR-B3] sortAt: emitted directly as epoch SECONDS (bigint) so it lands in
     # the sortAt sort layers with no ms conversion (data_schema fallback: sortAt,
-    # which does NOT apply ms_to_seconds). TYPE-CORRECT belt — every COALESCE/
-    # GREATEST operand is a TIMESTAMP, and extract(epoch ...)::bigint wraps the
-    # whole thing (never COALESCE(timestamp, bigint)). i."sortAt" is the value the
-    # model-share trigger maintains as GREATEST(post.publishedAt, scannedAt,
-    # createdAt); the GREATEST here is only the fallback for rows the backfill
-    # hasn't populated yet (COALESCE short-circuits, so the Post subselect runs
-    # only when i."sortAt" IS NULL). Matches the steady-state trigger's sortAtUnix
-    # value ÷ 1000 (W3 asserts dump == trigger on the same rows).
+    # which does NOT apply ms_to_seconds). TYPE-CORRECT: every GREATEST operand
+    # is a TIMESTAMP, and extract(epoch ...)::bigint wraps the whole expression.
+    #
+    # NO-BACKFILL DECISION (2026-07-16): the dump computes sortAt as a PURE
+    # GREATEST(post.publishedAt, scannedAt, createdAt) — it NEVER reads
+    # i."sortAt". A COALESCE(i."sortAt", GREATEST(...)) shape was tried first and
+    # is WRONG here: with no backfill, ~92M historical Image rows have a
+    # NOT-NULL i."sortAt" that is stale `now()`-at-migration garbage (measured on
+    # prod: 88.1% mismatch vs. the correct GREATEST value, clustering ≈
+    # createdAt). COALESCE prefers the column when non-null, so it would have
+    # ingested that garbage for ~92M rows. Only rows the model-share
+    # `image_sort_at_before` trigger has WRITTEN THROUGH (post-cutover
+    # inserts/updates) have a trustworthy column value — the dump has no way to
+    # distinguish "trigger-written" from "stale migration default" from SQL
+    # alone, so it must ignore the column entirely and always recompute.
+    #
+    # PINNED PAIRING (do not decouple without re-reading this comment): the
+    # STEADY-STATE ops emission expression below (shared_ops_fields:
+    # [sortAtUnix], `COALESCE(NEW."sortAt", GREATEST(...))`) is UNCHANGED and
+    # stays COALESCE-shaped — trusting the column there is safe ONLY because
+    # `image_sort_at_before` (model-share BEFORE INSERT OR UPDATE trigger)
+    # recomputes NEW."sortAt" on every write that reaches PG, so any row the ops
+    # trigger fires on has a correct-on-write column by construction. The dump
+    # has no such guarantee (it reads rows regardless of whether they were ever
+    # touched post-cutover) — ops emission may trust the column ONLY because
+    # image_sort_at_before recomputes it on every write; the dump must NEVER
+    # trust it (92M pre-trigger rows are stale).
     copy_query: >
       COPY (SELECT i.id, i.url, i."nsfwLevel", i.hash, i.flags, i.type::text,
                    i."userId", i."blockedFor",
                    extract(epoch from i."scannedAt")::bigint as "scannedAtSecs",
                    extract(epoch from i."createdAt")::bigint as "createdAtSecs",
-                   extract(epoch from COALESCE(i."sortAt",
+                   extract(epoch from
                      GREATEST((SELECT p."publishedAt" FROM "Post" p WHERE p.id = i."postId"),
-                              i."scannedAt", i."createdAt")))::bigint as "sortAt",
+                              i."scannedAt", i."createdAt"))::bigint as "sortAt",
                    i."postId", i.width, i.height
             FROM "Image" i)
       TO STDOUT WITH (FORMAT csv)
@@ -239,10 +258,21 @@ triggers:
     #
     # sortAtUnix is emitted via the SHARED bitdex_image_sortat_ops() function so
     # the W1-3 re-emitter re-asserts the identical value (shape parity). MS units
-    # (`* 1000`) with a COALESCE(GREATEST...) belt for rows the PG backfill hasn't
-    # populated Image.sortAt on yet. Expression is byte-identical to the W1-1
-    # codegen pin (trigger_gen.rs SORTATUNIX_EXPR); COALESCE short-circuits so the
-    # Post subselect only evaluates when Image.sortAt is still NULL.
+    # (`* 1000`) with a COALESCE(NEW."sortAt", GREATEST(...)) shape — trusting
+    # NEW."sortAt" here is UNCHANGED from before the no-backfill decision and
+    # stays COALESCE-shaped, because it is SAFE for a different reason than the
+    # dump: the model-share `image_sort_at_before` BEFORE INSERT OR UPDATE
+    # trigger recomputes Image.sortAt = GREATEST(post.publishedAt, scannedAt,
+    # createdAt) on EVERY write that reaches PG, so by the time this trigger
+    # fires, NEW."sortAt" is already correct-on-write (COALESCE's GREATEST
+    # fallback only exists for the pre-cutover window / defense-in-depth, not for
+    # 92M-stale-row coverage the way the old dump reasoning assumed).
+    #
+    # PINNED PAIRING — do not decouple without re-reading the dump's copy_query
+    # comment above: ops emission may trust the column ONLY because
+    # image_sort_at_before recomputes it on every write; the dump must NEVER
+    # trust it (92M pre-trigger rows are stale). Expression is byte-identical to
+    # the W1-1 codegen pin (trigger_gen.rs SORTATUNIX_EXPR).
     shared_ops_fields: [sortAtUnix]
     track_fields:
       - nsfwLevel

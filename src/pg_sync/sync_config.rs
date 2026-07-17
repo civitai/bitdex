@@ -966,4 +966,85 @@ triggers: []
         assert!(ds_fields.iter().any(|f| f["target"].as_str() == Some("model3dId")),
             "model3dId must be in data_schema");
     }
+
+    /// No-backfill decision (2026-07-16): with ~92M historical Image rows never
+    /// backfilled, i."sortAt" is NOT-NULL-but-stale (measured on prod: 88.1%
+    /// mismatch vs. the correct GREATEST value, clustering ≈ createdAt — a
+    /// `now()`-at-migration default, not a computed value). A
+    /// `COALESCE(i."sortAt", GREATEST(...))` dump copy_query would prefer that
+    /// stale column and ingest garbage for ~92M rows. The dump must compute
+    /// sortAt as a PURE GREATEST and never read i."sortAt" at all.
+    ///
+    /// This is the mirror image of `test_image_sortatunix_emitted_ms_on_deploy_config`:
+    /// that test pins the OPS trigger's `COALESCE(NEW."sortAt", GREATEST(...))`
+    /// as correct (trusting the column is safe there because model-share's
+    /// `image_sort_at_before` BEFORE trigger recomputes it on every write this
+    /// trigger fires for). This test pins the DUMP side of the same pairing:
+    /// the two code paths trust the column differently ON PURPOSE, and a change
+    /// to one without re-reading the other's rationale is the failure mode this
+    /// guards against.
+    #[test]
+    fn test_dump_sortat_never_trusts_the_column() {
+        let config = load_deploy_sync_config();
+        let images = config.dump_phases.iter().find(|p| p.name == "images")
+            .expect("images dump phase must exist");
+        let copy_query = images.copy_query.as_deref()
+            .expect("images phase must have a copy_query");
+
+        // The dump must NEVER read i."sortAt" — only ever WRITE the alias
+        // `as "sortAt"` for the computed expression's output column. A read
+        // reference (`i."sortAt"` used as an operand, e.g. inside a COALESCE)
+        // is exactly the pattern this test guards against.
+        assert!(
+            !copy_query.contains(r#"i."sortAt""#),
+            "dump copy_query must not READ the sortAt column (92M pre-trigger \
+             rows are stale) — found a read reference:\n{copy_query}"
+        );
+        // No COALESCE anywhere near the sortAt computation — a COALESCE shape
+        // is exactly the wrong-for-this-world pattern this test guards against.
+        assert!(
+            !copy_query.to_uppercase().contains("COALESCE"),
+            "dump copy_query must not COALESCE onto the stale sortAt column:\n{copy_query}"
+        );
+        // Must still compute sortAt via a pure GREATEST over publishedAt/
+        // scannedAt/createdAt, aliased "sortAt", with type-correct casts
+        // (extract(epoch from ...)::bigint wraps the whole GREATEST — never
+        // GREATEST applied to a mix of timestamp and bigint operands).
+        assert!(
+            copy_query.contains("GREATEST(") && copy_query.contains(r#"as "sortAt""#),
+            "dump copy_query must compute sortAt via GREATEST(...) as \"sortAt\":\n{copy_query}"
+        );
+        let normalized: String = copy_query.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("extract(epoch from GREATEST("),
+            "sortAt's extract(epoch from ...) must wrap the GREATEST(...) as a \
+             single timestamp expression, not mix bigint/timestamp operands \
+             [PR-B3]:\n{copy_query}"
+        );
+
+        // The `sortAt` CSV column is still declared and mapped to the sortAt
+        // sort field (unaffected by the no-backfill decision).
+        assert!(images.columns.iter().any(|c| c == "sortAt"),
+            "images phase columns must include sortAt");
+        assert!(images.fields.iter().any(|f| f.target() == "sortAt"),
+            "images phase fields must map sortAt");
+
+        // PINNED PAIRING: the ops trigger's sortAtUnix expression is UNCHANGED
+        // and stays COALESCE-shaped — trusting the column there is a *different*
+        // safety argument (image_sort_at_before recomputes on every write), not
+        // a relaxation of the dump's no-trust rule.
+        let image_trigger = config.triggers.iter().find(|t| t.table == "Image")
+            .expect("Image trigger must exist");
+        let sortatunix_track = image_trigger.track_fields.as_deref().unwrap_or(&[])
+            .iter()
+            .map(|tf| tf.to_track_string())
+            .find(|s| s.contains("sortAtUnix"))
+            .expect("Image trigger must have a sortAtUnix track field");
+        assert!(
+            sortatunix_track.to_uppercase().contains("COALESCE"),
+            "ops emission sortAtUnix expression must remain COALESCE-shaped \
+             (safe via image_sort_at_before recompute-on-write, unlike the \
+             dump):\n{sortatunix_track}"
+        );
+    }
 }
