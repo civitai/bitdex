@@ -622,6 +622,12 @@ where
                             }
                             promoted += 1;
                         }
+                        // The source `.new` vanished between our readdir and the
+                        // rename — a concurrent compaction (a live writer, or a
+                        // second store instance opened on the same tree) already
+                        // promoted or discarded it. The orphan is gone, which is
+                        // the outcome we wanted; skip, don't count as a failure.
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                         Err(e) => {
                             eprintln!(
                                 "shard_store: sweep: failed to promote {}: {e}",
@@ -634,6 +640,9 @@ where
                     // Truncated or corrupt — delete
                     match fs::remove_file(&path) {
                         Ok(()) => { deleted += 1; }
+                        // Already gone (concurrent sweep/rename won the race) —
+                        // idempotent delete: the desired end state holds.
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                         Err(e) => {
                             eprintln!(
                                 "shard_store: sweep: failed to delete orphan {}: {e}",

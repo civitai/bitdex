@@ -11875,6 +11875,29 @@ mod tests {
             expected_alive
         );
     }
+    /// Poll `cond` until it returns true or `max_ms` (floored at 5 s) elapses.
+    /// Returns whether the condition was observed true.
+    ///
+    /// Use this to observe state that only becomes true AFTER the flush thread
+    /// publishes its snapshot — chiefly ON-DISK ops-log appends and merge-thread
+    /// checkpoints. Those writes happen after `inner.store()` + a deliberate
+    /// `std::thread::yield_now()` (see the flush loop), so `alive_count` and the
+    /// publish counter both advance BEFORE the disk write lands. A fixed
+    /// `thread::sleep` therefore races the append under scheduler contention;
+    /// polling the actual condition does not.
+    fn wait_until(max_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(max_ms.max(5000));
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     // ---- Basic correctness tests ----
     #[test]
     fn test_put_and_query() {
@@ -12761,7 +12784,9 @@ mod tests {
             ("reactionCount", FieldValue::Single(Value::Integer(100))),
         ]);
         engine.put(1, &updated).unwrap();
-        wait_for_flush(&engine, 2, 5_000);
+        // Upsert leaves alive_count at 2, so wait_for_flush(2) would return
+        // before the diff is applied; wait for the publish to settle instead.
+        wait_for_flush_quiet(&engine, 5000);
         // nsfwLevel=1 should now be EMPTY (slot 1 moved to nsfwLevel=3)
         let result = engine.query(
             &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
@@ -12814,7 +12839,9 @@ mod tests {
             ("reactionCount", FieldValue::Single(Value::Integer(100))),
         ]);
         engine.put(1, &updated).unwrap();
-        wait_for_flush(&engine, 2, 5_000);
+        // Upsert leaves alive_count at 2, so wait_for_flush(2) would return
+        // before the diff is applied; wait for the publish to settle instead.
+        wait_for_flush_quiet(&engine, 5000);
         // Verify diff worked correctly
         let result = engine.query(
             &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
@@ -13249,10 +13276,14 @@ mod tests {
         let engine = ConcurrentEngine::new_with_path(config.clone(), &doc_path).unwrap();
         // Set a cursor
         engine.set_cursor("pg-sync-0".to_string(), "99999".to_string());
-        // Wait for merge thread to checkpoint (merge interval + margin)
-        thread::sleep(Duration::from_millis(300));
-        // Verify cursor was written to disk (via MetaStore)
+        // Poll for the merge thread to checkpoint the cursor to disk rather than
+        // sleeping a fixed interval — the checkpoint lands after a merge cycle,
+        // which the scheduler can delay well past 300ms under contention.
         let ms = crate::shard_store_meta::MetaStore::new(bitmap_path.join("shardstore")).unwrap();
+        let persisted = wait_until(15000, || {
+            ms.load_cursor("pg-sync-0").ok().flatten().as_deref() == Some("99999")
+        });
+        assert!(persisted, "merge thread should checkpoint cursor to disk");
         let on_disk = ms.load_cursor("pg-sync-0").unwrap();
         assert_eq!(on_disk.unwrap(), "99999");
         drop(engine);
@@ -14309,7 +14340,8 @@ mod tests {
         wait_for_flush(&engine, 1, 500);
         // Sync to empty — removes all values
         engine.sync_filter_values(1, "tagIds", &[]).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Wait for the sync mutation's publish to settle (in-memory snapshot).
+        wait_for_flush_quiet(&engine, 5000);
         let result = engine
             .query(
                 &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
@@ -14723,7 +14755,9 @@ mod tests {
         assert_eq!(result.total_matched, 1);
         // Delete
         engine.delete(1).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        // Clean delete clears filter/sort bits and the alive bit in the same
+        // published cycle; wait for alive to reach 0 rather than a fixed sleep.
+        wait_for_flush(&engine, 0, 5000);
         // Verify alive is cleared
         assert_eq!(engine.alive_count(), 0);
         // Verify filter bitmaps are clean (no stale bits)
@@ -15036,15 +15070,18 @@ mod tests {
                 ]),
             )
             .unwrap();
-        // Wait for flush thread to process the mutation and append ops.
-        std::thread::sleep(Duration::from_millis(200));
-        // Verify ops landed on disk — alive shard should have ops
+        // Verify ops landed on disk — alive shard should have ops.
+        // Ops-log appends happen AFTER the snapshot publish + a yield_now, so a
+        // fixed sleep races the append under load; poll the disk state instead.
         let alive_store = crate::shard_store_bitmap::AliveBitmapStore::new(
             ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
         ).unwrap();
+        let got_alive = wait_until(15000, || {
+            matches!(alive_store.ops_count(&AliveShardKey), Ok(Some(n)) if n > 0)
+        });
         let alive_ops = alive_store.ops_count(&AliveShardKey).unwrap();
         assert!(
-            alive_ops.is_some() && alive_ops.unwrap() > 0,
+            got_alive && alive_ops.is_some() && alive_ops.unwrap() > 0,
             "alive shard should have ops after insert, got {:?}",
             alive_ops,
         );
@@ -15060,6 +15097,7 @@ mod tests {
             ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
         ).unwrap();
         let bucket_key = FilterBucketKey::from_value("nsfwLevel".to_string(), 1);
+        wait_until(15000, || matches!(filter_store.read(&bucket_key), Ok(Some(_))));
         let filter_snap = filter_store.read(&bucket_key).unwrap();
         assert!(filter_snap.is_some(), "filter bucket should exist after insert");
         let filter_snap = filter_snap.unwrap();
@@ -15075,6 +15113,9 @@ mod tests {
         // At least bit 8 should be set for slot 1. Flush appends sort ops to
         // the PACKED per-field shard — the file `load_sort_layers` reads at
         // boot (fix 2026-07-10: legacy per-layer appends were dead writes).
+        wait_until(15000, || {
+            matches!(sort_store.load_sort_layers("reactionCount", 32), Ok(Some(_)))
+        });
         let layers = sort_store
             .load_sort_layers("reactionCount", 32)
             .unwrap()
@@ -15095,11 +15136,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        std::thread::sleep(Duration::from_millis(200));
-        // Verify alive ops accumulated
+        // Poll for the additional inserts' ops to accumulate on disk.
+        let got_more = wait_until(15000, || {
+            alive_store.ops_count(&AliveShardKey).ok().flatten().unwrap_or(0) > 1
+        });
         let alive_ops_after = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(0);
         assert!(
-            alive_ops_after > 1,
+            got_more && alive_ops_after > 1,
             "alive shard should have multiple ops, got {}",
             alive_ops_after,
         );
@@ -15380,7 +15423,16 @@ mod tests {
                 ("reactionCount", FieldValue::Single(Value::Integer(slot as i64))),
             ])).unwrap();
         }
-        wait_for_flush(&engine, test_slots.len() as u64, 1000);
+        wait_for_flush(&engine, test_slots.len() as u64, 5000);
+        // Docstore write-through can lag the snapshot publish under load; wait
+        // until every slot is actually readable before asserting order.
+        let ready = wait_until(15000, || {
+            engine
+                .get_documents(test_slots)
+                .map(|b| b.iter().all(|d| d.is_some()))
+                .unwrap_or(false)
+        });
+        assert!(ready, "all docs should be persisted before the order check");
 
         // Request in reverse order — spans shards 0 and 1
         let slots: Vec<u32> = vec![600, 0, 513, 200, 511, 400, 512];
