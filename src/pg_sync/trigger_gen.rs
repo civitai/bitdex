@@ -702,6 +702,51 @@ pub fn fan_out_ops_function_name(source: &SyncSource) -> String {
     format!("bitdex_{}_fanout_ops", source.table.to_lowercase())
 }
 
+/// Field whose fan-out `set` must be guarded against NULL / FUTURE values.
+///
+/// A future `publishedAt` on a Post is a *scheduling* event, not a publish. The
+/// per-image fan-out applies ops directly to already-ALIVE images (the engine's
+/// deferred branch only quarantines future values on FRESH inserts). Because the
+/// `isPublished` filter target is an `exists_boolean` shadow — a plain null-check
+/// on `publishedAt` — a bare `set` with a future value flips the shadow TRUE and
+/// lands the image at the top of the feed with a future `sortAt` (this leaked
+/// ~26.5k slots in prod 2026-07-18). Emitting a `remove` instead flips the shadow
+/// FALSE (image hidden) and is correct for BOTH unpublish (NULL) and scheduling
+/// (FUTURE). The image is later activated by the overdue sweep (only where the
+/// doc retained publishedAt) and PRIMARILY by the W1-3 re-emitter (civitai PR
+/// #3231): once `publishedAt` enters `[now-15m, now]` the re-emitter re-emits a
+/// past-value `set` that flips the shadow back TRUE. **The re-emitter flag being
+/// ON is LOAD-BEARING for this population** — without it, alive-then-scheduled
+/// images never activate.
+const FUTURE_GUARDED_FIELD: &str = "publishedAt";
+
+/// Build a single jsonb op element for a fan-out `set` payload.
+///
+/// For most fields this is an unconditional `set`. For [`FUTURE_GUARDED_FIELD`]
+/// it is a `CASE` that emits a `remove` when the parent's value is NULL or FUTURE
+/// (`> now()`) and a `set` only when the value is already past — keeping
+/// scheduled/unpublished images hidden until the value actually becomes past.
+/// `parent_row` is the SQL row alias the guard reads the raw column from (`_p`
+/// for the shared INSERT function, `NEW` for the UPDATE-branch new-side).
+fn fan_out_set_op_element(field_name: &str, parent_row: &str, value_expr: &str) -> String {
+    if field_name == FUTURE_GUARDED_FIELD {
+        format!(
+            "    CASE WHEN {parent}.\"{field}\" IS NULL OR {parent}.\"{field}\" > now()\n\
+             \x20     THEN jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({expr}))\n\
+             \x20     ELSE jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({expr}))\n\
+             \x20   END",
+            parent = parent_row,
+            field = field_name,
+            expr = value_expr,
+        )
+    } else {
+        format!(
+            "    jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
+            field_name, value_expr
+        )
+    }
+}
+
 /// Generate the shared op-payload function for a `fan_out_per_row` source:
 ///
 /// ```sql
@@ -729,10 +774,10 @@ pub fn generate_fan_out_ops_function_sql(source: &SyncSource, rows: &RowsFrom) -
     let ops: Vec<String> = track_strings.iter().map(|f| {
         let (field_name, _insert_expr, template_expr) = parse_track_field(f);
         let expr = substitute_columns(&template_expr, parent_row);
-        format!(
-            "    jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
-            field_name, expr
-        )
+        // publishedAt is guarded (future/null → remove) so a scheduled Post's
+        // fan-out does not flip already-alive images visible; see
+        // FUTURE_GUARDED_FIELD. All other fields emit a plain `set`.
+        fan_out_set_op_element(&field_name, parent_row, &expr)
     }).collect();
 
     format!(
@@ -887,16 +932,39 @@ fn generate_fan_out_per_row_body(source: &SyncSource, rows: &RowsFrom) -> String
         let (field_name, _insert_expr, template_expr) = parse_track_field(f);
         let old_expr = substitute_columns(&template_expr, "OLD");
         let new_expr = substitute_columns(&template_expr, "NEW");
+        // The OLD-side is always a `remove` (clears the prior value). The
+        // NEW-side is guarded ONLY for publishedAt: a future/null NEW value
+        // produces a `remove`, not a `set`, so an alive image being SCHEDULED
+        // (or unpublished) stays hidden rather than jumping to feed top with a
+        // future sortAt. See FUTURE_GUARDED_FIELD. Non-guarded fields keep the
+        // plain `set` new-side, byte-for-byte as before.
+        let new_side = if field_name == FUTURE_GUARDED_FIELD {
+            format!(
+                "        CASE WHEN NEW.\"{field}\" IS NULL OR NEW.\"{field}\" > now()\n\
+                 \x20         THEN jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20         ELSE jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20       END",
+                field = field_name,
+                new = new_expr,
+            )
+        } else {
+            format!(
+                "        jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))",
+                field = field_name,
+                new = new_expr,
+            )
+        };
         body.push_str(&format!(
             "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
              \x20     _ops := _ops || jsonb_build_array(\n\
              \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
-             \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+             {new_side}\n\
              \x20     );\n\
              \x20   END IF;\n",
             old = old_expr,
             new = new_expr,
             field = field_name,
+            new_side = new_side,
         ));
     }
     body.push_str("    IF jsonb_array_length(_ops) > 0 THEN\n");
@@ -1482,6 +1550,65 @@ extract(epoch from {createdAt})::bigint)) * 1000 as sortAtUnix";
         assert!(
             sql.contains(r#"extract(epoch from NEW."publishedAt")::bigint"#),
             "publishedAt must be emitted as an epoch bigint:\n{sql}"
+        );
+    }
+
+    /// PROD-BUG GUARD (2026-07-18 ~26.5k leaked slots): the fan-out `publishedAt`
+    /// emission must be CONDITIONAL. A future/null value is a scheduling/unpublish
+    /// event and MUST become a `remove` (flips the isPublished exists_boolean
+    /// shadow false → image hidden); only an already-past value may `set` (flips
+    /// it true → visible). Pinned in the shared INSERT function AND the UPDATE
+    /// new-side. availability/postedToId stay UNCONDITIONAL — only publishedAt is
+    /// guarded.
+    #[test]
+    fn test_fan_out_publishedat_future_guard() {
+        let source = post_fan_out_per_row_source();
+        let rows = source.rows_from.as_ref().unwrap();
+
+        // --- Shared INSERT function (_p parent row) ---
+        let fn_sql = generate_fan_out_ops_function_sql(&source, rows);
+
+        // Guard predicate covers BOTH future (> now()) AND null (IS NULL).
+        assert!(
+            fn_sql.contains(r#"CASE WHEN _p."publishedAt" IS NULL OR _p."publishedAt" > now()"#),
+            "INSERT publishedAt must be guarded on NULL/future:\n{fn_sql}"
+        );
+        // future/null → remove (THEN branch); past → set (ELSE branch).
+        assert!(
+            fn_sql.contains(r#"THEN jsonb_build_object('op', 'remove', 'field', 'publishedAt'"#),
+            "future/null publishedAt must emit a remove:\n{fn_sql}"
+        );
+        assert!(
+            fn_sql.contains(r#"ELSE jsonb_build_object('op', 'set', 'field', 'publishedAt'"#),
+            "past publishedAt must emit a set:\n{fn_sql}"
+        );
+        // Only publishedAt is guarded — availability/postedToId stay plain `set`.
+        assert!(
+            !fn_sql.contains(r#"CASE WHEN _p."availability""#)
+                && !fn_sql.contains(r#"CASE WHEN _p."modelVersionId""#),
+            "only publishedAt may be guarded; other fields must be unconditional:\n{fn_sql}"
+        );
+        assert!(
+            fn_sql.contains(r#"jsonb_build_object('op', 'set', 'field', 'availability'"#),
+            "availability must remain an unconditional set:\n{fn_sql}"
+        );
+
+        // --- UPDATE new-side (NEW row) ---
+        let trigger_sql = generate_trigger_sql(&source);
+        assert!(
+            trigger_sql.contains(r#"CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()"#),
+            "UPDATE new-side publishedAt must be guarded on NULL/future:\n{trigger_sql}"
+        );
+        // The OLD-side remove is always emitted; the guarded NEW-side supplies
+        // the remove/set. A future NEW value therefore yields remove(old)+remove(new).
+        assert!(
+            trigger_sql.contains(r#"'op', 'remove', 'field', 'publishedAt'"#),
+            "UPDATE must still remove the OLD publishedAt value:\n{trigger_sql}"
+        );
+        // availability's UPDATE new-side is NOT guarded.
+        assert!(
+            !trigger_sql.contains(r#"CASE WHEN NEW."availability""#),
+            "only publishedAt may be guarded on the UPDATE new-side:\n{trigger_sql}"
         );
     }
 
