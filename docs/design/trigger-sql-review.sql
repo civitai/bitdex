@@ -48,17 +48,17 @@ CREATE TRIGGER trg_cleanup_bitdex_ops
 -- Part 2: Per-table triggers (generated from sync config YAML)
 -- -----------------------------------------------------------------------
 
--- [1/8] Table: Image → Trigger: bitdex_image_ee936694
+-- [1/8] Table: Image → Trigger: bitdex_image_dda29cf8
 -- Sets alive: yes
 -- On delete: emit delete op
 
 CREATE OR REPLACE FUNCTION bitdex_image_sortat_ops(_i "Image") RETURNS jsonb AS $$
   SELECT jsonb_build_array(
-    jsonb_build_object('op', 'set', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from _i."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = _i."postId"))::bigint, extract(epoch from _i."scannedAt")::bigint, extract(epoch from _i."createdAt")::bigint)) * 1000))
+    jsonb_build_object('op', 'set', 'field', 'sortAt', 'value', to_jsonb(COALESCE(extract(epoch from _i."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = _i."postId"))::bigint, extract(epoch from _i."scannedAt")::bigint, extract(epoch from _i."createdAt")::bigint))))
   );
 $$ LANGUAGE sql STABLE;
 
-CREATE OR REPLACE FUNCTION bitdex_image_ops_ee936694() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_image_ops_dda29cf8() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -146,10 +146,10 @@ BEGIN
         jsonb_build_object('op', 'set', 'field', 'height', 'value', to_jsonb(NEW."height"))
       );
     END IF;
-    IF (COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint)) * 1000) IS DISTINCT FROM (COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint)) * 1000) THEN
+    IF (COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint))) IS DISTINCT FROM (COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint))) THEN
       _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint)) * 1000)),
-        jsonb_build_object('op', 'set', 'field', 'sortAtUnix', 'value', to_jsonb(COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint)) * 1000))
+        jsonb_build_object('op', 'remove', 'field', 'sortAt', 'value', to_jsonb(COALESCE(extract(epoch from OLD."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = OLD."postId"))::bigint, extract(epoch from OLD."scannedAt")::bigint, extract(epoch from OLD."createdAt")::bigint)))),
+        jsonb_build_object('op', 'set', 'field', 'sortAt', 'value', to_jsonb(COALESCE(extract(epoch from NEW."sortAt")::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = NEW."postId"))::bigint, extract(epoch from NEW."scannedAt")::bigint, extract(epoch from NEW."createdAt")::bigint))))
       );
     END IF;
     IF ((OLD."flags" >> 13) & 1 = 1 AND (OLD."flags" >> 2) & 1 = 0) IS DISTINCT FROM ((NEW."flags" >> 13) & 1 = 1 AND (NEW."flags" >> 2) & 1 = 0) THEN
@@ -214,10 +214,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_image_ee936694 ON "Image";
-CREATE TRIGGER bitdex_image_ee936694 AFTER INSERT OR UPDATE OR DELETE ON "Image"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_ee936694();
-ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_ee936694;
+DROP TRIGGER IF EXISTS bitdex_image_dda29cf8 ON "Image";
+CREATE TRIGGER bitdex_image_dda29cf8 AFTER INSERT OR UPDATE OR DELETE ON "Image"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_dda29cf8();
+ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_dda29cf8;
 
 
 -- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_bcbef3c3
@@ -494,7 +494,7 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_a13d0fe3;
 -- -----------------------------------------------------------------------
 -- Tables created: BitdexOps, bitdex_cursors
 -- Triggers: 8
---   bitdex_image_ee936694 on "Image"
+--   bitdex_image_dda29cf8 on "Image"
 --   bitdex_tagsonimagenew_bcbef3c3 on "TagsOnImageNew"
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"

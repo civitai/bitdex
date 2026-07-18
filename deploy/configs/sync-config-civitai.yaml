@@ -237,13 +237,19 @@ triggers:
     slot_field: id
     sets_alive: true
     on_delete: true
-    # [PR-B4] PINNED UNIT STATEMENT (emission + query chains — see also civitai-index.yaml):
-    #   EMISSION: sortAtUnix is emitted in MILLISECONDS (`* 1000`). The engine
-    #   data_schema mapping `sortAtUnix -> sortAt` (civitai-index.yaml,
-    #   ms_to_seconds:true) divides by 1000, so the sortAt SORT LAYERS store
-    #   SECONDS. The dump path instead emits a `sortAt` column already in SECONDS
-    #   (data_schema fallback: sortAt — ms_to_seconds is NOT applied to a
-    #   fallback source). Both wire encodings converge on SECONDS in the layers.
+    # [PR-B4-v2] PINNED UNIT STATEMENT (emission + query chains — see also civitai-index.yaml):
+    #   EMISSION: ops emit field `sortAt` (the TARGET name) in SECONDS. This was
+    #   CORRECTED 2026-07-18: the original design emitted `sortAtUnix` in ms,
+    #   assuming the data_schema `sortAtUnix -> sortAt` mapping applied to op
+    #   field names — IT DOES NOT. data_schema renames apply to DOCUMENT keys
+    #   (dump/insert path) only; op Set/Remove fields are resolved raw against
+    #   filter/sort TARGET names (ops_processor.rs process_set_op), and unknown
+    #   fields are SILENTLY IGNORED. Every other field always emitted target
+    #   names — sortAtUnix was the one deviation, and its ops were dropped in
+    #   prod for ~5h until caught by a single-op experiment. Target-name seconds
+    #   is now the rule. The dormant sortAtUnix->sortAt doc mapping remains for
+    #   the dump path only. The dump path emits a `sortAt` CSV column in SECONDS
+    #   (doc path — mapping applies). Both paths converge on SECONDS everywhere.
     #   QUERY: the Civitai builder sends `sortAtUnix Gte <seconds>`
     #   (image.service.ts:3940). That clause is resolved by the time-bucket
     #   manager (civitai-index.yaml time_buckets.filter_field: sortAtUnix,
@@ -256,9 +262,9 @@ triggers:
     #   divided back on ingest. The builder's seconds-Gte is CORRECT both before
     #   this change (sortAt computed) and after (sortAt ingested).
     #
-    # sortAtUnix is emitted via the SHARED bitdex_image_sortat_ops() function so
-    # the W1-3 re-emitter re-asserts the identical value (shape parity). MS units
-    # (`* 1000`) with a COALESCE(NEW."sortAt", GREATEST(...)) shape — trusting
+    # sortAt is emitted via the SHARED bitdex_image_sortat_ops() function so
+    # the W1-3 re-emitter re-asserts the identical value (shape parity). SECONDS
+    # with a COALESCE(NEW."sortAt", GREATEST(...)) shape — trusting
     # NEW."sortAt" here is UNCHANGED from before the no-backfill decision and
     # stays COALESCE-shaped, because it is SAFE for a different reason than the
     # dump: the model-share `image_sort_at_before` BEFORE INSERT OR UPDATE
@@ -272,8 +278,8 @@ triggers:
     # comment above: ops emission may trust the column ONLY because
     # image_sort_at_before recomputes it on every write; the dump must NEVER
     # trust it (92M pre-trigger rows are stale). Expression is byte-identical to
-    # the W1-1 codegen pin (trigger_gen.rs SORTATUNIX_EXPR).
-    shared_ops_fields: [sortAtUnix]
+    # the W1-1 codegen pin (trigger_gen.rs SORTAT_EXPR).
+    shared_ops_fields: [sortAt]
     track_fields:
       - nsfwLevel
       - { column: type, expression: "{type}::text" }
@@ -284,7 +290,7 @@ triggers:
       - hash
       - width
       - height
-      - 'COALESCE(extract(epoch from {sortAt})::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = {postId}))::bigint, extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)) * 1000 as sortAtUnix'
+      - 'COALESCE(extract(epoch from {sortAt})::bigint, GREATEST(extract(epoch from (SELECT p."publishedAt" FROM "Post" p WHERE p.id = {postId}))::bigint, extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)) as sortAt'
     computed_fields:
       - target: hasMeta
         expression: "({flags} >> 13) & 1 = 1 AND ({flags} >> 2) & 1 = 0"
