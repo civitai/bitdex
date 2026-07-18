@@ -344,18 +344,21 @@ CREATE TRIGGER bitdex_imageresourcenew_d84d15a8 AFTER INSERT OR DELETE ON "Image
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_d84d15a8;
 
 
--- [6/8] Table: Post → Trigger: bitdex_post_8511462a
+-- [6/8] Table: Post → Trigger: bitdex_post_54f0a619
 -- Type: fan_out_per_row
 
 CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb AS $$
   SELECT jsonb_build_array(
-    jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from _p."publishedAt")::bigint)),
+    CASE WHEN _p."publishedAt" IS NULL OR _p."publishedAt" > now()
+      THEN jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from _p."publishedAt")::bigint))
+      ELSE jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from _p."publishedAt")::bigint))
+    END,
     jsonb_build_object('op', 'set', 'field', 'availability', 'value', to_jsonb(_p."availability"::text)),
     jsonb_build_object('op', 'set', 'field', 'postedToId', 'value', to_jsonb(_p."modelVersionId"))
   );
 $$ LANGUAGE sql STABLE;
 
-CREATE OR REPLACE FUNCTION bitdex_post_ops_8511462a() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_post_ops_54f0a619() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -369,7 +372,10 @@ BEGIN
     IF (extract(epoch from OLD."publishedAt")::bigint) IS DISTINCT FROM (extract(epoch from NEW."publishedAt")::bigint) THEN
       _ops := _ops || jsonb_build_array(
         jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from OLD."publishedAt")::bigint)),
-        jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
+        CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()
+          THEN jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
+          ELSE jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
+        END
       );
     END IF;
     IF (OLD."availability"::text) IS DISTINCT FROM (NEW."availability"::text) THEN
@@ -394,10 +400,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_post_8511462a ON "Post";
-CREATE TRIGGER bitdex_post_8511462a AFTER INSERT OR UPDATE ON "Post"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_8511462a();
-ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_8511462a;
+DROP TRIGGER IF EXISTS bitdex_post_54f0a619 ON "Post";
+CREATE TRIGGER bitdex_post_54f0a619 AFTER INSERT OR UPDATE ON "Post"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_54f0a619();
+ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_54f0a619;
 
 
 -- [7/8] Table: ModelVersion → Trigger: bitdex_modelversion_22dd59b3
@@ -499,7 +505,7 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_a13d0fe3;
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
 --   bitdex_imageresourcenew_d84d15a8 on "ImageResourceNew"
---   bitdex_post_8511462a on "Post"
+--   bitdex_post_54f0a619 on "Post"
 --   bitdex_modelversion_22dd59b3 on "ModelVersion"
 --   bitdex_model_a13d0fe3 on "Model"
 --
