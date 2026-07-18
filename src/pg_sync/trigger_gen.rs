@@ -1318,14 +1318,20 @@ sync_sources:
     // W1-1: fan_out_per_row (per-image materialized Post fan-out) + sortAtUnix
     // ----------------------------------------------------------------------
 
-    /// The exact sortAtUnix track-field expression W2-1 wires onto the Image
-    /// trigger. Emits **milliseconds** (`* 1000`) with a COALESCE(GREATEST...)
-    /// belt so rows the PG backfill hasn't reached still emit a correct value.
-    /// The engine's `sortAtUnix → sortAt` mapping (ms_to_seconds) divides by 1000.
-    const SORTATUNIX_EXPR: &str = "COALESCE(extract(epoch from {sortAt})::bigint, \
+    /// The exact sortAt track-field expression W2-1 wires onto the Image
+    /// trigger. Emits the TARGET field name `sortAt` in **seconds**, with a
+    /// COALESCE(GREATEST...) belt so rows the PG backfill hasn't reached still
+    /// emit a correct value.
+    ///
+    /// CORRECTED 2026-07-18 (was `sortAtUnix` in milliseconds): data_schema
+    /// source→target renames apply to DOCUMENT keys only, never to op field
+    /// names — ops resolve raw against filter/sort TARGET names and unknown
+    /// fields are silently ignored (ops_processor.rs process_set_op). Emitting
+    /// the source name meant every steady-state sortAt op was dropped in prod.
+    const SORTAT_EXPR: &str = "COALESCE(extract(epoch from {sortAt})::bigint, \
 GREATEST(extract(epoch from (SELECT p.\"publishedAt\" FROM \"Post\" p WHERE p.id = {postId}))::bigint, \
 extract(epoch from {scannedAt})::bigint, \
-extract(epoch from {createdAt})::bigint)) * 1000 as sortAtUnix";
+extract(epoch from {createdAt})::bigint)) as sortAt";
 
     /// Build the Post per-image fan-out source, retaining the FULL payload
     /// {publishedAt, availability, postedToId} exactly as the current queryOpSet
@@ -1598,21 +1604,22 @@ sync_sources:
         assert!(!sql.contains("queryOpSet"), "{sql}");
     }
 
-    /// #3 + [AR-4] units: the Image sortAtUnix track field emits MILLISECONDS
-    /// (`* 1000`) with a COALESCE(GREATEST...) fallback, and diffs on UPDATE.
-    /// The engine mapping divides by 1000 — seconds here would shrink every
-    /// value 1000×. Pins the whole chain at codegen.
-    /// Build the Image source with the sortAtUnix track field factored into
+    /// [AR-4-v2] units: the Image sortAt track field emits the TARGET name
+    /// `sortAt` in SECONDS with a COALESCE(GREATEST...) fallback, and diffs on
+    /// UPDATE. CORRECTED 2026-07-18: source-name (`sortAtUnix`, ms) emission was
+    /// silently dropped by the engine — op fields resolve against TARGET names
+    /// only; data_schema renames are doc-path only. Pins the chain at codegen.
+    /// Build the Image source with the sortAt track field factored into
     /// the shared `bitdex_image_sortat_ops` function (production shape: the
-    /// re-emitter calls this exact function to re-assert sortAtUnix).
+    /// re-emitter calls this exact function to re-assert sortAt).
     fn image_source_with_sortat() -> SyncSource {
         SyncSource {
             slot_field: Some("id".into()),
             track_fields: Some(vec![
                 TrackField::Simple("nsfwLevel".into()),
-                TrackField::Simple(SORTATUNIX_EXPR.into()),
+                TrackField::Simple(SORTAT_EXPR.into()),
             ]),
-            shared_ops_fields: Some(vec!["sortAtUnix".into()]),
+            shared_ops_fields: Some(vec!["sortAt".into()]),
             sets_alive: true,
             on_delete: Some(OnDeleteValue::String("delete_slot".into())),
             ..test_source("Image")
@@ -1620,14 +1627,16 @@ sync_sources:
     }
 
     #[test]
-    fn test_image_sortatunix_ms_and_coalesce() {
+    fn test_image_sortat_target_name_seconds_and_coalesce() {
         let source = image_source_with_sortat();
         let sql = generate_trigger_sql(&source);
 
-        // Emitted under the sortAtUnix target (the dormant sortAtUnix → sortAt mapping).
-        assert!(emitted_fields(&sql).contains("sortAtUnix"), "{sql}");
-        // Milliseconds — not seconds.
-        assert!(sql.contains("* 1000"), "sortAtUnix must be milliseconds:\n{sql}");
+        // Emitted under the TARGET field name `sortAt` — op fields resolve
+        // against target names; data_schema renames are doc-path only.
+        assert!(emitted_fields(&sql).contains("sortAt"), "{sql}");
+        assert!(!emitted_fields(&sql).contains("sortAtUnix"), "must NOT emit the source name:\n{sql}");
+        // Seconds — the engine stores sort layers in seconds; no ms conversion.
+        assert!(!sql.contains("* 1000"), "sortAt must be seconds, not ms:\n{sql}");
         // INSERT branch: the shared function is called with NEW rather than the
         // expression being inlined a second time.
         assert!(
@@ -1660,7 +1669,7 @@ sync_sources:
         );
     }
 
-    /// W1-3 parity for sortAtUnix, same pattern as the Post fan-out's parity
+    /// W1-3 parity for sortAt, same pattern as the Post fan-out's parity
     /// test: prove the re-emitter's call target is the SAME function the
     /// trigger installs, not a name/expression it reimplements and could drift
     /// from.
@@ -1671,16 +1680,16 @@ sync_sources:
         // Stable, unhashed name — same convention as bitdex_post_fanout_ops,
         // derived from the wire field name with the Unix suffix stripped.
         assert_eq!(
-            shared_field_ops_function_name("Image", "sortAtUnix"),
+            shared_field_ops_function_name("Image", "sortAt"),
             "bitdex_image_sortat_ops"
         );
 
-        let fn_sql = generate_shared_field_ops_function_sql(&source, "sortAtUnix")
-            .expect("sortAtUnix is tracked, must resolve");
+        let fn_sql = generate_shared_field_ops_function_sql(&source, "sortAt")
+            .expect("sortAt is tracked, must resolve");
         assert!(fn_sql.contains(r#"CREATE OR REPLACE FUNCTION bitdex_image_sortat_ops(_i "Image") RETURNS jsonb"#), "{fn_sql}");
         assert!(fn_sql.contains("LANGUAGE sql STABLE"), "{fn_sql}");
-        assert!(fn_sql.contains("'field', 'sortAtUnix'"), "{fn_sql}");
-        assert!(fn_sql.contains("* 1000"), "shared function must preserve ms units:\n{fn_sql}");
+        assert!(fn_sql.contains("'field', 'sortAt'"), "{fn_sql}");
+        assert!(!fn_sql.contains("* 1000"), "shared function must emit seconds:\n{fn_sql}");
 
         // REAL parity: the function embedded in the generated trigger SQL is
         // byte-identical to the standalone generator's output.
@@ -1693,7 +1702,7 @@ sync_sources:
         assert!(
             trigger_sql.contains(&format!(
                 "_ops := _ops || {}(NEW);",
-                shared_field_ops_function_name("Image", "sortAtUnix"),
+                shared_field_ops_function_name("Image", "sortAt"),
             )),
             "trigger INSERT path must call the function by its helper-derived name:\n{trigger_sql}"
         );
@@ -1730,7 +1739,7 @@ sync_sources:
                 TrackField::Simple("nsfwLevel".into()),
                 TrackField::Simple("{type}::text as type".into()),
                 TrackField::Simple("postId".into()),
-                TrackField::Simple(SORTATUNIX_EXPR.into()),
+                TrackField::Simple(SORTAT_EXPR.into()),
             ]),
             ..image_source_with_sortat()
         };

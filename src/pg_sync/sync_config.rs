@@ -840,7 +840,7 @@ triggers: []
 
     /// [W1-1 review minor 3 / PR-m2] Disjointness on the REAL deploy config.
     ///
-    /// The load-bearing invariant is that the new `sortAtUnix` writer (the Image
+    /// The load-bearing invariant is that the new `sortAt` writer (the Image
     /// trigger's shared function) and the Post per-image fan-out never emit the
     /// SAME field for one image — an overlap would let op_dedup LIFO-resolve the
     /// two writers nondeterministically.
@@ -851,9 +851,9 @@ triggers: []
     /// safe: the two writers fire for temporally-separated events and resolve to
     /// the SAME value (both read Post.publishedAt), so LIFO order is immaterial.
     /// This test pins that the overlap is EXACTLY that documented set and that
-    /// `sortAtUnix` (and `model3dId`) are strictly disjoint.
+    /// `sortAt` (and `model3dId`) are strictly disjoint.
     #[test]
-    fn test_post_fanout_disjoint_from_sortatunix() {
+    fn test_post_fanout_disjoint_from_sortat() {
         use crate::pg_sync::trigger_gen::generate_trigger_sql;
 
         let config = load_deploy_sync_config();
@@ -873,16 +873,20 @@ triggers: []
         assert!(!post_fields.is_empty() && !image_fields.is_empty());
 
         // Post fan-out emits exactly the retained payload (PR-M1) — and crucially
-        // NOT sortAtUnix.
+        // NOT sortAt.
         let expected_post: std::collections::HashSet<String> =
             ["publishedAt", "availability", "postedToId"].iter().map(|s| s.to_string()).collect();
         assert_eq!(post_fields, expected_post,
             "Post fan-out must emit exactly {{publishedAt, availability, postedToId}}, got {post_fields:?}");
 
-        // sortAtUnix is emitted by the Image trigger and is DISJOINT from Post.
-        assert!(image_fields.contains("sortAtUnix"), "Image trigger must emit sortAtUnix");
-        assert!(!post_fields.contains("sortAtUnix"),
-            "Post fan-out must NOT emit sortAtUnix — it is the Image trigger's field");
+        // sortAt is emitted by the Image trigger (TARGET name, seconds — the
+        // 2026-07-18 correction) and is DISJOINT from Post.
+        assert!(image_fields.contains("sortAt"), "Image trigger must emit sortAt");
+        assert!(!image_fields.contains("sortAtUnix"),
+            "Image trigger must NOT emit the source name sortAtUnix — op fields \
+             resolve against TARGET names only; source-name ops are silently dropped");
+        assert!(!post_fields.contains("sortAt"),
+            "Post fan-out must NOT emit sortAt — it is the Image trigger's field");
         // model3dId likewise Image-only (INSERT-read, not carried on the fan-out).
         assert!(image_fields.contains("model3dId"), "Image trigger must emit model3dId");
         assert!(!post_fields.contains("model3dId"), "Post fan-out must NOT emit model3dId");
@@ -893,28 +897,32 @@ triggers: []
         assert_eq!(overlap, expected_post,
             "the only Post∩Image overlap must be the intentional Mode-B set \
              {{publishedAt, availability, postedToId}}; any other overlap (esp. \
-             sortAtUnix) would be op_dedup-nondeterministic. Got {overlap:?}");
+             sortAt) would be op_dedup-nondeterministic. Got {overlap:?}");
     }
 
-    /// [PR-B4 emission side / AR-4] The Image trigger emits sortAtUnix in
-    /// MILLISECONDS via the shared function, on the REAL deploy config. Seconds
-    /// here would shrink every value 1000× once the engine's ms_to_seconds
-    /// mapping divides by 1000.
+    /// [PR-B4-v2 emission side] The Image trigger emits the TARGET field name
+    /// `sortAt` in SECONDS via the shared function, on the REAL deploy config.
+    /// CORRECTED 2026-07-18: the original sortAtUnix/ms emission was silently
+    /// dropped by the engine — op field names resolve against filter/sort TARGET
+    /// names only (data_schema renames are doc-path only), and unknown op fields
+    /// are ignored without error.
     #[test]
-    fn test_image_sortatunix_emitted_ms_on_deploy_config() {
+    fn test_image_sortat_emitted_target_name_seconds_on_deploy_config() {
         use crate::pg_sync::trigger_gen::generate_trigger_sql;
 
         let config = load_deploy_sync_config();
         let image = config.triggers.iter().find(|t| t.table == "Image")
             .expect("Image trigger must exist");
-        assert_eq!(image.shared_ops_fields.as_deref(), Some(&["sortAtUnix".to_string()][..]),
-            "Image must factor sortAtUnix into the shared re-emitter function");
+        assert_eq!(image.shared_ops_fields.as_deref(), Some(&["sortAt".to_string()][..]),
+            "Image must factor sortAt into the shared re-emitter function");
 
         let sql = generate_trigger_sql(image);
-        assert!(sql.contains("* 1000"), "sortAtUnix must be milliseconds:\n{sql}");
+        assert!(!sql.contains("* 1000"), "sortAt must be SECONDS, not ms:\n{sql}");
         assert!(sql.contains("_ops := _ops || bitdex_image_sortat_ops(NEW);"),
             "INSERT must call the shared sortat ops function (re-emitter parity):\n{sql}");
-        assert!(emitted_trigger_fields(&sql).contains("sortAtUnix"));
+        assert!(emitted_trigger_fields(&sql).contains("sortAt"));
+        assert!(!emitted_trigger_fields(&sql).contains("sortAtUnix"),
+            "source-name emission would be silently dropped by the engine");
     }
 
     /// [PR-B4 mapping side + PR-M5] Index config: sortAt is INGESTED not computed,
@@ -1029,22 +1037,23 @@ triggers: []
         assert!(images.fields.iter().any(|f| f.target() == "sortAt"),
             "images phase fields must map sortAt");
 
-        // PINNED PAIRING: the ops trigger's sortAtUnix expression is UNCHANGED
-        // and stays COALESCE-shaped — trusting the column there is a *different*
+        // PINNED PAIRING: the ops trigger's sortAt expression stays
+        // COALESCE-shaped — trusting the column there is a *different*
         // safety argument (image_sort_at_before recomputes on every write), not
-        // a relaxation of the dump's no-trust rule.
+        // a relaxation of the dump's no-trust rule. (2026-07-18: emission field
+        // renamed sortAtUnix -> sortAt / ms -> seconds; the pairing is unchanged.)
         let image_trigger = config.triggers.iter().find(|t| t.table == "Image")
             .expect("Image trigger must exist");
-        let sortatunix_track = image_trigger.track_fields.as_deref().unwrap_or(&[])
+        let sortat_track = image_trigger.track_fields.as_deref().unwrap_or(&[])
             .iter()
             .map(|tf| tf.to_track_string())
-            .find(|s| s.contains("sortAtUnix"))
-            .expect("Image trigger must have a sortAtUnix track field");
+            .find(|s| s.contains("as sortAt"))
+            .expect("Image trigger must have a sortAt track field");
         assert!(
-            sortatunix_track.to_uppercase().contains("COALESCE"),
-            "ops emission sortAtUnix expression must remain COALESCE-shaped \
+            sortat_track.to_uppercase().contains("COALESCE"),
+            "ops emission sortAt expression must remain COALESCE-shaped \
              (safe via image_sort_at_before recompute-on-write, unlike the \
-             dump):\n{sortatunix_track}"
+             dump):\n{sortat_track}"
         );
     }
 }
