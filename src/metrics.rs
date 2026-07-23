@@ -141,6 +141,10 @@ pub struct Metrics {
     /// reason so we can distinguish compound_and, compound_or, compound_not,
     /// isnull, isnotnull, unknown_op. Must read zero in prod after B2 ships.
     pub cache_maint_conservative_total: IntCounterVec,
+    /// Page-1 divergence canary: fast-path bucket-sort cache hits whose first
+    /// page disagreed with a sampled slow-path re-derivation. Labels: index,
+    /// sort_field. Non-zero indicates a stale top-of-feed served from cache.
+    pub cache_page1_divergence_total: IntCounterVec,
     /// Incremented when an `In`-arm string value can't be resolved to a u64 key
     /// (requires StringMaps/FieldDictionary not yet threaded). Goes to zero after B2.
     pub cache_maint_string_lookup_miss_total: IntCounter,
@@ -1395,6 +1399,14 @@ impl Metrics {
             &["reason"],
         ).unwrap();
 
+        let cache_page1_divergence_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_cache_page1_divergence_total",
+                "Fast-path bucket-sort cache hits whose first page diverged from a sampled slow-path re-derivation. Non-zero indicates a stale top-of-feed served from cache. Gated by cache.page1_canary_sample_rate.",
+            ),
+            &["index", "sort_field"],
+        ).unwrap();
+
         let cache_maint_string_lookup_miss_total = IntCounter::new(
             "bitdex_cache_maint_string_lookup_miss_total",
             "In-arm string value unresolvable to u64 key. Goes to zero after B2 threads StringMaps.",
@@ -1593,6 +1605,7 @@ impl Metrics {
         registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
         registry.register(Box::new(cache_maint_conservative_total.clone())).unwrap();
+        registry.register(Box::new(cache_page1_divergence_total.clone())).unwrap();
         registry.register(Box::new(cache_maint_string_lookup_miss_total.clone())).unwrap();
         registry.register(Box::new(cache_entries_compound_clause_count.clone())).unwrap();
 
@@ -1752,6 +1765,7 @@ impl Metrics {
             cache_maint_compound_eval_us,
             cache_substituted_entries,
             cache_maint_conservative_total,
+            cache_page1_divergence_total,
             cache_maint_string_lookup_miss_total,
             cache_entries_compound_clause_count,
         }

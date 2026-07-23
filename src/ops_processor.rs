@@ -1200,7 +1200,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value, dictionaries);
+                    process_set_op(sink, meta, engine, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_set(slot, field, value);
                         // §3b (bug #16): mirror the bitmap shadow update at
@@ -1430,11 +1430,22 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
                 // pattern on direct sort fields. Independence from prior
                 // bitmap state is what stops the OR-accumulation corruption
                 // documented in src/ops_processor.rs history.
-                for bit in 0..dep.target_bits {
-                    if (new_computed >> bit) & 1 == 1 {
-                        sink.sort_set(dep.target_arc.clone(), bit, slot);
-                    } else {
-                        sink.sort_clear(dep.target_arc.clone(), bit, slot);
+                //
+                // No-op suppression: skip the overwrite (and the sort-mutated
+                // registration that floods bucket maintenance) when the computed
+                // target already reconstructs to `new_computed`. `None` engine
+                // (dump/test mode) keeps the unconditional overwrite.
+                let unchanged = engine
+                    .and_then(|e| e.reconstruct_sort_value(dep.target_arc.as_ref(), slot))
+                    .map(|cur| cur == new_computed)
+                    .unwrap_or(false);
+                if !unchanged {
+                    for bit in 0..dep.target_bits {
+                        if (new_computed >> bit) & 1 == 1 {
+                            sink.sort_set(dep.target_arc.clone(), bit, slot);
+                        } else {
+                            sink.sort_clear(dep.target_arc.clone(), bit, slot);
+                        }
                     }
                 }
                 if let Some(ref mut dw) = doc_writer {
@@ -1517,6 +1528,7 @@ fn recompute_computed_sorts_for_slot<S: BitmapSink>(
 fn process_set_op<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
+    engine: Option<&ConcurrentEngine>,
     slot: u32,
     field: &str,
     value: &JsonValue,
@@ -1546,11 +1558,34 @@ fn process_set_op<S: BitmapSink>(
     // This is essential for the CH metrics poller which sends Set-only ops (no Remove).
     if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {
         if let Some(sort_val) = value_to_sort_u32(&qval) {
-            for bit in 0..*num_bits {
-                if (sort_val >> bit) & 1 == 1 {
-                    sink.sort_set(arc_name.clone(), bit, slot);
-                } else {
-                    sink.sort_clear(arc_name.clone(), bit, slot);
+            // No-op suppression: a same-value set (the steady-state re-emitter's
+            // dominant shape) would otherwise overwrite every bit layer, register
+            // the slot as sort-mutated, and flood bucket-membership maintenance.
+            // Reconstruct the currently-published value (~num_bits contains) and
+            // skip the clear+set entirely when unchanged. `None` engine (dump/test
+            // mode) falls back to the unconditional full overwrite.
+            //
+            // Staleness: reconstruct reads the PUBLISHED snapshot (base + unmerged
+            // diffs via fused_contains), not this batch's uncommitted staging.
+            // Within a batch, re-sets of the same slot+field are already collapsed
+            // upstream by dedup_ops (LIFO), so intra-batch staleness cannot cause a
+            // dropped genuine change. The one known residual is cross-batch: if a
+            // value moves away and back to its published value across batches, the
+            // return set is suppressed and the slot keeps its published sort
+            // position until the next genuine change. This is a narrow, self-
+            // healing window and is accepted in exchange for killing the re-emit
+            // flood.
+            let unchanged = engine
+                .and_then(|e| e.reconstruct_sort_value(arc_name.as_ref(), slot))
+                .map(|cur| cur == sort_val)
+                .unwrap_or(false);
+            if !unchanged {
+                for bit in 0..*num_bits {
+                    if (sort_val >> bit) & 1 == 1 {
+                        sink.sort_set(arc_name.clone(), bit, slot);
+                    } else {
+                        sink.sort_clear(arc_name.clone(), bit, slot);
+                    }
                 }
             }
         }
@@ -2659,7 +2694,7 @@ fn apply_query_op_set<S: BitmapSink>(
         for op in ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value, dictionaries);
+                    process_set_op(sink, meta, Some(engine), slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_set(slot, field, value);
                         write_shadow_target_docs(dw, meta, slot, field, value.is_null());
@@ -4002,6 +4037,59 @@ mod tests {
         assert_eq!(pub_bits, expected_bits, "safety net must write publishedAt sort-layer set-bits for the stored value");
     }
 
+    /// No-op suppression: a same-value Set on a sort field must emit ZERO sort
+    /// mutations (the steady-state re-emitter's dominant shape), while a changed
+    /// value still writes the full bit overwrite. This is what keeps redundant
+    /// re-emits from registering the slot as sort-mutated and flooding
+    /// bucket-membership maintenance.
+    #[test]
+    fn test_set_op_suppresses_same_value_sort_write() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 100u32;
+        // Fresh engine: publishedAt sort layers all-clear → reconstructs to 0.
+        // Setting 0 is a no-op and must emit no sort ops.
+        let mut sink = RecordingSink::new();
+        process_set_op(&mut sink, &meta, Some(&engine), slot, "publishedAt", &json!(0i64), None);
+        let pub_ops = sink.sort_sets.iter().filter(|(f, _, _)| f == "publishedAt").count()
+            + sink.sort_clears.iter().filter(|(f, _, _)| f == "publishedAt").count();
+        assert_eq!(pub_ops, 0, "same-value sort Set must emit no sort mutations");
+        // A changed value still writes the full overwrite.
+        let mut sink2 = RecordingSink::new();
+        process_set_op(&mut sink2, &meta, Some(&engine), slot, "publishedAt", &json!(12_345i64), None);
+        let pub_ops2 = sink2.sort_sets.iter().filter(|(f, _, _)| f == "publishedAt").count()
+            + sink2.sort_clears.iter().filter(|(f, _, _)| f == "publishedAt").count();
+        assert!(pub_ops2 > 0, "changed value must still write publishedAt sort layers");
+    }
+
+    /// The computed-sort fan-out path (`recompute_computed_sorts_for_slot`) must
+    /// apply the same no-op suppression: a recompute that yields the already-
+    /// stored computed value writes nothing; a changed value still overwrites.
+    #[test]
+    fn test_recompute_suppresses_same_value_computed_sort() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot = 101u32;
+        // sortAt = GREATEST(existedAt, publishedAt); fresh engine reconstructs 0.
+        // A recompute yielding 0 must emit no sortAt sort ops.
+        let mut noop_vals: HashMap<&str, u32> = HashMap::new();
+        noop_vals.insert("existedAt", 0);
+        let empty: HashMap<&str, u32> = HashMap::new();
+        let mut sink = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink, &meta, Some(&engine), slot, &noop_vals, &empty, None);
+        let sortat_ops = sink.sort_sets.iter().filter(|(f, _, _)| f == "sortAt").count()
+            + sink.sort_clears.iter().filter(|(f, _, _)| f == "sortAt").count();
+        assert_eq!(sortat_ops, 0, "same-value computed sort must emit no sort mutations");
+        // A changed computed value still overwrites the sortAt layers.
+        let mut changed_vals: HashMap<&str, u32> = HashMap::new();
+        changed_vals.insert("existedAt", 500);
+        let mut sink2 = RecordingSink::new();
+        recompute_computed_sorts_for_slot(&mut sink2, &meta, Some(&engine), slot, &changed_vals, &empty, None);
+        let sortat_ops2 = sink2.sort_sets.iter().filter(|(f, _, _)| f == "sortAt").count()
+            + sink2.sort_clears.iter().filter(|(f, _, _)| f == "sortAt").count();
+        assert!(sortat_ops2 > 0, "changed computed value must still write sortAt sort layers");
+    }
+
     /// The safety net must NOT force-activate a slot that is still legitimately
     /// deferred (publishedAt in the future) — that would leak scheduled posts.
     #[test]
@@ -4206,6 +4294,7 @@ mod tests {
         process_set_op(
             &mut sink,
             &meta,
+            None,
             42,
             "type",
             &json!("image"),
@@ -4288,7 +4377,7 @@ mod tests {
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
         // Trigger emits Set publishedAt=<seconds> when a Post is published.
-        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(1_777_581_167i64), None);
+        process_set_op(&mut sink, &meta, None, 42, "publishedAt", &json!(1_777_581_167i64), None);
 
         // Sort field gets the standard bit decomposition (existence-agnostic).
         assert!(!sink.sort_sets.is_empty(), "publishedAt sort bits must still be written");
@@ -4311,7 +4400,7 @@ mod tests {
         let config = shadow_config();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
-        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(null), None);
+        process_set_op(&mut sink, &meta, None, 42, "publishedAt", &json!(null), None);
 
         let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
             .filter(|(f, _, _)| f == "isPublished").collect();
@@ -4355,7 +4444,7 @@ mod tests {
         let config = shadow_config();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
-        process_set_op(&mut sink, &meta, 42, "publishedAtUnix", &json!(1_777_581_167_000i64), None);
+        process_set_op(&mut sink, &meta, None, 42, "publishedAtUnix", &json!(1_777_581_167_000i64), None);
 
         let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
             .filter(|(f, _, _)| f == "isPublished").collect();

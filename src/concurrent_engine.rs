@@ -31,6 +31,9 @@ use crate::shard_store_bitmap::{
     AliveShardKey, BitmapOp, FilterBucketKey, FilterOp,
 };
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
+/// Minimum seconds between page-1 divergence canary warns for the same cache
+/// entry — bounds log volume when a hot entry diverges every query.
+const PAGE1_CANARY_WARN_INTERVAL_SECS: u64 = 60;
 /// Bridge for passing Prometheus metric handles from the server layer into
 /// the engine's background threads (compaction worker, lazy loading).
 /// Only available when compiled with the `server` feature.
@@ -105,6 +108,11 @@ pub struct MetricsBridge {
     /// Wall time of the on-flush-thread reconcile apply (re-validate + mutate),
     /// distinct from the off-thread scan duration. Bounds the flush-thread cost.
     pub time_bucket_reconcile_apply_seconds: prometheus::HistogramVec,
+    /// Page-1 divergence canary: fast-path bucket-sort cache hits whose first
+    /// page disagreed with a sampled slow-path re-derivation. Non-zero means the
+    /// cache is serving a stale top-of-feed for some bucket entry. Labels: index,
+    /// sort_field.
+    pub page1_divergence_total: prometheus::IntCounterVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -466,6 +474,15 @@ pub struct ConcurrentEngine {
     boundstore_entries_restored: Arc<AtomicU64>,
     /// Cumulative entries skipped (tombstoned + orphan) during shard load.
     boundstore_entries_skipped: Arc<AtomicU64>,
+    /// Deterministic 1-in-N sampler for the page-1 divergence canary. Bumped on
+    /// every fast-path bucket-sort cache hit; the slow-path cross-check runs when
+    /// the counter lands on a sampling boundary. Gated by
+    /// `cache.page1_canary_sample_rate` (0.0 = never sample).
+    page1_canary_counter: Arc<AtomicU64>,
+    /// Per-entry last-warn timestamp (unix seconds) for the page-1 divergence
+    /// canary, so a diverging entry logs at most once per
+    /// `PAGE1_CANARY_WARN_INTERVAL_SECS`.
+    page1_canary_warn_log: Arc<DashMap<UnifiedKey, u64>>,
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
@@ -828,6 +845,7 @@ impl ConcurrentEngine {
             prefetch_threshold: config.cache.prefetch_threshold,
             compound_eval_atom_limit: config.cache.compound_eval_atom_limit,
             bucket_entry_ttl_secs: config.cache.bucket_entry_ttl_secs,
+            page1_canary_sample_rate: config.cache.page1_canary_sample_rate,
         };
         // Cache-worker metrics created early so the cache can hold an Arc to
         // it for reason-attributed rebuild counters (alive_change,
@@ -1434,6 +1452,8 @@ impl ConcurrentEngine {
                 boundstore_bytes_read,
                 boundstore_entries_restored,
                 boundstore_entries_skipped,
+                page1_canary_counter: Arc::new(AtomicU64::new(0)),
+                page1_canary_warn_log: Arc::new(DashMap::new()),
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
@@ -5179,6 +5199,8 @@ impl ConcurrentEngine {
             boundstore_bytes_read,
             boundstore_entries_restored,
             boundstore_entries_skipped,
+            page1_canary_counter: Arc::new(AtomicU64::new(0)),
+            page1_canary_warn_log: Arc::new(DashMap::new()),
             #[cfg(feature = "server")]
             metrics_bridge,
             bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
@@ -7014,6 +7036,30 @@ impl ConcurrentEngine {
                                 // Skip prefetch for radix path — expanded entries are already at max_capacity
                             }
                         }
+                        // Page-1 divergence canary (diagnostic, default-off). Only
+                        // first-page bucket-sort hits (no cursor, no offset) are
+                        // sampled — that is the top-of-feed case the prod symptom
+                        // hit, and it keeps the fast/slow comparison offset-free.
+                        let canary_rate = self.unified_cache.config().page1_canary_sample_rate;
+                        if canary_rate > 0.0
+                            && offset == 0
+                            && query.cursor.is_none()
+                            && ukey.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause)
+                        {
+                            let seq = self.page1_canary_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                            let period = ((1.0 / canary_rate).round() as u64).max(1);
+                            if seq % period == 0 {
+                                self.page1_divergence_canary(
+                                    &executor,
+                                    &ukey,
+                                    query,
+                                    effective_filters,
+                                    tb_guard.as_deref(),
+                                    now_unix,
+                                    &result.ids,
+                                );
+                            }
+                        }
                         self.post_validate(&mut result, &query.filters, &executor)?;
                         return Ok(result);
                     }
@@ -8228,6 +8274,80 @@ impl ConcurrentEngine {
         let filter_bitmap = Arc::new(executor.compute_filters(&plan.ordered_clauses)?);
         Ok((filter_bitmap, plan.use_simple_sort))
     }
+    /// Diagnostic page-1 divergence canary (default-off, gated by
+    /// `cache.page1_canary_sample_rate`). Re-derives the first page from the
+    /// live filter+sort — bounded to `query.limit`, no doc fetches — and diffs
+    /// it against the fast-path cache result `fast_ids`. On divergence, bumps
+    /// `page1_divergence_total{sort_field}` and warns at most once per entry per
+    /// `PAGE1_CANARY_WARN_INTERVAL_SECS`. Only meaningful for first-page queries
+    /// (no cursor, no offset); the caller gates on that.
+    #[allow(clippy::too_many_arguments)]
+    fn page1_divergence_canary(
+        &self,
+        executor: &QueryExecutor,
+        ukey: &UnifiedKey,
+        query: &BitdexQuery,
+        effective_filters: &[FilterClause],
+        time_buckets: Option<&TimeBucketManager>,
+        now_unix: u64,
+        fast_ids: &[i64],
+    ) {
+        let (filter_arc, use_simple_sort) =
+            match self.resolve_filters(executor, effective_filters, time_buckets, now_unix) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+        let slow = match executor.execute_from_bitmap(
+            &filter_arc,
+            query.sort.as_ref(),
+            query.limit,
+            None,
+            use_simple_sort,
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let n = query.limit.min(fast_ids.len()).min(slow.ids.len());
+        if fast_ids[..n] == slow.ids[..n] {
+            return;
+        }
+        #[cfg(feature = "server")]
+        {
+            let bridge = self.metrics_bridge.load();
+            if let Some(ref b) = **bridge {
+                b.page1_divergence_total
+                    .with_label_values(&[&b.index_name, ukey.sort_field.as_str()])
+                    .inc();
+            }
+        }
+        let should_warn = self
+            .page1_canary_warn_log
+            .get(ukey)
+            .map(|r| now_unix.saturating_sub(*r.value()) >= PAGE1_CANARY_WARN_INTERVAL_SECS)
+            .unwrap_or(true);
+        if should_warn {
+            self.page1_canary_warn_log.insert(ukey.clone(), now_unix);
+            let (needs_rebuild, min_tracked_value, capacity, bucket_cutoff) = self
+                .unified_cache
+                .lookup_for_read(ukey)
+                .map(|e| {
+                    let e = e.value();
+                    (e.needs_rebuild(), e.min_tracked_value(), e.capacity(), e.bucket_cutoff())
+                })
+                .unwrap_or((false, 0, 0, 0));
+            tracing::warn!(
+                sort_field = %ukey.sort_field,
+                key = ?ukey,
+                min_tracked_value,
+                capacity,
+                needs_rebuild,
+                bucket_cutoff,
+                fast_page = ?&fast_ids[..n],
+                slow_page = ?&slow.ids[..n],
+                "page-1 divergence canary: cache first page disagrees with slow-path re-derivation"
+            );
+        }
+    }
     /// Post-validate query results against in-flight writes.
     fn post_validate(
         &self,
@@ -8264,6 +8384,14 @@ impl ConcurrentEngine {
     /// Get the number of alive documents (lock-free snapshot).
     pub fn alive_count(&self) -> u64 {
         self.snapshot().slots.alive_count()
+    }
+    /// Reconstruct the currently-published sort value for `slot` in sort field
+    /// `field` from the live snapshot. `None` when the field is not a registered
+    /// sort field. Used by the ops processor to detect same-value sort sets and
+    /// suppress the redundant clear+set (and the mutated-slot registration that
+    /// otherwise floods bucket-membership maintenance).
+    pub fn reconstruct_sort_value(&self, field: &str, slot: u32) -> Option<u32> {
+        self.snapshot().sorts.get_field(field).map(|f| f.reconstruct_value(slot))
     }
     /// Pre-load all pending filter and sort fields from disk.
     /// Call from a background thread after server startup so lazy-loading
@@ -9132,6 +9260,11 @@ impl ConcurrentEngine {
     /// cache. 0 disables the fallback.
     pub fn set_bucket_entry_ttl_secs(&self, v: u64) {
         self.unified_cache.with_config_mut(|c| c.bucket_entry_ttl_secs = v);
+    }
+    /// Update the page-1 divergence canary sample rate (0.0–1.0) on the live
+    /// unified cache. 0.0 disables the canary. Takes effect on the next query.
+    pub fn set_page1_canary_sample_rate(&self, v: f64) {
+        self.unified_cache.with_config_mut(|c| c.page1_canary_sample_rate = v.clamp(0.0, 1.0));
     }
     /// Update the max_maintenance_ms time budget on the live unified cache and
     /// the async cache worker (if running). Takes effect on the worker's next

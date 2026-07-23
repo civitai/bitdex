@@ -1148,6 +1148,9 @@ struct CachePatch {
     /// TTL (seconds) for time-bucket cache entries. 0 disables. Hot-tunable;
     /// takes effect on the next read of an affected entry.
     bucket_entry_ttl_secs: Option<u64>,
+    /// Page-1 divergence canary sample rate (0.0–1.0). 0.0 disables. Hot-tunable;
+    /// takes effect on the next query.
+    page1_canary_sample_rate: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2012,6 +2015,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
                 .metrics
                 .time_bucket_reconcile_apply_seconds
                 .clone(),
+            page1_divergence_total: state.metrics.cache_page1_divergence_total.clone(),
             index_name: def.name.clone(),
         });
         // Install the cache-worker cycle-time histogram so the worker can
@@ -2372,6 +2376,7 @@ async fn handle_create_index(
         time_bucket_stale: state.metrics.time_bucket_stale.clone(),
         time_bucket_missing: state.metrics.time_bucket_missing.clone(),
         time_bucket_reconcile_apply_seconds: state.metrics.time_bucket_reconcile_apply_seconds.clone(),
+        page1_divergence_total: state.metrics.cache_page1_divergence_total.clone(),
         index_name: definition.name.clone(),
     });
 
@@ -2701,6 +2706,10 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.bucket_entry_ttl_secs {
                         idx.definition.config.cache.bucket_entry_ttl_secs = v;
                         idx.engine.set_bucket_entry_ttl_secs(v);
+                    }
+                    if let Some(v) = cache_patch.page1_canary_sample_rate {
+                        idx.definition.config.cache.page1_canary_sample_rate = v;
+                        idx.engine.set_page1_canary_sample_rate(v);
                     }
                     if let Some(v) = cache_patch.async_maintenance {
                         // Updates the stored config (persisted on next save).
