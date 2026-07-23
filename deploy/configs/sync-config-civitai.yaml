@@ -216,11 +216,20 @@ dump_phases:
       - { column: techniqueId, target: techniqueIds }
 
   # Phase 6: Metrics (1.4GB, from ClickHouse, TAB-separated)
+  # 2026-07-17: `FROM image_metrics` was STALE (table gone; CH 404
+  # UNKNOWN_IDENTIFIER on the first real boot-dump under this file) — this
+  # repo copy had drifted from the deployed talos ConfigMap, which already
+  # used entityMetricDailyAgg_v2. Now matched to deployed reality.
   - name: metrics
     source: clickhouse
     query: >
-      SELECT imageId, reactionCount, commentCount, collectedCount
-      FROM image_metrics
+      SELECT entityId AS imageId,
+      sumIf(total, metricType IN ('Like','Heart','Laugh','Cry')) AS reactionCount,
+      sumIf(total, metricType = 'commentCount') AS commentCount,
+      sumIf(total, metricType = 'Collection') AS collectedCount
+      FROM entityMetricDailyAgg_v2
+      WHERE entityType = 'Image' AND entityId >= {id_lo} AND entityId < {id_hi}
+      GROUP BY entityId
     format: tsv
     slot_field: imageId
     fields: [reactionCount, commentCount, collectedCount]
