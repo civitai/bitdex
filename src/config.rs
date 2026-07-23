@@ -567,6 +567,15 @@ pub struct CacheConfig {
     /// `PATCH /indexes/{name}/config` → `cache.bucket_entry_ttl_secs`.
     #[serde(default = "default_bucket_entry_ttl_secs")]
     pub bucket_entry_ttl_secs: u64,
+    /// Diagnostic: fraction (0.0–1.0) of fast-path bucket-sort cache hits that
+    /// are cross-checked against the slow path to detect first-page divergence.
+    /// On a sampled hit, the slow path is re-run bounded to the query limit (no
+    /// doc fetches) and the first-page IDs are diffed; mismatches increment
+    /// `bitdex_cache_page1_divergence_total`. `0.0` disables (default). Adds
+    /// latency to sampled queries only. Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.page1_canary_sample_rate`.
+    #[serde(default = "default_page1_canary_sample_rate")]
+    pub page1_canary_sample_rate: f64,
 }
 fn default_cache_max_entries() -> usize {
     100_000
@@ -622,6 +631,9 @@ fn default_compound_eval_atom_limit() -> u32 {
 fn default_bucket_entry_ttl_secs() -> u64 {
     0 // disabled by default
 }
+fn default_page1_canary_sample_rate() -> f64 {
+    0.0 // disabled by default
+}
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -641,6 +653,7 @@ impl Default for CacheConfig {
             async_maintenance: false,
             compound_eval_atom_limit: default_compound_eval_atom_limit(),
             bucket_entry_ttl_secs: default_bucket_entry_ttl_secs(),
+            page1_canary_sample_rate: default_page1_canary_sample_rate(),
         }
     }
 }

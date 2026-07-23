@@ -152,8 +152,30 @@ pub struct CacheMaintenanceResult {
     pub key: UnifiedKey,
     /// Slots to add: (slot_id, sort_value)
     pub adds: Vec<(u32, u32)>,
-    /// Slots to remove: (slot_id, sort_value)
+    /// Filter-mismatch removes: (slot_id, sort_value). The slot no longer
+    /// matches the entry's filter, so it must be evicted regardless of where its
+    /// sort value sits relative to the bound. Applied unconditionally.
     pub removes: Vec<(u32, u32)>,
+    /// Sort-bound removes: (slot_id, sort_value). The slot's value fell on the
+    /// wrong side of the bound captured at collect time (it did NOT qualify
+    /// under that captured floor). These are subject to the stale-min guard in
+    /// apply: a concurrent `expand()` can lower the live floor to include such a
+    /// slot, in which case it is a freshly-added legitimate member and its
+    /// remove is dropped. Kept separate from `removes` because the guard must
+    /// never touch filter-mismatch removes.
+    pub sort_bound_removes: Vec<(u32, u32)>,
+}
+/// Whether `value` is inside the top-N bound anchored at `min_tracked_value`.
+/// Desc entries keep values strictly above the floor; Asc entries keep values
+/// strictly below the ceiling. Mirrors `UnifiedEntry::sort_qualifies` but takes
+/// the bound explicitly so callers can test against a bound they read
+/// independently of the entry (e.g. the live bound during apply).
+#[inline]
+fn sort_qualifies_raw(value: u32, min_tracked_value: u32, direction: SortDirection) -> bool {
+    match direction {
+        SortDirection::Desc => value > min_tracked_value,
+        SortDirection::Asc => value < min_tracked_value,
+    }
 }
 /// Configuration for the unified cache.
 #[derive(Debug, Clone)]
@@ -198,6 +220,10 @@ pub struct UnifiedCacheConfig {
     /// (default). Hot-tunable via `PATCH /indexes/{name}/config` →
     /// `cache.bucket_entry_ttl_secs`.
     pub bucket_entry_ttl_secs: u64,
+    /// Diagnostic sample rate (0.0–1.0) for the page-1 divergence canary on
+    /// fast-path bucket-sort cache hits. 0.0 disables (default). Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.page1_canary_sample_rate`.
+    pub page1_canary_sample_rate: f64,
 }
 impl Default for UnifiedCacheConfig {
     fn default() -> Self {
@@ -212,6 +238,7 @@ impl Default for UnifiedCacheConfig {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0, // disabled by default
+            page1_canary_sample_rate: 0.0, // disabled by default
         }
     }
 }
@@ -2261,8 +2288,36 @@ impl UnifiedCache {
                     // (slots whose value fell below the bound) that are mostly
                     // non-members, and we must not mark the shard dirty / bump
                     // the update counter for a no-op.
+                    //
+                    // Filter-mismatch removes: the slot no longer matches the
+                    // entry's filter, so evict unconditionally (membership-guarded
+                    // by `remove_slots_bulk`). These carry no sort-bound relation
+                    // to the floor, so the stale-min guard must never touch them.
                     if !result.removes.is_empty() && entry.remove_slots_bulk(&result.removes) {
                         modified = true;
+                    }
+                    // Sort-bound removes: flagged because the slot's value fell
+                    // below the floor captured at collect time (it did NOT qualify
+                    // under that captured floor). A concurrent pagination expand()
+                    // can lower the LIVE floor to include such a slot, making it a
+                    // freshly-added legitimate member — keep it. Since every
+                    // sort-bound candidate was captured as non-qualifying, the
+                    // guard reduces to a single live-bound test: apply the remove
+                    // only when the value still does NOT qualify under the current
+                    // floor. In the common no-expand case the floor is unchanged,
+                    // so all sort-bound removes still apply.
+                    if !result.sort_bound_removes.is_empty() {
+                        let current_min = entry.min_tracked_value();
+                        let dir = result.key.direction;
+                        let to_remove: Vec<(u32, u32)> = result
+                            .sort_bound_removes
+                            .iter()
+                            .copied()
+                            .filter(|&(_s, v)| !sort_qualifies_raw(v, current_min, dir))
+                            .collect();
+                        if !to_remove.is_empty() && entry.remove_slots_bulk(&to_remove) {
+                            modified = true;
+                        }
                     }
                 }
             }
@@ -3123,6 +3178,8 @@ pub fn evaluate_filter_work(
                 key: item.key.clone(),
                 adds,
                 removes,
+                // Filter-mismatch removes only — no sort-bound removes on this path.
+                sort_bound_removes: Vec::new(),
             }))
         } else {
             None
@@ -3271,6 +3328,7 @@ pub fn evaluate_sort_work(
         let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
+        let mut sort_bound_removes = Vec::new();
         for &slot in &item.slots {
             let sort_value = reconstructed
                 .get(&(field_name, slot))
@@ -3286,8 +3344,10 @@ pub fn evaluate_sort_work(
                 // still a cached member it must be dropped; the remove is a
                 // membership-guarded no-op when it isn't. Suppressed while the
                 // field is partially loaded (garbage values must not evict).
+                // Sort-bound origin: eligible for the apply-time stale-min guard
+                // (a concurrent expand() may have lowered the floor to include it).
                 if field_loaded {
-                    removes.push((slot, sort_value));
+                    sort_bound_removes.push((slot, sort_value));
                 }
                 continue;
             }
@@ -3320,15 +3380,17 @@ pub fn evaluate_sort_work(
             } else if field_loaded {
                 // Qualifies by sort value but no longer matches the filter
                 // (e.g. a bucket clause that no longer contains it) — evict if
-                // it was a member. Suppressed during partial load.
+                // it was a member. Suppressed during partial load. Filter-mismatch
+                // origin: must always apply, never subject to the stale-min guard.
                 removes.push((slot, sort_value));
             }
         }
-        if !adds.is_empty() || !removes.is_empty() {
+        if !adds.is_empty() || !removes.is_empty() || !sort_bound_removes.is_empty() {
             Some(ItemOutcome::Result(CacheMaintenanceResult {
                 key: item.key.clone(),
                 adds,
                 removes,
+                sort_bound_removes,
             }))
         } else {
             None
@@ -3977,6 +4039,95 @@ mod tests {
         let new_slots: Vec<u32> = (5..10).collect();
         entry.expand(&new_slots, |s| 1000 - s);
         assert_eq!(entry.min_tracked_value(), 991); // 1000 - 9
+    }
+    /// Stale-min remove race: a maintenance work item collected against the
+    /// pre-expand bound must not evict members that a concurrent pagination
+    /// expand() added under the lowered bound. `apply_maintenance_results`
+    /// re-reads the live bound and drops now-qualifying removes.
+    ///
+    /// Under the pre-fix code (unconditional `remove_slots_bulk(&result.removes)`)
+    /// slot 5 is a member and gets removed — this test fails.
+    #[test]
+    fn test_apply_maintenance_keeps_members_added_by_concurrent_expand() {
+        let config = UnifiedCacheConfig {
+            initial_capacity: 5,
+            max_capacity: 100,
+            ..make_config()
+        };
+        let cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        // Initial top-5: slots 0..5, values 1000-s → min_tracked_value = 996.
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        // Concurrent pagination expand(): lowers the bound and appends members
+        // 5..10 (values 995..991). Post-expand min_tracked_value = 991.
+        {
+            let mut entry = cache.get_mut(&key).unwrap();
+            let new_slots: Vec<u32> = (5..10).collect();
+            entry.expand(&new_slots, |s| 1000 - s);
+            assert_eq!(entry.min_tracked_value(), 991);
+        }
+        // A work item collected BEFORE the expand captured min=996 and produced
+        // a remove for slot 5 (value 995: below the OLD bound, above the NEW one)
+        // alongside a genuine drop for slot 7 (value 980, below both bounds).
+        let result = CacheMaintenanceResult {
+            key: key.clone(),
+            adds: Vec::new(),
+            // Both were flagged as sort-bound against the pre-expand floor (996):
+            // slot 5 (995) landed in the band the expand opened; slot 7 (980) is
+            // below even the new floor (991), a genuine drop.
+            removes: Vec::new(),
+            sort_bound_removes: vec![(5, 995), (7, 980)],
+        };
+        cache.apply_maintenance_results(&[result]);
+        let entry = cache.get(&key).unwrap();
+        assert!(
+            entry.bitmap().contains(5),
+            "member added by concurrent expand must survive the stale-min remove"
+        );
+        assert!(
+            !entry.bitmap().contains(7),
+            "a genuine below-bound remove must still apply"
+        );
+    }
+    /// Origin gap: a FILTER-mismatch remove whose value lands inside the band a
+    /// concurrent expand() opened (it qualifies under the live floor) MUST still
+    /// be evicted — the slot no longer matches the filter. The stale-min guard
+    /// applies only to sort-bound removes. Under an origin-blind guard this
+    /// remove is wrongly dropped, leaving a no-longer-matching slot in the
+    /// result (transient false inclusion).
+    #[test]
+    fn test_apply_maintenance_filter_mismatch_remove_always_applies() {
+        let config = UnifiedCacheConfig {
+            initial_capacity: 5,
+            max_capacity: 100,
+            ..make_config()
+        };
+        let cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        // Concurrent expand lowers the floor to 991 and adds members 5..10.
+        {
+            let mut entry = cache.get_mut(&key).unwrap();
+            let new_slots: Vec<u32> = (5..10).collect();
+            entry.expand(&new_slots, |s| 1000 - s);
+            assert_eq!(entry.min_tracked_value(), 991);
+        }
+        // Slot 5 (value 995) qualifies under the live floor (991) but no longer
+        // matches the filter — a filter-mismatch remove, applied unconditionally.
+        let result = CacheMaintenanceResult {
+            key: key.clone(),
+            adds: Vec::new(),
+            removes: vec![(5, 995)],
+            sort_bound_removes: Vec::new(),
+        };
+        cache.apply_maintenance_results(&[result]);
+        let entry = cache.get(&key).unwrap();
+        assert!(
+            !entry.bitmap().contains(5),
+            "filter-mismatch remove must apply even when the value qualifies under the live bound"
+        );
     }
     #[test]
     fn test_radix_built_on_expand() {
@@ -4662,6 +4813,7 @@ mod tests {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
+            page1_canary_sample_rate: 0.0,
         };
         let cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
@@ -5141,6 +5293,7 @@ mod tests {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
+            page1_canary_sample_rate: 0.0,
         });
         // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
         cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
@@ -5246,6 +5399,7 @@ mod tests {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
+            page1_canary_sample_rate: 0.0,
         });
         // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
@@ -5387,6 +5541,7 @@ mod tests {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
+            page1_canary_sample_rate: 0.0,
         });
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
             if s == 1 { ts_slot1 } else { 0 }
@@ -5551,6 +5706,7 @@ mod tests {
             key: key.clone(),
             adds: vec![(99u32, 500u32)],
             removes: vec![],
+            sort_bound_removes: vec![],
         }];
         cache.apply_maintenance_results(&results);
         let after = cache.stats().updates;
@@ -5593,6 +5749,7 @@ mod tests {
             key: key.clone(),
             adds: vec![(99u32, 500u32)],
             removes: vec![],
+            sort_bound_removes: vec![],
         }];
         cache.apply_maintenance_results(&results);
 
@@ -5627,6 +5784,7 @@ mod tests {
             key: key.clone(),
             adds: vec![],
             removes: vec![],
+            sort_bound_removes: vec![],
         }];
         cache.apply_maintenance_results(&results);
 
@@ -5656,6 +5814,7 @@ mod tests {
             key: key.clone(),
             adds: vec![],
             removes: vec![(5u32, 5u32)],
+            sort_bound_removes: vec![],
         }];
         cache.apply_maintenance_results(&results);
 
@@ -5690,11 +5849,13 @@ mod tests {
                 key: key_a.clone(),
                 adds: vec![(99u32, 500u32)],
                 removes: vec![],
+                sort_bound_removes: vec![],
             },
             crate::unified_cache::CacheMaintenanceResult {
                 key: key_b.clone(),
                 adds: vec![(98u32, 400u32)],
                 removes: vec![],
+                sort_bound_removes: vec![],
             },
         ];
         cache.apply_maintenance_results(&results);
@@ -5781,6 +5942,7 @@ mod tests {
             key: key.clone(),
             adds: vec![(99u32, 500u32)],
             removes: vec![],
+            sort_bound_removes: vec![],
         }];
         cache.apply_maintenance_results(&results);
         cache.remove_slot_from_all(1);
@@ -6909,6 +7071,7 @@ mod tests {
             prefetch_threshold: 0.95,
             compound_eval_atom_limit: 50,
             bucket_entry_ttl_secs: 0,
+            page1_canary_sample_rate: 0.0,
         };
         let cache = UnifiedCache::new(cfg);
 
@@ -7174,6 +7337,7 @@ mod tests {
                 prefetch_threshold: 0.95,
                 compound_eval_atom_limit: 50,
                 bucket_entry_ttl_secs: 0,
+                page1_canary_sample_rate: 0.0,
             };
             let cache = UnifiedCache::new(cfg);
             let fi = build_filter_index_two_fields(fa_keys, fa_bitmasks, fb_keys, fb_bitmasks);
