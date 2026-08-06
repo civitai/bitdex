@@ -145,6 +145,11 @@ pub struct Metrics {
     /// page disagreed with a sampled slow-path re-derivation. Labels: index,
     /// sort_field. Non-zero indicates a stale top-of-feed served from cache.
     pub cache_page1_divergence_total: IntCounterVec,
+    /// First-page bucket-sort cache hits sampled by the page1 divergence canary.
+    /// Liveness signal for the canary itself: zero rate under first-page traffic
+    /// means the canary is disabled, so a quiet divergence counter proves nothing.
+    /// Labels: index.
+    pub cache_page1_canary_samples_total: IntCounterVec,
     /// Incremented when an `In`-arm string value can't be resolved to a u64 key
     /// (requires StringMaps/FieldDictionary not yet threaded). Goes to zero after B2.
     pub cache_maint_string_lookup_miss_total: IntCounter,
@@ -1407,6 +1412,14 @@ impl Metrics {
             &["index", "sort_field"],
         ).unwrap();
 
+        let cache_page1_canary_samples_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_cache_page1_canary_samples_total",
+                "First-page bucket-sort cache hits sampled by the page1 divergence canary. Liveness signal: a zero rate while first-page traffic flows means the canary is OFF (cache.page1_canary_sample_rate = 0), so a silent divergence counter proves nothing.",
+            ),
+            &["index"],
+        ).unwrap();
+
         let cache_maint_string_lookup_miss_total = IntCounter::new(
             "bitdex_cache_maint_string_lookup_miss_total",
             "In-arm string value unresolvable to u64 key. Goes to zero after B2 threads StringMaps.",
@@ -1606,6 +1619,7 @@ impl Metrics {
         registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
         registry.register(Box::new(cache_maint_conservative_total.clone())).unwrap();
         registry.register(Box::new(cache_page1_divergence_total.clone())).unwrap();
+        registry.register(Box::new(cache_page1_canary_samples_total.clone())).unwrap();
         registry.register(Box::new(cache_maint_string_lookup_miss_total.clone())).unwrap();
         registry.register(Box::new(cache_entries_compound_clause_count.clone())).unwrap();
 
@@ -1766,8 +1780,47 @@ impl Metrics {
             cache_substituted_entries,
             cache_maint_conservative_total,
             cache_page1_divergence_total,
+            cache_page1_canary_samples_total,
             cache_maint_string_lookup_miss_total,
             cache_entries_compound_clause_count,
+        }
+    }
+
+    /// Build the engine-side `MetricsBridge` from this registry's collectors.
+    /// Single construction point for the boot path, the reload path, and tests —
+    /// a bridge field added here is wired everywhere at once.
+    pub fn engine_bridge(&self, index_name: String) -> crate::concurrent_engine::MetricsBridge {
+        crate::concurrent_engine::MetricsBridge {
+            lazy_load_duration: self.lazy_load_duration_seconds.clone(),
+            compaction_total: self.compaction_total.clone(),
+            compaction_duration: self.compaction_duration_seconds.clone(),
+            query_op_set_fanout_size: self.query_op_set_fanout_size.clone(),
+            query_op_set_rejected_total: self.query_op_set_rejected_total.clone(),
+            query_op_set_zero_match_total: self.query_op_set_zero_match_total.clone(),
+            query_op_set_applied_slots_total: self.query_op_set_applied_slots_total.clone(),
+            deferred_fanout_scanned_total: self.deferred_fanout_scanned_total.clone(),
+            deferred_fanout_reached_total: self.deferred_fanout_reached_total.clone(),
+            activation_verify_checked_total: self.activation_verify_checked_total.clone(),
+            activation_verify_redriven_total: self.activation_verify_redriven_total.clone(),
+            activation_verify_publish_lag_total: self.activation_verify_publish_lag_total.clone(),
+            activation_verify_inconclusive_total: self.activation_verify_inconclusive_total.clone(),
+            wal_apply_batch_seconds: self.wal_apply_batch_seconds.clone(),
+            bitmap_mem_scan_tick_seconds: self.bitmap_mem_scan_tick_seconds.clone(),
+            query_total: self.query_total.clone(),
+            timebucket_dropped_no_sort_field_total: self.timebucket_dropped_no_sort_field_total.clone(),
+            timebucket_dropped_capacity_exceeded_total: self.timebucket_dropped_capacity_exceeded_total.clone(),
+            timebucket_applied_not_bucketed_total: self.timebucket_applied_not_bucketed_total.clone(),
+            timebucket_anomalous_ts_total: self.timebucket_anomalous_ts_total.clone(),
+            time_bucket_full_rebuild_duration_seconds: self.time_bucket_full_rebuild_duration_seconds.clone(),
+            time_bucket_full_rebuild_total: self.time_bucket_full_rebuild_total.clone(),
+            time_bucket_pruned_total: self.time_bucket_pruned_total.clone(),
+            time_bucket_backfilled_total: self.time_bucket_backfilled_total.clone(),
+            time_bucket_stale: self.time_bucket_stale.clone(),
+            time_bucket_missing: self.time_bucket_missing.clone(),
+            time_bucket_reconcile_apply_seconds: self.time_bucket_reconcile_apply_seconds.clone(),
+            page1_divergence_total: self.cache_page1_divergence_total.clone(),
+            page1_canary_samples_total: self.cache_page1_canary_samples_total.clone(),
+            index_name,
         }
     }
 

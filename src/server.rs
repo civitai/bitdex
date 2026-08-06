@@ -1969,55 +1969,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         // Phase 4: Metrics bridge wiring
         let phase_start = std::time::Instant::now();
         // Wire Prometheus metrics bridge into the engine's background threads.
-        engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
-            lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
-            compaction_total: state.metrics.compaction_total.clone(),
-            compaction_duration: state.metrics.compaction_duration_seconds.clone(),
-            query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
-            query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
-            query_op_set_zero_match_total: state.metrics.query_op_set_zero_match_total.clone(),
-            query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
-            deferred_fanout_scanned_total: state.metrics.deferred_fanout_scanned_total.clone(),
-            deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
-            activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
-            activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
-            activation_verify_publish_lag_total: state.metrics.activation_verify_publish_lag_total.clone(),
-            activation_verify_inconclusive_total: state.metrics.activation_verify_inconclusive_total.clone(),
-            wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
-            bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
-            query_total: state.metrics.query_total.clone(),
-            timebucket_dropped_no_sort_field_total: state
-                .metrics
-                .timebucket_dropped_no_sort_field_total
-                .clone(),
-            timebucket_dropped_capacity_exceeded_total: state
-                .metrics
-                .timebucket_dropped_capacity_exceeded_total
-                .clone(),
-            timebucket_applied_not_bucketed_total: state
-                .metrics
-                .timebucket_applied_not_bucketed_total
-                .clone(),
-            timebucket_anomalous_ts_total: state
-                .metrics
-                .timebucket_anomalous_ts_total
-                .clone(),
-            time_bucket_full_rebuild_duration_seconds: state
-                .metrics
-                .time_bucket_full_rebuild_duration_seconds
-                .clone(),
-            time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
-            time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
-            time_bucket_backfilled_total: state.metrics.time_bucket_backfilled_total.clone(),
-            time_bucket_stale: state.metrics.time_bucket_stale.clone(),
-            time_bucket_missing: state.metrics.time_bucket_missing.clone(),
-            time_bucket_reconcile_apply_seconds: state
-                .metrics
-                .time_bucket_reconcile_apply_seconds
-                .clone(),
-            page1_divergence_total: state.metrics.cache_page1_divergence_total.clone(),
-            index_name: def.name.clone(),
-        });
+        engine.set_metrics_bridge(state.metrics.engine_bridge(def.name.clone()));
         // Install the cache-worker cycle-time histogram so the worker can
         // observe per cycle. OnceLock — first set wins; idempotent on retries.
         let _ = engine
@@ -2339,46 +2291,7 @@ async fn handle_create_index(
     }
 
     // Wire Prometheus metrics bridge into the engine's background threads.
-    engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
-        lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
-        compaction_total: state.metrics.compaction_total.clone(),
-        compaction_duration: state.metrics.compaction_duration_seconds.clone(),
-        query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
-        query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
-        query_op_set_zero_match_total: state.metrics.query_op_set_zero_match_total.clone(),
-        query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
-        deferred_fanout_scanned_total: state.metrics.deferred_fanout_scanned_total.clone(),
-        deferred_fanout_reached_total: state.metrics.deferred_fanout_reached_total.clone(),
-        activation_verify_checked_total: state.metrics.activation_verify_checked_total.clone(),
-        activation_verify_redriven_total: state.metrics.activation_verify_redriven_total.clone(),
-            activation_verify_publish_lag_total: state.metrics.activation_verify_publish_lag_total.clone(),
-            activation_verify_inconclusive_total: state.metrics.activation_verify_inconclusive_total.clone(),
-        wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
-        bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
-        query_total: state.metrics.query_total.clone(),
-        timebucket_dropped_no_sort_field_total: state
-            .metrics
-            .timebucket_dropped_no_sort_field_total
-            .clone(),
-        timebucket_dropped_capacity_exceeded_total: state
-            .metrics
-            .timebucket_dropped_capacity_exceeded_total
-            .clone(),
-        timebucket_applied_not_bucketed_total: state
-            .metrics
-            .timebucket_applied_not_bucketed_total
-            .clone(),
-        timebucket_anomalous_ts_total: state.metrics.timebucket_anomalous_ts_total.clone(),
-        time_bucket_full_rebuild_duration_seconds: state.metrics.time_bucket_full_rebuild_duration_seconds.clone(),
-        time_bucket_full_rebuild_total: state.metrics.time_bucket_full_rebuild_total.clone(),
-        time_bucket_pruned_total: state.metrics.time_bucket_pruned_total.clone(),
-        time_bucket_backfilled_total: state.metrics.time_bucket_backfilled_total.clone(),
-        time_bucket_stale: state.metrics.time_bucket_stale.clone(),
-        time_bucket_missing: state.metrics.time_bucket_missing.clone(),
-        time_bucket_reconcile_apply_seconds: state.metrics.time_bucket_reconcile_apply_seconds.clone(),
-        page1_divergence_total: state.metrics.cache_page1_divergence_total.clone(),
-        index_name: definition.name.clone(),
-    });
+    engine.set_metrics_bridge(state.metrics.engine_bridge(definition.name.clone()));
 
     let schema_registry = engine.build_schema_registry();
 
