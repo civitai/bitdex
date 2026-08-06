@@ -113,6 +113,9 @@ pub struct MetricsBridge {
     /// cache is serving a stale top-of-feed for some bucket entry. Labels: index,
     /// sort_field.
     pub page1_divergence_total: prometheus::IntCounterVec,
+    /// Canary liveness: incremented for every sampled first-page check,
+    /// diverged or not. Zero rate under traffic = canary is off.
+    pub page1_canary_samples_total: prometheus::IntCounterVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -7049,6 +7052,20 @@ impl ConcurrentEngine {
                             let seq = self.page1_canary_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             let period = ((1.0 / canary_rate).round() as u64).max(1);
                             if seq % period == 0 {
+                                // Liveness signal: count every sample, diverged or
+                                // not, so a quiet divergence counter is provably
+                                // "canary ran and found nothing" rather than
+                                // "canary disabled" (sample rate defaults to 0.0
+                                // and resets on restart unless seeded in config).
+                                #[cfg(feature = "server")]
+                                {
+                                    let bridge = self.metrics_bridge.load();
+                                    if let Some(ref b) = **bridge {
+                                        b.page1_canary_samples_total
+                                            .with_label_values(&[&b.index_name])
+                                            .inc();
+                                    }
+                                }
                                 self.page1_divergence_canary(
                                     &executor,
                                     &ukey,
