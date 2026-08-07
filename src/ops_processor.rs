@@ -788,6 +788,46 @@ fn get_deferred_timestamp(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
     }
     None
 }
+/// Extract a FUTURE schedule timestamp carried by ops on the deferred source
+/// field — from a `Set` OR a value-bearing `Remove`.
+///
+/// The sync triggers' future-publishedAt guard (#335) emits
+/// `{op: remove, field: publishedAt, value: <future ts>}` for scheduled posts:
+/// the REMOVE hides the entity now, and the VALUE is the publish time. Before
+/// this helper existed, that remove read as an unschedule — a deferred slot was
+/// dropped from the deferred map and activated as a draft (destroying its Tf
+/// activation), and a not-alive slot was memoized as deleted. A future-valued
+/// remove is a RESCHEDULE, and the value says when.
+///
+/// Deliberately future-only: a past-valued remove is a genuine unpublish and
+/// keeps unschedule semantics; a past-valued set is a publish and is handled by
+/// `get_deferred_timestamp`. Returns the LAST matching op's timestamp (LIFO,
+/// matching dedup semantics).
+fn get_future_schedule(meta: &FieldMeta, ops: &[Op], now_secs: u64) -> Option<u64> {
+    let (ref da_field, ms_to_secs) = *meta.deferred_alive_field.as_ref()?;
+    let mut found = None;
+    for op in ops {
+        let (field, value) = match op {
+            Op::Set { field, value } => (field, value),
+            Op::Remove { field, value } => (field, value),
+            _ => continue,
+        };
+        if field != &da_field.to_string() {
+            continue;
+        }
+        if let Some(ts) = value.as_i64() {
+            let secs = if ms_to_secs { ts / 1000 } else { ts };
+            if secs > 0 && secs as u64 > now_secs {
+                found = Some(secs as u64);
+            } else {
+                found = None;
+            }
+        } else {
+            found = None; // null / non-numeric — an unschedule spelling
+        }
+    }
+    found
+}
 /// Process a batch of entity ops, translating them into BitmapSink calls
 /// and optionally writing field values to the docstore via DocWriter.
 ///
@@ -967,13 +1007,33 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     // the activation — schedule_alive dedupes the old key, and
                     // a now-past timestamp activates on the next flush cycle.
                     if eng.is_slot_deferred(slot) {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let future_sched = get_future_schedule(meta, &entry.ops, now_secs);
+                        let da_field_name = meta
+                            .deferred_alive_field
+                            .as_ref()
+                            .map(|(f, _)| f.to_string())
+                            .unwrap_or_default();
                         if let Some(ref mut dw) = doc_writer {
                             for op in &entry.ops {
                                 match op {
                                     Op::Set { field, value } => dw.write_set(slot, field, value),
                                     Op::Add { field, value } => dw.write_add(slot, field, value),
                                     Op::Remove { field, value } => {
-                                        dw.write_remove(slot, field, value)
+                                        // A future-guarded remove of the schedule field
+                                        // carries the publish time as its value — store
+                                        // the SCHEDULE, not the removal, so activation
+                                        // at Tf replays a correct publishedAt (the slot
+                                        // is not alive, so the doc value is invisible
+                                        // until then).
+                                        if future_sched.is_some() && *field == da_field_name {
+                                            dw.write_set(slot, field, value)
+                                        } else {
+                                            dw.write_remove(slot, field, value)
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -998,6 +1058,16 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             sink.deferred_alive(slot, new_at);
                             tracing::info!(
                                 "ops processor: rescheduled deferred slot {slot} to {new_at}"
+                            );
+                        } else if let Some(new_at) = future_sched {
+                            // Future-guarded REMOVE (#335 trigger guard): the value
+                            // is the publish time. Reschedule, do NOT unschedule —
+                            // treating this as an unschedule is what drained
+                            // bitdex-1's deferred map (2026-08-07 incident).
+                            sink.deferred_alive(slot, new_at);
+                            tracing::info!(
+                                "ops processor: rescheduled deferred slot {slot} to {new_at} \
+                                 (future-guarded remove)"
                             );
                         } else if modifies_schedule {
                             // Unschedule (publishedAt → null/removed): the entity
@@ -1029,6 +1099,61 @@ pub fn apply_ops_batch<S: BitmapSink>(
                              (entity_id={entity_id}, beyond slot_counter={})",
                             eng.slot_counter()
                         );
+                    } else if let Some(arm_at) = get_future_schedule(
+                        meta,
+                        &entry.ops,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ) {
+                        // Not alive, NOT in the deferred map, but the ops carry a
+                        // FUTURE schedule (a set, or #335's future-guarded remove
+                        // whose value is the publish time). This is a scheduled
+                        // slot whose deferred entry was lost (the 2026-08-07
+                        // drained-map class: unschedule-on-remove emptied the map,
+                        // then these slots memoized as confirmed-deleted and every
+                        // later op was dropped — no activation path at Tf). Re-arm
+                        // the schedule and persist the fields for activation replay.
+                        //
+                        // This check MUST precede the confirmed-deleted memo: a
+                        // drained scheduled slot is indistinguishable from a
+                        // deleted one by doc-presence alone — the future timestamp
+                        // in the op stream is the discriminator. A PG-deleted image
+                        // cannot reach here: the fan-out and re-emit queries join
+                        // live "Image" rows, so ops for deleted rows are never
+                        // emitted.
+                        let da_field_name = meta
+                            .deferred_alive_field
+                            .as_ref()
+                            .map(|(f, _)| f.to_string())
+                            .unwrap_or_default();
+                        if let Some(ref mut dw) = doc_writer {
+                            for op in &entry.ops {
+                                match op {
+                                    Op::Set { field, value } => dw.write_set(slot, field, value),
+                                    Op::Add { field, value } => dw.write_add(slot, field, value),
+                                    Op::Remove { field, value } => {
+                                        // Store the schedule, not the removal — see the
+                                        // deferred branch above; activation at Tf then
+                                        // replays a correct publishedAt.
+                                        if *field == da_field_name {
+                                            dw.write_set(slot, field, value)
+                                        } else {
+                                            dw.write_remove(slot, field, value)
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        sink.deferred_alive(slot, arm_at);
+                        tracing::info!(
+                            "ops processor: armed deferred schedule for not-alive slot {slot} \
+                             at {arm_at} (drained-map re-arm)"
+                        );
+                        applied += 1;
+                        continue;
                     } else if is_confirmed_deleted(slot) {
                         // Memoized: this slot already proved doc-present
                         // (deleted). Skip without re-reading the docstore —
@@ -5230,6 +5355,177 @@ mod tests {
         assert!(
             (at as i64) <= now + 5,
             "activation must be scheduled at ~now (immediate), got {at}"
+        );
+    }
+
+    /// The #335 trigger guard emits `{op: remove, field: publishedAt,
+    /// value: <future ts>}` for scheduled posts. On a DEFERRED slot that is a
+    /// RESCHEDULE — the value is the publish time. Treating it as an
+    /// unschedule is what drained bitdex-1's deferred map (2026-08-07): every
+    /// fan-out/heal pass destroyed the Tf activation of the whole scheduled
+    /// population.
+    #[test]
+    fn test_deferred_slot_future_valued_remove_reschedules() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 81;
+        let now = unit_now_secs() as i64;
+        let t1 = now + 3_600;
+        let t2 = now + 7_200; // the future value carried on the remove
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(t1) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Remove { field: "publishedAt".into(), value: json!(t2) }],
+        }];
+        let (applied2, skipped2, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!((applied2, skipped2, errors2), (1, 0, 0));
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, t2 as u64)],
+            "future-valued remove must RESCHEDULE at the carried timestamp, not unschedule"
+        );
+        assert!(
+            rec.alive_inserts.is_empty(),
+            "no draft activation — the slot stays deferred until t2"
+        );
+        // The schedule is stored INTO the doc (as a set) so activation at Tf
+        // replays a correct publishedAt without waiting for a re-emit.
+        let doc = engine.get_document(slot).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("publishedAt"),
+            Some(&crate::mutation::FieldValue::Single(crate::types::Value::Integer(t2))),
+            "doc must carry the rescheduled publish time for activation replay"
+        );
+    }
+
+    /// A PAST-valued remove is a genuine unpublish and must keep the existing
+    /// unschedule-and-activate-as-draft semantics.
+    #[test]
+    fn test_deferred_slot_past_valued_remove_still_unschedules() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 82;
+        let now = unit_now_secs() as i64;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(now + 3_600) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+        wait_for_deferred(&engine, slot, 2_000);
+
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![Op::Remove { field: "publishedAt".into(), value: json!(now - 50) }],
+        }];
+        let (applied2, _, _) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!(applied2, 1);
+        assert_eq!(rec.deferred_alive.len(), 1, "unpublish must activate as draft");
+        let (s, at) = rec.deferred_alive[0];
+        assert_eq!(s, slot);
+        assert!((at as i64) <= now + 5, "activation must be immediate, got {at}");
+    }
+
+    /// The drained-map class (2026-08-07): a slot that is not alive, NOT in
+    /// the deferred map, but has a stored doc — previously memoized as
+    /// confirmed-deleted, silently dropping every op forever, leaving the
+    /// image with no activation path at Tf. A future schedule carried by the
+    /// ops (here the #335 future-guarded remove) must RE-ARM it instead.
+    #[test]
+    fn test_notalive_nondeferred_future_remove_arms_schedule() {
+        let engine = ConcurrentEngine::new(safety_net_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let now = unit_now_secs() as i64;
+        let tf = now + 86_400;
+
+        // Raise the high-water mark past the victim slot with a normal insert.
+        let hwm_slot: u32 = 90;
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: hwm_slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "existedAt".into(), value: json!(now - 100) },
+                Op::Set { field: "publishedAt".into(), value: json!(now - 100) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        sink.flush().unwrap();
+        dw.flush();
+
+        // Manufacture the drained state for slot 85: stored doc, below HWM,
+        // not alive, not deferred (doc written directly, never registered).
+        let victim: u32 = 85;
+        let mut dw_direct = DocWriter::new(engine.docstore_arc());
+        dw_direct.write_set(victim, "existedAt", &json!(now - 1_000));
+        dw_direct.write_set(victim, "publishedAt", &json!(tf));
+        dw_direct.flush();
+        assert!(!engine.is_slot_deferred(victim));
+        assert!(!engine.is_slot_alive(victim));
+
+        // A sweep/fan-out pass arrives: future-guarded remove + sortAt set.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: victim as i64,
+            creates_slot: false,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(tf) },
+                Op::Set { field: "existedAt".into(), value: json!(now - 1_000) },
+            ],
+        }];
+        let (applied2, skipped2, errors2) =
+            apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+        assert_eq!(
+            (applied2, skipped2, errors2),
+            (1, 0, 0),
+            "the drained slot must be re-armed, not skipped as confirmed-deleted"
+        );
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(victim, tf as u64)],
+            "arming must schedule activation at the carried publish time"
+        );
+        // Doc keeps the schedule for the eventual activation replay.
+        let doc = engine.get_document(victim).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("publishedAt"),
+            Some(&crate::mutation::FieldValue::Single(crate::types::Value::Integer(tf))),
         );
     }
 
