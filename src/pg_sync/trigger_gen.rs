@@ -932,40 +932,65 @@ fn generate_fan_out_per_row_body(source: &SyncSource, rows: &RowsFrom) -> String
         let (field_name, _insert_expr, template_expr) = parse_track_field(f);
         let old_expr = substitute_columns(&template_expr, "OLD");
         let new_expr = substitute_columns(&template_expr, "NEW");
-        // The OLD-side is always a `remove` (clears the prior value). The
-        // NEW-side is guarded ONLY for publishedAt: a future/null NEW value
-        // produces a `remove`, not a `set`, so an alive image being SCHEDULED
-        // (or unpublished) stays hidden rather than jumping to feed top with a
-        // future sortAt. See FUTURE_GUARDED_FIELD. Non-guarded fields keep the
-        // plain `set` new-side, byte-for-byte as before.
-        let new_side = if field_name == FUTURE_GUARDED_FIELD {
-            format!(
-                "        CASE WHEN NEW.\"{field}\" IS NULL OR NEW.\"{field}\" > now()\n\
-                 \x20         THEN jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({new}))\n\
-                 \x20         ELSE jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
-                 \x20       END",
-                field = field_name,
+        // Non-guarded fields emit `remove(OLD) + set(NEW)`. publishedAt is
+        // guarded: a future/null NEW value produces a `remove`, not a `set`, so
+        // an alive image being SCHEDULED (or unpublished) stays hidden rather
+        // than jumping to feed top with a future sortAt — and in that case the
+        // row emits that remove ALONE. See FUTURE_GUARDED_FIELD and the comment
+        // on the guarded branch below.
+        if field_name == FUTURE_GUARDED_FIELD {
+            // ONE op per row when the new value is future/null — no old-side
+            // remove to disagree with it.
+            //
+            // The ordinary shape below is `remove(OLD) + set(NEW)`, which dedup
+            // resolves deterministically: a Remove on a field that also carries
+            // a Set is routed to scalar last-wins. The guarded field breaks that
+            // pairing exactly when it matters. A schedule/reschedule/unschedule
+            // turns the new side into a `remove` too, so the row carries TWO
+            // value-bearing removes and NO set — and dedup classifies removes on
+            // a Set-less field as MULTI-VALUE ops (op_dedup.rs), keeping both and
+            // re-emitting them in AHashMap order. The engine's schedule reader is
+            // last-op-wins, so the arm it takes is a coin flip: the old arm
+            // publishes the content at the abandoned schedule (visible early),
+            // the losing arm strips the schedule entirely (published content
+            // stuck invisible). Both were live user-visible bugs; the two-remove
+            // row was captured in "BitdexOps" on 2026-08-18 carrying null and a
+            // future timestamp for the same image.
+            //
+            // Emitting only the guarded remove leaves nothing to order. Its VALUE
+            // is the schedule the engine arms at, and it is the sole publishedAt
+            // op for the row. The already-past case keeps remove(OLD)+set(NEW)
+            // byte-for-byte: that is a publish, the Set makes the pair
+            // unambiguous, and the bitmap cleanup still needs the old value.
+            body.push_str(&format!(
+                "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+                 \x20     _ops := _ops || CASE WHEN NEW.\"{field}\" IS NULL OR NEW.\"{field}\" > now()\n\
+                 \x20       THEN jsonb_build_array(\n\
+                 \x20         jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20       )\n\
+                 \x20       ELSE jsonb_build_array(\n\
+                 \x20         jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+                 \x20         jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20       )\n\
+                 \x20     END;\n\
+                 \x20   END IF;\n",
+                old = old_expr,
                 new = new_expr,
-            )
+                field = field_name,
+            ));
         } else {
-            format!(
-                "        jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))",
-                field = field_name,
+            body.push_str(&format!(
+                "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+                 \x20     _ops := _ops || jsonb_build_array(\n\
+                 \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+                 \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20     );\n\
+                 \x20   END IF;\n",
+                old = old_expr,
                 new = new_expr,
-            )
-        };
-        body.push_str(&format!(
-            "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
-             \x20     _ops := _ops || jsonb_build_array(\n\
-             \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
-             {new_side}\n\
-             \x20     );\n\
-             \x20   END IF;\n",
-            old = old_expr,
-            new = new_expr,
-            field = field_name,
-            new_side = new_side,
-        ));
+                field = field_name,
+            ));
+        }
     }
     body.push_str("    IF jsonb_array_length(_ops) > 0 THEN\n");
     body.push_str(&format!(
@@ -1605,16 +1630,110 @@ extract(epoch from {createdAt})::bigint)) as sortAt";
             trigger_sql.contains(r#"CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()"#),
             "UPDATE new-side publishedAt must be guarded on NULL/future:\n{trigger_sql}"
         );
-        // The OLD-side remove is always emitted; the guarded NEW-side supplies
-        // the remove/set. A future NEW value therefore yields remove(old)+remove(new).
+        // The already-past (publish) case still emits remove(OLD) + set(NEW).
         assert!(
-            trigger_sql.contains(r#"'op', 'remove', 'field', 'publishedAt'"#),
-            "UPDATE must still remove the OLD publishedAt value:\n{trigger_sql}"
+            trigger_sql.contains(&format!(
+                "jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', \
+                 to_jsonb({}))",
+                r#"extract(epoch from OLD."publishedAt")::bigint"#
+            )),
+            "the publish arm must still remove the OLD publishedAt value:\n{trigger_sql}"
         );
         // availability's UPDATE new-side is NOT guarded.
         assert!(
             !trigger_sql.contains(r#"CASE WHEN NEW."availability""#),
             "only publishedAt may be guarded on the UPDATE new-side:\n{trigger_sql}"
+        );
+    }
+
+    /// ROOT-CAUSE GUARD (2026-08-18): a schedule/reschedule/unschedule must emit
+    /// exactly ONE publishedAt op for the row.
+    ///
+    /// When the new value is future/null the guarded new-side is a `remove`. If
+    /// the row ALSO carried the old-side remove, the row would hold two
+    /// value-bearing removes on one field with no Set — the shape `op_dedup`
+    /// classifies as multi-value, keeps both of, and re-emits in AHashMap order.
+    /// The engine's schedule reader is last-op-wins, so the arm was chosen by
+    /// hash order: one arm publishes at the abandoned schedule (content visible
+    /// early), the other strips the schedule (published content stuck invisible).
+    /// Captured live in "BitdexOps": one row, `remove publishedAt null` and
+    /// `remove publishedAt 1787029800`, same image.
+    ///
+    /// The publish arm (already-past value) keeps the ordinary
+    /// `remove(OLD) + set(NEW)` pair — the Set makes it unambiguous.
+    #[test]
+    fn test_fan_out_publishedat_schedule_emits_single_op() {
+        let trigger_sql = generate_trigger_sql(&post_fan_out_per_row_source());
+
+        let old_remove = format!(
+            "jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb({}))",
+            r#"extract(epoch from OLD."publishedAt")::bigint"#
+        );
+        let new_remove = format!(
+            "jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb({}))",
+            r#"extract(epoch from NEW."publishedAt")::bigint"#
+        );
+        let new_set = format!(
+            "jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb({}))",
+            r#"extract(epoch from NEW."publishedAt")::bigint"#
+        );
+
+        // Split the guarded CASE into its two arms. THEN = future/null
+        // (schedule), ELSE = already-past (publish).
+        let case_start = trigger_sql
+            .find(r#"CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()"#)
+            .unwrap_or_else(|| panic!("guarded CASE missing:\n{trigger_sql}"));
+        let case_body = &trigger_sql[case_start..];
+        let else_at = case_body
+            .find("ELSE")
+            .unwrap_or_else(|| panic!("guarded CASE has no ELSE arm:\n{case_body}"));
+        let end_at = case_body
+            .find("END;")
+            .unwrap_or_else(|| panic!("guarded CASE is unterminated:\n{case_body}"));
+        let then_arm = &case_body[..else_at];
+        let else_arm = &case_body[else_at..end_at];
+
+        // --- schedule arm: exactly one op, and it is the NEW-valued remove ---
+        assert!(
+            then_arm.contains(&new_remove),
+            "schedule arm must carry the NEW value (the publish time the engine \
+             arms at):\n{then_arm}"
+        );
+        assert!(
+            !then_arm.contains(&old_remove),
+            "schedule arm must NOT also emit the old-side remove — two \
+             value-bearing removes on one Set-less field are resolved by hash \
+             order, which is the 2026-08-18 root cause:\n{then_arm}"
+        );
+        assert_eq!(
+            then_arm.matches("jsonb_build_object('op'").count(),
+            1,
+            "schedule arm must emit exactly ONE publishedAt op:\n{then_arm}"
+        );
+
+        // --- publish arm: unchanged remove(OLD) + set(NEW) pair ---
+        assert!(
+            else_arm.contains(&old_remove) && else_arm.contains(&new_set),
+            "publish arm must keep remove(OLD) + set(NEW):\n{else_arm}"
+        );
+        assert_eq!(
+            else_arm.matches("jsonb_build_object('op'").count(),
+            2,
+            "publish arm must emit exactly those two ops:\n{else_arm}"
+        );
+
+        // The guarded field's ops are inside the CASE, never alongside it: no
+        // publishedAt op may be emitted unconditionally by the UPDATE branch.
+        let update_at = trigger_sql
+            .find("ELSIF TG_OP = 'UPDATE' THEN")
+            .unwrap_or_else(|| panic!("no UPDATE branch:\n{trigger_sql}"));
+        let update_branch = &trigger_sql[update_at..];
+        assert_eq!(
+            update_branch.matches("'field', 'publishedAt'").count(),
+            3,
+            "UPDATE branch must contain exactly the three guarded publishedAt \
+             ops (1 schedule arm + 2 publish arm) and nothing outside the \
+             CASE:\n{update_branch}"
         );
     }
 
