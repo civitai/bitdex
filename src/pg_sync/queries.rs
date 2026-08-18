@@ -268,12 +268,156 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+"#;
 
+/// The `bitdex_cursors` cleanup trigger, separated from [`SETUP_V2_SQL`].
+///
+/// `DROP TRIGGER` needs an AccessExclusiveLock on `bitdex_cursors`, and every
+/// replica's ops poller writes to that table continuously — each write firing
+/// this very trigger. A pod restarting while its sibling is healthy therefore
+/// competes for the lock against a steady stream of short writes, and the
+/// `bitdex` role carries a `lock_timeout`. Observed 2026-08-18: bitdex-1 lost
+/// that race eight times in a row and crash-looped, because setup ran this DDL
+/// unconditionally at every boot even though the trigger was already installed
+/// and correct. The pod that *did* install it only won because both pods were
+/// down at the time and nothing was writing.
+///
+/// So this is run only when the trigger is missing or differs — see
+/// [`cleanup_trigger_is_current`].
+pub const CLEANUP_TRIGGER_DDL: &str = r#"
 DROP TRIGGER IF EXISTS trg_cleanup_bitdex_ops ON bitdex_cursors;
 CREATE TRIGGER trg_cleanup_bitdex_ops
     AFTER INSERT OR UPDATE ON bitdex_cursors
     FOR EACH ROW EXECUTE FUNCTION cleanup_bitdex_ops();
 "#;
+
+/// `pg_trigger.tgtype` for `AFTER INSERT OR UPDATE ... FOR EACH ROW`:
+/// ROW (1) | INSERT (4) | UPDATE (16).
+const CLEANUP_TRIGGER_TGTYPE: i16 = 1 | 4 | 16;
+
+/// How long to wait for a table lock when trigger DDL genuinely has to run.
+///
+/// The role-level `lock_timeout` is deliberately short so ordinary queries fail
+/// fast rather than pile up behind a stuck lock. DDL is the one case that wants
+/// to *queue*: it runs rarely, it is a one-shot cost at boot, and failing it
+/// takes the whole sidecar down. `SET LOCAL` scopes the longer timeout to the
+/// DDL transaction only.
+const DDL_LOCK_TIMEOUT: &str = "30s";
+
+/// How many times to retry a piece of trigger DDL that lost its lock race.
+const DDL_LOCK_ATTEMPTS: u32 = 3;
+
+/// Is a trigger already installed exactly as we would install it?
+///
+/// Compares against the catalog rather than re-issuing the DDL, so the common
+/// case — a pod restarting against a database that is already set up — costs one
+/// indexed catalog read instead of an AccessExclusiveLock on a hot table.
+///
+/// Checks the trigger's name, table, firing events (`tgtype`) and the function
+/// it calls. `tgenabled` must be `'A'` (ENABLE ALWAYS): a trigger left at the
+/// default `'O'` would not fire on a replica, so that difference has to count as
+/// "not current" even though the trigger exists.
+///
+/// Returns `Ok(false)` when anything differs or nothing is installed. A catalog
+/// read that itself errors propagates — we would rather fail loudly than skip
+/// DDL on the strength of a failed check.
+async fn trigger_matches(
+    pool: &PgPool,
+    table: &str,
+    trigger: &str,
+    function: &str,
+    tgtype: i16,
+) -> Result<bool, String> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        r#"
+        SELECT (t.tgtype = $4 AND t.tgenabled = 'A' AND p.proname = $3)
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_proc p ON p.oid = t.tgfoid
+        WHERE c.relname = $1 AND t.tgname = $2 AND NOT t.tgisinternal
+          -- pg_table_is_visible restricts the match to the table the unqualified
+          -- DDL would target, so a same-named table in another schema cannot
+          -- make us skip DDL we actually needed to run.
+          AND pg_table_is_visible(c.oid)
+        "#,
+    )
+    .bind(table)
+    .bind(trigger)
+    .bind(function)
+    .bind(tgtype)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to inspect trigger {trigger} on {table}: {e}"))?;
+
+    Ok(row.map(|(matches,)| matches).unwrap_or(false))
+}
+
+/// [`trigger_matches`] for the `bitdex_cursors` cleanup trigger.
+async fn cleanup_trigger_is_current(pool: &PgPool) -> Result<bool, String> {
+    trigger_matches(
+        pool,
+        "bitdex_cursors",
+        "trg_cleanup_bitdex_ops",
+        "cleanup_bitdex_ops",
+        CLEANUP_TRIGGER_TGTYPE,
+    )
+    .await
+}
+
+/// Run one piece of trigger DDL with a longer lock timeout, retrying if it
+/// loses the lock race.
+///
+/// PostgreSQL reports a lock timeout as SQLSTATE 55P03 (`lock_not_available`).
+/// That is the only error worth retrying: it means "somebody else held the
+/// table", which is transient by nature. Anything else — a syntax error, a
+/// missing table, a permissions problem — will fail identically on the next
+/// attempt, so it returns immediately.
+async fn run_ddl_with_lock_retry(pool: &PgPool, label: &str, sql: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+
+    for attempt in 1..=DDL_LOCK_ATTEMPTS {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("Failed to begin transaction for {label}: {e}"))?;
+
+        // SET LOCAL: scoped to this transaction, reverts on commit or rollback.
+        if let Err(e) = sqlx::raw_sql(&format!("SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+            .execute(&mut *tx)
+            .await
+        {
+            return Err(format!("Failed to set lock_timeout for {label}: {e}"));
+        }
+
+        match sqlx::raw_sql(sql).execute(&mut *tx).await {
+            Ok(_) => {
+                return tx
+                    .commit()
+                    .await
+                    .map_err(|e| format!("Failed to commit {label}: {e}"));
+            }
+            Err(e) => {
+                let lock_timeout = e
+                    .as_database_error()
+                    .and_then(|db| db.code())
+                    .is_some_and(|code| code == "55P03");
+                last_err = e.to_string();
+                let _ = tx.rollback().await;
+
+                if !lock_timeout {
+                    return Err(format!("{label} failed: {last_err}"));
+                }
+                eprintln!(
+                    "WARNING: {label} lost the lock race (attempt {attempt}/{DDL_LOCK_ATTEMPTS})"
+                );
+            }
+        }
+    }
+
+    Err(format!(
+        "{label} failed after {DDL_LOCK_ATTEMPTS} attempts waiting up to {DDL_LOCK_TIMEOUT} for the table lock: {last_err}"
+    ))
+}
 
 /// Run V2 setup: create BitdexOps + cursors tables, then reconcile triggers
 /// from the sync config. Generates trigger SQL from `trigger_gen`, drops
@@ -282,26 +426,50 @@ pub async fn run_setup_v2(
     pool: &PgPool,
     triggers: &[super::trigger_gen::SyncSource],
 ) -> Result<(), String> {
-    // 1. Create tables
+    // 1. Create tables and the cleanup function. Everything in SETUP_V2_SQL is
+    //    either `IF NOT EXISTS` or `CREATE OR REPLACE FUNCTION`, so it takes no
+    //    lock on a table anyone is writing to and is safe to re-run at boot.
     sqlx::raw_sql(SETUP_V2_SQL)
         .execute(pool)
         .await
         .map_err(|e| format!("Failed to create V2 tables: {e}"))?;
     eprintln!("Created BitdexOps + bitdex_cursors tables");
 
-    // 2. Generate expected trigger names from config
-    let expected_triggers: Vec<(String, String)> = triggers
+    // 1b. The cleanup trigger is the one part that locks a hot table, so install
+    //     it only if it is missing or differs. See CLEANUP_TRIGGER_DDL.
+    if cleanup_trigger_is_current(pool).await? {
+        eprintln!("Cleanup trigger already current — skipping DDL");
+    } else {
+        run_ddl_with_lock_retry(pool, "cleanup trigger DDL", CLEANUP_TRIGGER_DDL).await?;
+        eprintln!("Installed cleanup trigger on bitdex_cursors");
+    }
+
+    // 2. Generate the expected trigger set from config. Functions and trigger
+    //    DDL are kept apart: the functions are cheap to re-apply, the DDL is not.
+    struct Expected {
+        name: String,
+        table: String,
+        function: String,
+        tgtype: i16,
+        functions_sql: String,
+        ddl_sql: String,
+    }
+
+    let expected_triggers: Vec<Expected> = triggers
         .iter()
-        .map(|source| {
-            let name = super::trigger_gen::trigger_name(source);
-            let sql = super::trigger_gen::generate_trigger_sql(source);
-            (name, sql)
+        .map(|source| Expected {
+            name: super::trigger_gen::trigger_name(source),
+            table: source.table.clone(),
+            function: super::trigger_gen::trigger_function_name(source),
+            tgtype: super::trigger_gen::trigger_type_mask(source),
+            functions_sql: super::trigger_gen::generate_trigger_functions_sql(source),
+            ddl_sql: super::trigger_gen::generate_trigger_ddl_sql(source),
         })
         .collect();
 
     let expected_names: HashSet<&str> = expected_triggers
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|e| e.name.as_str())
         .collect();
 
     // 3. Find existing bitdex triggers
@@ -341,14 +509,47 @@ pub async fn run_setup_v2(
     // 5. Create/update triggers from config.
     // The bitdex user should have direct TRIGGER privilege on the tables
     // (via GRANT TRIGGER ON TABLE ... TO bitdex). No SET ROLE needed.
-    for (name, sql) in &expected_triggers {
-        match sqlx::raw_sql(sql).execute(pool).await {
-            Ok(_) => eprintln!("Created trigger: {name}"),
-            Err(e) => {
-                return Err(format!("Failed to create trigger {name}: {e}"));
-            }
+    //
+    // Two halves, deliberately. The function definitions go in every time: they
+    // lock only their own pg_proc row, and re-applying them is how a changed
+    // trigger body reaches the database. The trigger DDL takes an
+    // AccessExclusiveLock on the source table — `Image`, `Post` and friends,
+    // under continuous write traffic — so it runs only when the installed
+    // trigger does not already match. On an ordinary restart that means zero
+    // table locks, which is the whole point: the DDL cannot fail if it does not
+    // run.
+    let mut installed = 0usize;
+    for expected in &expected_triggers {
+        sqlx::raw_sql(&expected.functions_sql)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to create function for trigger {}: {e}", expected.name))?;
+
+        if trigger_matches(
+            pool,
+            &expected.table,
+            &expected.name,
+            &expected.function,
+            expected.tgtype,
+        )
+        .await?
+        {
+            continue;
         }
+
+        run_ddl_with_lock_retry(
+            pool,
+            &format!("trigger {} on {}", expected.name, expected.table),
+            &expected.ddl_sql,
+        )
+        .await?;
+        eprintln!("Created trigger: {}", expected.name);
+        installed += 1;
     }
+    eprintln!(
+        "Trigger DDL: {installed} installed, {} already current",
+        expected_triggers.len() - installed
+    );
 
     let existing_count = existing.len();
     let stale_count = existing.iter()
