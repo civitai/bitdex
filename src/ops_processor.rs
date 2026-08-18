@@ -812,7 +812,7 @@ fn get_future_schedule(meta: &FieldMeta, ops: &[Op], now_secs: u64) -> Option<u6
             Op::Remove { field, value } => (field, value),
             _ => continue,
         };
-        if field != &da_field.to_string() {
+        if field != da_field {
             continue;
         }
         if let Some(ts) = value.as_i64() {
@@ -3925,6 +3925,121 @@ mod tests {
             "the doc must keep the schedule — activation replays this doc, and a \
              doc with publishedAt stripped activates as a draft that never publishes"
         );
+    }
+
+    /// The old-side remove is what clears the previous timestamp out of the
+    /// sort layers on an ALIVE slot.
+    ///
+    /// `process_remove_op` clears sort bits derived from the VALUE it is handed,
+    /// not "the field", and `publishedAt` is a 32-bit sort field. So a schedule
+    /// arriving as `remove(OLD) + remove(NEW future)` needs BOTH: the new-valued
+    /// remove tells the engine the schedule, the old-valued one clears the bits.
+    /// An emission that dropped the old side left `OLD & ~NEW` resident in the
+    /// layer — and on an unpublish (new value null, no bits to clear) left the
+    /// old timestamp resident in full, with no later Set to heal it.
+    ///
+    /// This is the alive-slot half of the guarded field, which the deferred
+    /// tests above cannot see: deferred slots take a doc-only path and write no
+    /// bitmaps at all.
+    #[test]
+    fn test_alive_slot_reschedule_clears_old_sort_bits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 11;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let old_past = now - 86_400; // published yesterday — alive, visible
+        let new_future = now + 7_200; // rescheduled forward
+
+        // Insert ALIVE (past publishedAt ⇒ no deferral).
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(500) },
+                Op::Set { field: "existedAt".into(), value: json!(old_past) },
+                Op::Set { field: "publishedAt".into(), value: json!(old_past) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        engine.force_publish_blocking(std::time::Duration::from_secs(5));
+        assert!(engine.is_slot_alive(slot), "setup: slot must be alive");
+        assert!(!engine.is_slot_deferred(slot), "setup: slot must not be deferred");
+
+        // The reschedule as the trigger emits it: old-side remove, then the
+        // guarded new-side remove carrying the schedule.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(old_past) },
+                Op::Remove { field: "publishedAt".into(), value: json!(new_future) },
+            ],
+        }];
+        apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+
+        // Assert only on bits the OLD value has and the NEW one does not.
+        //
+        // Asserting on every old bit would pass for the wrong reason: two
+        // timestamps hours apart share almost all of their high bits, so the
+        // new-valued remove alone clears most of them. Only the difference
+        // isolates the old-side remove's contribution — dropping it must turn
+        // this red, and with the full old-bit set it does not.
+        let old_only_bits: Vec<usize> = (0..32)
+            .filter(|b| (old_past as u32 >> b) & 1 == 1 && (new_future as u32 >> b) & 1 == 0)
+            .collect();
+        assert!(
+            !old_only_bits.is_empty(),
+            "sanity: the two timestamps must differ in at least one bit the OLD \
+             value sets — otherwise this test asserts nothing. old={old_past} \
+             new={new_future}"
+        );
+        for bit in old_only_bits {
+            assert!(
+                rec.sort_clears
+                    .iter()
+                    .any(|(f, b, s)| f == "publishedAt" && *b == bit && *s == slot),
+                "bit {bit} belongs to the old publishedAt alone and was never \
+                 cleared — the layer keeps part of a stale timestamp. \
+                 clears: {:?}",
+                rec.sort_clears
+            );
+        }
+        // The future timestamp is never written INTO the layers — a reschedule
+        // clears, it never sets forward.
+        let future_bits: Vec<usize> = (0..32)
+            .filter(|b| (new_future as u32 >> b) & 1 == 1)
+            .collect();
+        for bit in future_bits {
+            assert!(
+                !rec.sort_sets.iter().any(|(f, b, s)| {
+                    f == "publishedAt" && *b == bit && *s == slot && {
+                        // The 2026-07-03 activation safety net re-asserts the
+                        // layer from the STORED doc further down the same batch
+                        // (see recompute_computed_sorts_for_slot) — and the doc
+                        // still holds the OLD value there, because this batch's
+                        // doc writes are buffered until flush. Those sets are
+                        // the old timestamp's bits, not the future one's; only
+                        // bits unique to the future value prove a forward write.
+                        (old_past as u32 >> bit) & 1 == 0
+                    }
+                }),
+                "bit {bit} is set only in the FUTURE timestamp and was written \
+                 into the sort layer — a reschedule must never write forward. \
+                 sets: {:?}",
+                rec.sort_sets
+            );
+        }
     }
 
     /// (c) A NON-publish fan-out (touches no deferred source field) must NOT

@@ -39,26 +39,33 @@ CREATE TABLE IF NOT EXISTS bitdex_cursors (
 -- document state. The floor keeps a bounded window of consumed ops readable.
 -- At the measured ~117 rows/s that is ~105k rows resident for 15 minutes.
 --
--- Deliberately NO index on created_at. This trigger fires on every cursor
--- report and the table takes ~117 inserts/s, so neither the extra write
--- amplification nor an unbounded scan is acceptable. Instead the DELETE walks
--- the PRIMARY KEY forward from the oldest row and stops after a bounded chunk:
--- ids are assigned in insert order, so "oldest by id" is "oldest by created_at",
--- and in steady state the first rows the scan meets are already past the floor.
--- Work per firing is capped at _chunk rows and is LESS than the previous
--- unbounded `DELETE ... WHERE id < MIN(cursor)`.
+-- Deliberately NO index on created_at: the table takes ~117 inserts/s and this
+-- trigger fires on every cursor report, so the write amplification of an index
+-- maintained for one lookup is not worth paying.
 --
--- The window is bounded by ID ARITHMETIC, not by a match count: `LIMIT n` on a
--- created_at predicate would, once the floor has caught up, walk every retained
--- row looking for matches it will not find. An id window of fixed width cannot.
+-- Instead this exploits the monotonicity the retention window already relies
+-- on: `id` is a BIGSERIAL assigned in insert order, so the PRIMARY KEY already
+-- orders rows by age and `created_at` only ever needs to be a filter. The
+-- function first walks the PK forward from the oldest row to find the FIRST row
+-- that is still inside the window, then deletes strictly below that id. In
+-- steady state that probe stops after the handful of rows that have just
+-- crossed the floor.
 --
--- Chunk sizing: at ~117 rows/s a single firing of 5,000 covers ~43s of backlog,
--- and the trigger fires several times a second (once per replica poll), so the
--- floor keeps up with a wide margin and recovers from a stall.
+-- Cost, stated honestly: the previous `DELETE ... WHERE id < MIN(cursor)` was
+-- unbounded in FORM but in practice touched only the few rows that had newly
+-- become deletable, so this is NOT cheaper than what it replaces — it is the
+-- same order of work plus one bounded probe, in exchange for the window. The
+-- `_chunk` ceiling exists only so a stalled or restarted replica cannot turn
+-- the probe into a full scan; it is a safety bound, not the steady-state cost.
+--
+-- Deletion capacity is `_chunk` per firing × several firings/s against ~117
+-- rows/s of arrivals, so the floor keeps up with a wide margin and recovers
+-- from a stall.
 CREATE OR REPLACE FUNCTION cleanup_bitdex_ops() RETURNS trigger AS $$
 DECLARE
     _consumed_below BIGINT;
     _oldest BIGINT;
+    _floor BIGINT;
     _chunk BIGINT := 5000;
 BEGIN
     SELECT MIN(last_outbox_id) INTO _consumed_below FROM bitdex_cursors;
@@ -71,10 +78,21 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- First row still inside the retention window. LIMIT 1 here finds the first
+    -- NON-match, which sits at the front of the scan — unlike a LIMIT on the
+    -- matching rows, which would walk the whole retained window once the floor
+    -- has caught up and there is nothing left to find.
+    SELECT id INTO _floor
+    FROM "BitdexOps"
+    WHERE id >= _oldest
+      AND id < _oldest + _chunk
+      AND created_at >= now() - interval '15 minutes'
+    ORDER BY id
+    LIMIT 1;
+
     DELETE FROM "BitdexOps"
     WHERE id >= _oldest
-      AND id < LEAST(_consumed_below, _oldest + _chunk)
-      AND created_at < now() - interval '15 minutes';
+      AND id < LEAST(_consumed_below, COALESCE(_floor, _oldest + _chunk));
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -89,7 +107,7 @@ CREATE TRIGGER trg_cleanup_bitdex_ops
 -- Part 2: Per-table triggers (generated from sync config YAML)
 -- -----------------------------------------------------------------------
 
--- [1/8] Table: Image → Trigger: bitdex_image_dda29cf8
+-- [1/8] Table: Image → Trigger: bitdex_image_45edf6c8
 -- Sets alive: yes
 -- On delete: emit delete op
 
@@ -99,7 +117,7 @@ CREATE OR REPLACE FUNCTION bitdex_image_sortat_ops(_i "Image") RETURNS jsonb AS 
   );
 $$ LANGUAGE sql STABLE;
 
-CREATE OR REPLACE FUNCTION bitdex_image_ops_dda29cf8() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_image_ops_45edf6c8() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -226,7 +244,10 @@ BEGIN
     IF ((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = OLD."postId")) IS DISTINCT FROM ((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")) THEN
       _ops := _ops || jsonb_build_array(
         jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = OLD."postId"))),
-        jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")))
+        CASE WHEN COALESCE(((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")) > extract(epoch from now())::bigint, TRUE)
+          THEN jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")))
+          ELSE jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb((SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = NEW."postId")))
+        END
       );
     END IF;
     IF ((SELECT p."availability"::text FROM "Post" p WHERE p.id = OLD."postId")) IS DISTINCT FROM ((SELECT p."availability"::text FROM "Post" p WHERE p.id = NEW."postId")) THEN
@@ -255,10 +276,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_image_dda29cf8 ON "Image";
-CREATE TRIGGER bitdex_image_dda29cf8 AFTER INSERT OR UPDATE OR DELETE ON "Image"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_dda29cf8();
-ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_dda29cf8;
+DROP TRIGGER IF EXISTS bitdex_image_45edf6c8 ON "Image";
+CREATE TRIGGER bitdex_image_45edf6c8 AFTER INSERT OR UPDATE OR DELETE ON "Image"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_image_ops_45edf6c8();
+ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_45edf6c8;
 
 
 -- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_bcbef3c3
@@ -385,7 +406,7 @@ CREATE TRIGGER bitdex_imageresourcenew_d84d15a8 AFTER INSERT OR DELETE ON "Image
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_d84d15a8;
 
 
--- [6/8] Table: Post → Trigger: bitdex_post_c85c5a80
+-- [6/8] Table: Post → Trigger: bitdex_post_54f0a619
 -- Type: fan_out_per_row
 
 CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb AS $$
@@ -399,7 +420,7 @@ CREATE OR REPLACE FUNCTION bitdex_post_fanout_ops(_p "Post") RETURNS jsonb AS $$
   );
 $$ LANGUAGE sql STABLE;
 
-CREATE OR REPLACE FUNCTION bitdex_post_ops_c85c5a80() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_post_ops_54f0a619() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
@@ -411,15 +432,13 @@ BEGIN
   ELSIF TG_OP = 'UPDATE' THEN
     _ops := '[]'::jsonb;
     IF (extract(epoch from OLD."publishedAt")::bigint) IS DISTINCT FROM (extract(epoch from NEW."publishedAt")::bigint) THEN
-      _ops := _ops || CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()
-        THEN jsonb_build_array(
-          jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
-        )
-        ELSE jsonb_build_array(
-          jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from OLD."publishedAt")::bigint)),
-          jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
-        )
-      END;
+      _ops := _ops || jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from OLD."publishedAt")::bigint)),
+        CASE WHEN NEW."publishedAt" IS NULL OR NEW."publishedAt" > now()
+          THEN jsonb_build_object('op', 'remove', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
+          ELSE jsonb_build_object('op', 'set', 'field', 'publishedAt', 'value', to_jsonb(extract(epoch from NEW."publishedAt")::bigint))
+        END
+      );
     END IF;
     IF (OLD."availability"::text) IS DISTINCT FROM (NEW."availability"::text) THEN
       _ops := _ops || jsonb_build_array(
@@ -443,10 +462,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_post_c85c5a80 ON "Post";
-CREATE TRIGGER bitdex_post_c85c5a80 AFTER INSERT OR UPDATE ON "Post"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_c85c5a80();
-ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_c85c5a80;
+DROP TRIGGER IF EXISTS bitdex_post_54f0a619 ON "Post";
+CREATE TRIGGER bitdex_post_54f0a619 AFTER INSERT OR UPDATE ON "Post"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_54f0a619();
+ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_54f0a619;
 
 
 -- [7/8] Table: ModelVersion → Trigger: bitdex_modelversion_22dd59b3
@@ -543,12 +562,12 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_a13d0fe3;
 -- -----------------------------------------------------------------------
 -- Tables created: BitdexOps, bitdex_cursors
 -- Triggers: 8
---   bitdex_image_dda29cf8 on "Image"
+--   bitdex_image_45edf6c8 on "Image"
 --   bitdex_tagsonimagenew_bcbef3c3 on "TagsOnImageNew"
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
 --   bitdex_imageresourcenew_d84d15a8 on "ImageResourceNew"
---   bitdex_post_c85c5a80 on "Post"
+--   bitdex_post_54f0a619 on "Post"
 --   bitdex_modelversion_22dd59b3 on "ModelVersion"
 --   bitdex_model_a13d0fe3 on "Model"
 --

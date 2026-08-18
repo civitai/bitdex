@@ -23,7 +23,17 @@ pub fn dedup_ops(batch: &mut Vec<EntityOps>) {
     // Phase 1: Merge all ops per entity_id, preserving creates_slot (OR across sources)
     let mut entity_map: HashMap<i64, Vec<Op>> = HashMap::new();
     let mut creates_slot_map: HashMap<i64, bool> = HashMap::new();
+    // First-arrival order of entity ids. Phase 3 used to rebuild the batch by
+    // consuming the map, so the ORDER ENTITIES ARE APPLIED IN was per-process
+    // hash order — and two entities can carry ops for the same slot in one
+    // batch (a Post fan-out's queryOpSet and a direct Image op both write
+    // publishedAt for the same image). Whichever landed last won, by hash.
+    // Same failure shape as the one inside `dedup_entity_ops`, one level up.
+    let mut entity_order: Vec<i64> = Vec::new();
     for entry in batch.drain(..) {
+        if !entity_map.contains_key(&entry.entity_id) {
+            entity_order.push(entry.entity_id);
+        }
         entity_map
             .entry(entry.entity_id)
             .or_default()
@@ -39,14 +49,19 @@ pub fn dedup_ops(batch: &mut Vec<EntityOps>) {
         dedup_entity_ops(ops);
     }
 
-    // Phase 3: Rebuild batch, dropping empty entries
-    *batch = entity_map
+    // Phase 3: Rebuild batch in first-arrival entity order, dropping empties
+    *batch = entity_order
         .into_iter()
-        .filter(|(_, ops)| !ops.is_empty())
-        .map(|(entity_id, ops)| EntityOps {
-            entity_id,
-            ops,
-            creates_slot: creates_slot_map.get(&entity_id).copied().unwrap_or(false),
+        .filter_map(|entity_id| {
+            let ops = entity_map.remove(&entity_id)?;
+            if ops.is_empty() {
+                return None;
+            }
+            Some(EntityOps {
+                entity_id,
+                ops,
+                creates_slot: creates_slot_map.get(&entity_id).copied().unwrap_or(false),
+            })
         })
         .collect();
 }
@@ -500,6 +515,30 @@ mod tests {
             removes,
             vec![future],
             "only the last arriving op survives, carrying its value: {ops:?}"
+        );
+    }
+
+    /// Entities come back in first-arrival order too, not hash order.
+    ///
+    /// The batch is applied in vec order, and two entities can carry ops for the
+    /// same slot in one batch — a Post fan-out (entity = post id) and a direct
+    /// Image op (entity = image id) both write `publishedAt` for that image.
+    /// Rebuilding the batch by consuming the entity map made which one landed
+    /// last a per-process coin flip: the same failure shape as the one inside
+    /// `dedup_entity_ops`, one level up.
+    #[test]
+    fn test_entities_keep_arrival_order() {
+        let ids: Vec<i64> = (1..=24).map(|i| i * 7).collect();
+        let mut batch: Vec<EntityOps> = ids
+            .iter()
+            .map(|id| entity(*id, vec![Op::Set { field: "nsfwLevel".into(), value: json!(1) }]))
+            .collect();
+        dedup_ops(&mut batch);
+        let seen: Vec<i64> = batch.iter().map(|e| e.entity_id).collect();
+        assert_eq!(
+            seen, ids,
+            "entities must be re-emitted in arrival order — the batch is applied \
+             in this order and two entities can write the same slot"
         );
     }
 
