@@ -290,22 +290,56 @@ pub fn trigger_name(source: &SyncSource) -> String {
     format!("bitdex_{}_{}", source.table.to_lowercase(), hash)
 }
 
-/// Generate the full CREATE OR REPLACE FUNCTION + CREATE TRIGGER SQL
-/// for a sync source.
-pub fn generate_trigger_sql(source: &SyncSource) -> String {
-    let func_name = trigger_function_name(source);
-    let trig_name = trigger_name(source);
-    let body = generate_trigger_body(source);
-
+/// The trigger's firing events, as the `AFTER ...` clause text.
+///
+/// Paired with [`trigger_type_mask`], which must describe the same events in
+/// `pg_trigger.tgtype` form — they are two encodings of one fact, so they are
+/// defined next to each other and changed together.
+fn trigger_events(source: &SyncSource) -> &'static str {
     let has_delete = source.on_delete.as_ref().map(|v| v.is_delete()).unwrap_or(false);
-    let trigger_events = if source.field.is_some() {
+    if source.field.is_some() {
         // Multi-value join table: INSERT and DELETE only
         "AFTER INSERT OR DELETE"
     } else if has_delete {
         "AFTER INSERT OR UPDATE OR DELETE"
     } else {
         "AFTER INSERT OR UPDATE"
-    };
+    }
+}
+
+/// The same events as [`trigger_events`], encoded as `pg_trigger.tgtype`.
+///
+/// Bits, from PostgreSQL's `catalog/pg_trigger.h`: ROW = 1, BEFORE = 2 (unset
+/// means AFTER), INSERT = 4, DELETE = 8, UPDATE = 16. Every trigger we emit is
+/// `AFTER ... FOR EACH ROW`, so BEFORE is never set and ROW always is.
+///
+/// This exists so a caller can ask "is the trigger already installed exactly as
+/// we would install it?" against the catalog, instead of re-issuing the DDL to
+/// find out. See `queries::trigger_is_current`.
+pub fn trigger_type_mask(source: &SyncSource) -> i16 {
+    const ROW: i16 = 1 << 0;
+    const INSERT: i16 = 1 << 2;
+    const DELETE: i16 = 1 << 3;
+    const UPDATE: i16 = 1 << 4;
+
+    match trigger_events(source) {
+        "AFTER INSERT OR DELETE" => ROW | INSERT | DELETE,
+        "AFTER INSERT OR UPDATE OR DELETE" => ROW | INSERT | UPDATE | DELETE,
+        _ => ROW | INSERT | UPDATE,
+    }
+}
+
+/// The function definitions a trigger depends on: the shared op-payload
+/// functions (fan-out and `shared_ops_fields`) plus the trigger function
+/// itself.
+///
+/// Split out from the trigger DDL because the two have very different costs.
+/// `CREATE OR REPLACE FUNCTION` locks the `pg_proc` row and nothing else, so it
+/// is safe to run on every boot. `CREATE TRIGGER` takes an AccessExclusiveLock
+/// on the *table* — see [`generate_trigger_ddl_sql`].
+pub fn generate_trigger_functions_sql(source: &SyncSource) -> String {
+    let func_name = trigger_function_name(source);
+    let body = generate_trigger_body(source);
 
     // For per-row fan-out, emit the shared op-payload function first so the
     // trigger (and the W1-3 re-emitter) can call it. Single source of the op
@@ -328,18 +362,49 @@ pub fn generate_trigger_sql(source: &SyncSource) -> String {
         r#"{ops_function}CREATE OR REPLACE FUNCTION {func_name}() RETURNS trigger AS $$
 {body}
 $$ LANGUAGE plpgsql;
+"#,
+        ops_function = ops_function,
+        func_name = func_name,
+        body = body,
+    )
+}
 
-DROP TRIGGER IF EXISTS {trig_name} ON "{table}";
+/// The trigger DDL alone: drop, create, and mark ENABLE ALWAYS.
+///
+/// Every statement here takes an **AccessExclusiveLock on the source table** —
+/// `Image`, `Post`, `ModelVersion` and friends, all of which take continuous
+/// write traffic from the app. Under load the lock request can lose its race
+/// repeatedly, and the `bitdex` role carries a `lock_timeout`, so re-issuing
+/// this DDL when nothing has changed is not free: it is a chance to fail.
+///
+/// Only run it when the installed trigger does not already match — ask
+/// `queries::trigger_is_current` first.
+pub fn generate_trigger_ddl_sql(source: &SyncSource) -> String {
+    format!(
+        r#"DROP TRIGGER IF EXISTS {trig_name} ON "{table}";
 CREATE TRIGGER {trig_name} {trigger_events} ON "{table}"
   FOR EACH ROW EXECUTE FUNCTION {func_name}();
 ALTER TABLE "{table}" ENABLE ALWAYS TRIGGER {trig_name};
 "#,
-        ops_function = ops_function,
-        func_name = func_name,
-        trig_name = trig_name,
-        body = body,
-        trigger_events = trigger_events,
+        trig_name = trigger_name(source),
+        func_name = trigger_function_name(source),
+        trigger_events = trigger_events(source),
         table = source.table,
+    )
+}
+
+/// Generate the full CREATE OR REPLACE FUNCTION + CREATE TRIGGER SQL
+/// for a sync source.
+///
+/// This is the whole-thing form, kept for the review-file generator and for
+/// callers that genuinely want to install from scratch. The boot path uses
+/// [`generate_trigger_functions_sql`] and [`generate_trigger_ddl_sql`]
+/// separately so it can skip the table-locking half.
+pub fn generate_trigger_sql(source: &SyncSource) -> String {
+    format!(
+        "{}\n{}",
+        generate_trigger_functions_sql(source),
+        generate_trigger_ddl_sql(source),
     )
 }
 
@@ -1237,6 +1302,94 @@ mod tests {
                 || sql.contains(r#"WHERE p.id = OLD."postId")) IS DISTINCT FROM"#),
             "UPDATE must diff the subquery between OLD and NEW postId:\n{sql}"
         );
+    }
+
+    // --- trigger DDL / catalog-mask agreement -------------------------------
+    //
+    // `trigger_type_mask` is what lets the boot path ask the catalog "is this
+    // trigger already what we would install?" instead of re-issuing DDL that
+    // takes an AccessExclusiveLock on a hot table. If the mask ever stops
+    // agreeing with the events clause, that check silently answers the wrong
+    // question — it would either skip DDL that was needed, or reinstall DDL
+    // every boot and reintroduce the crash-loop it exists to prevent. So the
+    // two encodings are tested against each other directly.
+
+    /// Decode a tgtype mask back into the events clause it claims to describe.
+    fn events_from_mask(mask: i16) -> String {
+        const ROW: i16 = 1 << 0;
+        const BEFORE: i16 = 1 << 1;
+        const INSERT: i16 = 1 << 2;
+        const DELETE: i16 = 1 << 3;
+        const UPDATE: i16 = 1 << 4;
+
+        assert_eq!(mask & ROW, ROW, "every emitted trigger is FOR EACH ROW");
+        assert_eq!(mask & BEFORE, 0, "every emitted trigger is AFTER, not BEFORE");
+
+        let mut events = Vec::new();
+        if mask & INSERT != 0 { events.push("INSERT"); }
+        if mask & UPDATE != 0 { events.push("UPDATE"); }
+        if mask & DELETE != 0 { events.push("DELETE"); }
+        format!("AFTER {}", events.join(" OR "))
+    }
+
+    #[test]
+    fn trigger_type_mask_agrees_with_events_clause() {
+        // Plain source: AFTER INSERT OR UPDATE.
+        let plain = test_source("Image");
+        assert_eq!(trigger_events(&plain), "AFTER INSERT OR UPDATE");
+        assert_eq!(events_from_mask(trigger_type_mask(&plain)), "AFTER INSERT OR UPDATE");
+
+        // on_delete set: AFTER INSERT OR UPDATE OR DELETE.
+        let mut with_delete = test_source("Image");
+        with_delete.on_delete = Some(OnDeleteValue::Bool(true));
+        assert_eq!(trigger_events(&with_delete), "AFTER INSERT OR UPDATE OR DELETE");
+        assert_eq!(
+            events_from_mask(trigger_type_mask(&with_delete)),
+            "AFTER INSERT OR UPDATE OR DELETE"
+        );
+
+        // Multi-value join table: AFTER INSERT OR DELETE, no UPDATE.
+        let mut join_table = test_source("TagsOnImageNew");
+        join_table.field = Some("tagIds".into());
+        join_table.value_field = Some("tagId".into());
+        assert_eq!(trigger_events(&join_table), "AFTER INSERT OR DELETE");
+        assert_eq!(events_from_mask(trigger_type_mask(&join_table)), "AFTER INSERT OR DELETE");
+
+        // `field` wins over on_delete — the join-table branch is checked first,
+        // and the mask has to follow that same precedence.
+        join_table.on_delete = Some(OnDeleteValue::Bool(true));
+        assert_eq!(trigger_events(&join_table), "AFTER INSERT OR DELETE");
+        assert_eq!(events_from_mask(trigger_type_mask(&join_table)), "AFTER INSERT OR DELETE");
+    }
+
+    /// The split halves must still concatenate to exactly what callers used to
+    /// get, or the review file and every `generate_trigger_sql` assertion in
+    /// this module would be silently describing something the boot path no
+    /// longer emits.
+    #[test]
+    fn split_sql_halves_reassemble_to_the_whole() {
+        for source in [
+            test_source("Image"),
+            post_fan_out_per_row_source(),
+            image_source_with_sortat(),
+        ] {
+            let whole = generate_trigger_sql(&source);
+            let functions = generate_trigger_functions_sql(&source);
+            let ddl = generate_trigger_ddl_sql(&source);
+
+            assert_eq!(whole, format!("{functions}\n{ddl}"));
+
+            // The half that is safe to re-run every boot must not contain the
+            // half that locks the table — that separation is the entire point.
+            assert!(
+                !functions.contains("CREATE TRIGGER") && !functions.contains("DROP TRIGGER"),
+                "functions half must not carry trigger DDL:\n{functions}"
+            );
+            assert!(
+                ddl.contains("CREATE TRIGGER") && ddl.contains("ENABLE ALWAYS TRIGGER"),
+                "DDL half must install and always-enable the trigger:\n{ddl}"
+            );
+        }
     }
 
     /// Helper to build a test SyncSource with defaults for unused fields.

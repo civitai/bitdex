@@ -713,6 +713,10 @@ triggers: []
         sql.push_str("-- Part 1: V2 Tables (BitdexOps + bitdex_cursors + cleanup trigger)\n");
         sql.push_str("-- -----------------------------------------------------------------------\n\n");
         sql.push_str(crate::pg_sync::queries::SETUP_V2_SQL);
+        // The cleanup trigger lives in its own const so the boot path can skip
+        // it when it is already installed, but this file is a review artifact —
+        // it has to show the whole of what setup would create.
+        sql.push_str(crate::pg_sync::queries::CLEANUP_TRIGGER_DDL);
         sql.push_str("\n\n");
 
         // Part 2: Per-trigger SQL
