@@ -2516,11 +2516,20 @@ fn apply_fanout_to_deferred_slots<S: BitmapSink>(
     }
     // A now/past Set reschedules to that instant (activates next flush cycle);
     // a Remove-only (source cleared) activates immediately as a plain draft.
-    let new_at = get_deferred_timestamp(meta, ops);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // ...unless the Remove CARRIES a future timestamp. The trigger's future
+    // guard spells a schedule as `{op: remove, field: publishedAt, value: <Tf>}`
+    // — the remove hides the entity now, the value says when to publish it. The
+    // direct-op branch in `apply_ops_batch` reads that as a reschedule; this
+    // path is the same op arriving through a fan-out, and must read it the same
+    // way. Reading it as "source cleared" instead activated the whole matched
+    // set as drafts and drained them from the deferred map, which is what a
+    // single edit of a scheduled post used to do to all of its images.
+    let future_sched = get_future_schedule(meta, ops, now);
+    let new_at = get_deferred_timestamp(meta, ops).or(future_sched);
 
     let mut touched: Vec<u32> = Vec::new();
     for slot in candidates {
@@ -2548,7 +2557,18 @@ fn apply_fanout_to_deferred_slots<S: BitmapSink>(
                 match op {
                     Op::Set { field, value } => dw.write_set(slot, field, value),
                     Op::Add { field, value } => dw.write_add(slot, field, value),
-                    Op::Remove { field, value } => dw.write_remove(slot, field, value),
+                    Op::Remove { field, value } => {
+                        // Store the SCHEDULE, not the removal, when the remove
+                        // carries a future timestamp — activation at Tf replays
+                        // the stored doc, and a doc with publishedAt stripped
+                        // activates as a draft that never publishes. Mirrors the
+                        // direct-op deferred branch in `apply_ops_batch`.
+                        if future_sched.is_some() && field == da_field {
+                            dw.write_set(slot, field, value)
+                        } else {
+                            dw.write_remove(slot, field, value)
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3856,6 +3876,54 @@ mod tests {
         assert!(
             rec.filter_inserts.is_empty() && rec.sort_sets.is_empty(),
             "deferred activation defers bitmap rebuild to replay, writes none here"
+        );
+    }
+
+    /// (b2) A fan-out carrying the trigger's FUTURE-GUARDED remove — one
+    /// `Remove{publishedAt, <future ts>}` and nothing else — is a RESCHEDULE,
+    /// not an unpublish. The direct-op path reads it that way; this is the same
+    /// op arriving through a fan-out.
+    ///
+    /// Read as "source cleared", it activates every matched image as a draft and
+    /// drops it from the deferred map, with publishedAt stripped from the doc —
+    /// so nothing publishes it at Tf. One edit of a scheduled post was enough to
+    /// do that to all of its images.
+    #[test]
+    fn test_deferred_fanout_future_valued_remove_reschedules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 7;
+        let post_id: i64 = 100;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_deferred_image(&engine, &meta, slot, post_id, now - 3600, now + 3600);
+
+        let t2 = now + 7200; // rescheduled later, carried on the remove
+        let (applied, rec) = apply_fanout_recording(
+            &engine,
+            &meta,
+            post_id,
+            vec![Op::Remove { field: "publishedAt".into(), value: json!(t2) }],
+        );
+        assert_eq!(applied, 1, "fan-out must reach the deferred slot");
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, t2 as u64)],
+            "future-valued remove must reschedule at the carried timestamp, not \
+             activate as a draft"
+        );
+        assert!(
+            rec.filter_inserts.is_empty() && rec.sort_sets.is_empty(),
+            "the slot stays out of every feed until t2"
+        );
+        assert_eq!(
+            doc_int_field(&engine, slot, "publishedAt"),
+            Some(t2),
+            "the doc must keep the schedule — activation replays this doc, and a \
+             doc with publishedAt stripped activates as a draft that never publishes"
         );
     }
 
