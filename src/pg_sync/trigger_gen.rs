@@ -458,21 +458,53 @@ fn generate_direct_body(source: &SyncSource) -> String {
             field = field_name,
         ));
     }
-    // Computed fields on UPDATE: emit remove/set when computed value changes
+    // Computed fields on UPDATE: emit remove/set when computed value changes.
+    //
+    // A computed field may target FUTURE_GUARDED_FIELD — on Image, publishedAt
+    // is computed from a correlated subquery on the parent Post. That makes the
+    // direct trigger a SECOND writer of a field whose whole invariant is that a
+    // future value must never reach an alive slot as a bare `set`, and the
+    // guard lived only in the fan-out codegen. The value here is already an
+    // epoch bigint, so the guard compares against epoch-now rather than the
+    // timestamptz column the fan-out guard reads.
+    //
+    // Only the UPDATE branch is guarded. The INSERT branch must keep emitting a
+    // plain future `set`: that Set is what puts a freshly-inserted scheduled
+    // image into the deferred map (the engine's deferral check reads Set ops),
+    // and guarding it would turn every scheduled insert into an unscheduled one.
     for cf in computed {
         let old_expr = substitute_columns(&cf.expression, "OLD");
         let new_expr = substitute_columns(&cf.expression, "NEW");
-        body.push_str(&format!(
-            "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
-             \x20     _ops := _ops || jsonb_build_array(\n\
-             \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
-             \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
-             \x20     );\n\
-             \x20   END IF;\n",
-            old = old_expr,
-            new = new_expr,
-            field = cf.target,
-        ));
+        if cf.target == FUTURE_GUARDED_FIELD {
+            body.push_str(&format!(
+                "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+                 \x20     _ops := _ops || CASE WHEN ({new}) IS NULL OR ({new}) > extract(epoch from now())::bigint\n\
+                 \x20       THEN jsonb_build_array(\n\
+                 \x20         jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20       )\n\
+                 \x20       ELSE jsonb_build_array(\n\
+                 \x20         jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+                 \x20         jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20       )\n\
+                 \x20     END;\n\
+                 \x20   END IF;\n",
+                old = old_expr,
+                new = new_expr,
+                field = cf.target,
+            ));
+        } else {
+            body.push_str(&format!(
+                "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+                 \x20     _ops := _ops || jsonb_build_array(\n\
+                 \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+                 \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+                 \x20     );\n\
+                 \x20   END IF;\n",
+                old = old_expr,
+                new = new_expr,
+                field = cf.target,
+            ));
+        }
     }
     body.push_str("    IF jsonb_array_length(_ops) > 0 THEN\n");
     body.push_str(&format!(
@@ -1870,6 +1902,94 @@ sync_sources:
             on_delete: Some(OnDeleteValue::String("delete_slot".into())),
             ..test_source("Image")
         }
+    }
+
+    /// The guarded field has TWO writers, and the invariant has to hold at both.
+    ///
+    /// On Image, `publishedAt` is a COMPUTED field — a correlated subquery on
+    /// the parent Post — so the direct-table trigger writes it as well as the
+    /// Post fan-out. The guard lived only in the fan-out codegen, leaving the
+    /// direct UPDATE branch free to emit a bare `set publishedAt = <future>`.
+    /// On an alive slot that flips the isPublished shadow true and lands the
+    /// image at the top of the feed with a future sortAt — the exact leak the
+    /// guard exists to prevent.
+    ///
+    /// The INSERT branch must stay unguarded: its future `set` is what puts a
+    /// freshly-inserted scheduled image into the deferred map.
+    #[test]
+    fn test_computed_publishedat_guarded_on_update_not_insert() {
+        let source = SyncSource {
+            slot_field: Some("id".into()),
+            track_fields: Some(vec![TrackField::Simple("nsfwLevel".into())]),
+            computed_fields: Some(vec![
+                TriggerComputedField {
+                    target: "publishedAt".into(),
+                    expression:
+                        r#"(SELECT extract(epoch from p."publishedAt")::bigint FROM "Post" p WHERE p.id = {postId})"#
+                            .into(),
+                    value: None,
+                },
+                TriggerComputedField {
+                    target: "existedAt".into(),
+                    expression: "GREATEST(extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)".into(),
+                    value: None,
+                },
+            ]),
+            sets_alive: true,
+            ..test_source("Image")
+        };
+        let sql = generate_trigger_sql(&source);
+
+        let insert_at = sql.find("IF TG_OP = 'INSERT' THEN").expect("INSERT branch");
+        let update_at = sql.find("  ELSE\n").expect("UPDATE branch");
+        assert!(insert_at < update_at, "unexpected branch order:\n{sql}");
+        let insert_branch = &sql[insert_at..update_at];
+        let update_branch = &sql[update_at..];
+
+        // INSERT: bare set, no guard — deferral depends on it.
+        assert!(
+            insert_branch.contains("jsonb_build_object('op', 'set', 'field', 'publishedAt'"),
+            "INSERT must emit a plain publishedAt set:\n{insert_branch}"
+        );
+        assert!(
+            !insert_branch.contains("CASE WHEN"),
+            "INSERT must NOT be guarded — the future set is what defers the \
+             slot:\n{insert_branch}"
+        );
+
+        // UPDATE: guarded, and the future/null arm emits ONE op.
+        assert!(
+            update_branch.contains("extract(epoch from now())::bigint"),
+            "UPDATE publishedAt must be guarded against future values:\n{update_branch}"
+        );
+        let case_at = update_branch
+            .find("CASE WHEN")
+            .expect("guarded CASE in the UPDATE branch");
+        let case_body = &update_branch[case_at..];
+        let else_at = case_body.find("ELSE").expect("ELSE arm");
+        let then_arm = &case_body[..else_at];
+        assert_eq!(
+            then_arm.matches("jsonb_build_object('op'").count(),
+            1,
+            "future/null arm must emit exactly one op:\n{then_arm}"
+        );
+        assert!(
+            then_arm.contains("'op', 'remove', 'field', 'publishedAt'"),
+            "future/null arm must be a remove:\n{then_arm}"
+        );
+
+        // Other computed fields stay unguarded.
+        assert!(
+            update_branch.contains(
+                "jsonb_build_object('op', 'set', 'field', 'existedAt'"
+            ),
+            "non-guarded computed fields keep the plain pair:\n{update_branch}"
+        );
+        assert_eq!(
+            update_branch.matches("CASE WHEN").count(),
+            1,
+            "only publishedAt may be guarded:\n{update_branch}"
+        );
     }
 
     #[test]
