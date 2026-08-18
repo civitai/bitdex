@@ -16,6 +16,32 @@
  *   6. monitor      — tail pg-sync container until /api/indexes/civitai/stats
  *                     reports alive_count > 0 AND all dump phases complete
  *
+ * Extra step (NOT numbered — run it BEFORE wiping anything, see "Two
+ * replicas" below):
+ *      pin-cursor  — pin a replica's bitdex_cursors row to MAX(BitdexOps.id)
+ *
+ * Two replicas
+ * ------------
+ * Production runs TWO pods and TWO locally-pinned PVCs:
+ *   bitdex-0 / data-bitdex-0 on talos-wjh-tgy   (HAProxy ACTIVE — serves all)
+ *   bitdex-1 / data-bitdex-1 on talos-48r-b3a   (warm failover only)
+ *
+ * Steps that touch one pod's disk take `--replica=N` (or BITDEX_REPLICA=N).
+ * `suspend` and `nuke-pg` are fleet-wide by definition and take no replica.
+ *
+ * REBUILD THE PODS SEQUENTIALLY, NEVER CONCURRENTLY. `cleanup_bitdex_ops`
+ * deletes every row below MIN(last_outbox_id) across bitdex_cursors. A pod
+ * that has been wiped has NO cursor row yet — it seeds one only AFTER its
+ * dump finishes — so MIN is the *other* pod's advancing cursor, and the
+ * healthy pod's progress trims away exactly the ops the rebuilding pod will
+ * need. Observed 2026-08-18: bitdex-1 came up at cursor 5,502 against an ops
+ * table starting at 171,697 ("ALERT — hole above id 5502 exceeds 100000 ids")
+ * and had to be rebuilt a second time.
+ *
+ * So: `pin-cursor --replica=N` for every replica you have not rebuilt yet,
+ * BEFORE you wipe anything. The pin holds the retention floor down until that
+ * pod has caught up on its own.
+ *
  * Post-flow (manual, see docs/guide/deploy-nukes.md §Post-load):
  *   - POST /api/indexes/civitai/compact -d '{"targets":["docs"]}'
  *   - Run smoke tests (Archer's three queries from
@@ -44,10 +70,14 @@ import { fileURLToPath } from 'url';
 
 const NS = 'bitdex';
 const STS = 'bitdex';
-const NODE = 'talos-wjh-tgy';
 const K8S_CONTEXT = 'civit-datapacket';
 const PG_NS = 'cnpg-database';
-const PG_POD = process.env.BITDEX_PG_WRITER_POD || 'cnpg-cluster-nvme0-2'; // current writer; verify via `kubectl get pod -n cnpg-database -l role=primary`
+const PG_POD = process.env.BITDEX_PG_WRITER_POD || 'cnpg-cluster-nvme0-5'; // current writer; verify via `kubectl get pod -n cnpg-database -l role=primary`
+
+// PVCs are openebs-hostpath and hard-pinned by PV nodeAffinity — a pod cannot
+// move off its node without a PVC migration. Verify with:
+//   kubectl get pv $(kubectl -n bitdex get pvc data-bitdex-N -o jsonpath='{.spec.volumeName}') -o jsonpath='{.spec.nodeAffinity}'
+const REPLICA_NODES = { 0: 'talos-wjh-tgy', 1: 'talos-48r-b3a' };
 const INDEX_PATH = '/data/indexes/civitai';
 const LOAD_STAGE = `${INDEX_PATH}/load_stage`;
 
@@ -76,6 +106,67 @@ function log(msg) { console.log(`  ✓ ${msg}`); }
 function warn(msg) { console.error(`  ! ${msg}`); }
 function err(msg) { console.error(`  ✗ ${msg}`); }
 function heading(msg) { console.log(`\n=== ${msg} ===`); }
+
+// --- replica selection ------------------------------------------------------
+// Steps that touch one pod's disk or cursor MUST name the replica. There is no
+// default: silently defaulting to 0 is how a two-pod fleet ends up with a
+// one-pod runbook, which is the bug this argument exists to fix.
+function requireReplica() {
+  const flag = process.argv.find(a => a.startsWith('--replica='));
+  const raw = flag ? flag.slice('--replica='.length) : process.env.BITDEX_REPLICA;
+  if (raw === undefined || raw === '') {
+    err('This step needs --replica=N (or BITDEX_REPLICA=N).');
+    err(`Known replicas: ${Object.keys(REPLICA_NODES).join(', ')}`);
+    process.exit(1);
+  }
+  const n = Number(raw);
+  if (!Object.prototype.hasOwnProperty.call(REPLICA_NODES, n)) {
+    err(`Unknown replica ${raw}. Known: ${Object.keys(REPLICA_NODES).join(', ')}`);
+    process.exit(1);
+  }
+  return { n, pod: `bitdex-${n}`, pvc: `data-bitdex-${n}`, node: REPLICA_NODES[n], cursor: `pg-sync-bitdex-${n}` };
+}
+
+// Every non-Completed bitdex-N pod, whatever the ordinal. The old checks
+// grepped `^bitdex-0` only, so `suspend` reported "Pods: 0" while bitdex-1 was
+// still Terminating and the destructive steps would run against a live pod.
+function livePods() {
+  return kubectl('get pods --no-headers', { ignoreError: true })
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => /^bitdex-\d+\s/.test(l) && !l.includes('Completed'))
+    .map(l => l.split(/\s+/)[0]);
+}
+
+function psql(sql, opts = {}) {
+  return execFileSync(
+    'kubectl',
+    ['--context', K8S_CONTEXT, 'exec', '-n', PG_NS, PG_POD, '-c', 'postgres',
+     '--', 'psql', '-U', 'postgres', '-d', 'civitai', ...(opts.tuples ? ['-t'] : []), '-c', sql],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+  ).trim();
+}
+
+// Pin a replica's retention floor to the current head of BitdexOps so
+// cleanup_bitdex_ops cannot delete ops that replica will still need while it
+// rebuilds. See the "Two replicas" note at the top of this file.
+function stepPinCursor() {
+  const r = requireReplica();
+  heading(`Pin cursor for ${r.cursor} to MAX(BitdexOps.id)`);
+
+  console.log(psql('SELECT replica_id, last_outbox_id FROM bitdex_cursors ORDER BY replica_id'));
+
+  psql(`INSERT INTO bitdex_cursors (replica_id, last_outbox_id, updated_at)
+        VALUES ('${r.cursor}', (SELECT max(id) FROM "BitdexOps"), now())
+        ON CONFLICT (replica_id) DO UPDATE
+          SET last_outbox_id = excluded.last_outbox_id, updated_at = now()`);
+
+  console.log(psql(
+    'SELECT c.replica_id, c.last_outbox_id, (SELECT max(id) FROM "BitdexOps") AS max_op'
+    + ' FROM bitdex_cursors c ORDER BY c.replica_id'));
+  log(`${r.cursor} pinned. Ops below MIN(last_outbox_id) stay retained until it catches up.`);
+  warn('The ops table will grow while the pin holds — expected. It drains once the pod catches up.');
+}
 
 // ---------------------------------------------------------------------------
 // Steps
@@ -111,23 +202,27 @@ function step1_preflight() {
 function step2_suspend() {
   heading('Step 2: Scale StatefulSet to 0');
 
+  const priorReplicas = kubectl(`get statefulset ${STS} -o jsonpath='{.spec.replicas}'`);
+  log(`StatefulSet was at ${priorReplicas} replica(s) — pass the same to step 5`);
+
   kubectl(`scale statefulset/${STS} --replicas=0`);
   run('sleep 5');
 
-  // Force-delete in case StatefulSet termination grace is long
-  kubectl(`delete pod bitdex-0 --force --grace-period=0`, { ignoreError: true });
+  // Force-delete every ordinal, not just bitdex-0 — StatefulSet termination
+  // grace is long and the old single-pod delete left bitdex-1 Terminating.
+  for (const pod of livePods()) {
+    kubectl(`delete pod ${pod} --force --grace-period=0`, { ignoreError: true });
+  }
   run('sleep 5');
 
   const replicas = kubectl(`get statefulset ${STS} -o jsonpath='{.spec.replicas}'`);
-  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n')
-    .filter(l => l.match(/^bitdex-0\s/) && !l.includes('Completed'))
-    .length;
+  const pods = livePods();
 
-  if (replicas.includes('0') && podCount === 0) {
+  if (replicas.includes('0') && pods.length === 0) {
     log(`Replicas: 0, Pods: 0`);
   } else {
-    err(`Replicas: ${replicas}, Pods: ${podCount} — expected 0/0`);
+    err(`Replicas: ${replicas}, Pods: ${pods.length} (${pods.join(', ') || 'none'}) — expected 0/0`);
+    err('Re-run once Terminating pods clear; do NOT proceed to nuke-pg or wipe.');
     process.exit(1);
   }
 }
@@ -137,12 +232,9 @@ function step3_nukePg() {
 
   // Verify pods still down — running an in-flight write while we truncate
   // BitdexOps would corrupt state.
-  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n')
-    .filter(l => l.match(/^bitdex-0\s/) && !l.includes('Completed'))
-    .length;
-  if (podCount > 0) {
-    err('bitdex-0 still running — run step 2 (suspend) first');
+  const pods = livePods();
+  if (pods.length > 0) {
+    err(`Still running: ${pods.join(', ')} — run step 2 (suspend) first`);
     process.exit(1);
   }
 
@@ -211,19 +303,17 @@ function countRemainingTriggers() {
 }
 
 function step4_wipe() {
-  heading('Step 4: Wipe PVC');
+  const r = requireReplica();
+  heading(`Step 4: Wipe PVC ${r.pvc} (replica ${r.n}, node ${r.node})`);
 
-  // Verify pods still down
-  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n')
-    .filter(l => l.match(/^bitdex-0\s/))
-    .length;
-  if (podCount > 0) {
-    err('bitdex-0 still running — must be at 0 replicas');
+  // Verify pods still down — any ordinal, not just bitdex-0
+  const pods = livePods();
+  if (pods.length > 0) {
+    err(`Still running: ${pods.join(', ')} — must be at 0 replicas`);
     process.exit(1);
   }
 
-  const podName = 'wipe-pvc';
+  const podName = `wipe-pvc-${r.n}`;
   const overrides = JSON.stringify({
     spec: {
       containers: [{
@@ -234,9 +324,9 @@ function step4_wipe() {
       }],
       volumes: [{
         name: 'data',
-        persistentVolumeClaim: { claimName: 'data-bitdex-0' },
+        persistentVolumeClaim: { claimName: r.pvc },
       }],
-      nodeSelector: { 'kubernetes.io/hostname': NODE },
+      nodeSelector: { 'kubernetes.io/hostname': r.node },
     },
   }).replace(/'/g, "\\'");
 
@@ -273,12 +363,23 @@ function step4_wipe() {
 function step5_start() {
   heading('Step 5: Scale StatefulSet up — bitdex-sync drives the rest');
 
-  kubectl(`scale statefulset/${STS} --replicas=1`);
-  console.log('  Waiting for pod to schedule (up to 60s)...');
-  run(`kubectl --context ${K8S_CONTEXT} -n ${NS} wait --for=condition=PodScheduled pod/bitdex-0 --timeout=60s`,
-    { ignoreError: true });
+  const flag = process.argv.find(a => a.startsWith('--replicas='));
+  const want = Number(flag ? flag.slice('--replicas='.length) : process.env.BITDEX_REPLICAS || 2);
+  kubectl(`scale statefulset/${STS} --replicas=${want}`);
+  console.log(`  Waiting for ${want} pod(s) to schedule (up to 60s each)...`);
+  for (let i = 0; i < want; i++) {
+    run(`kubectl --context ${K8S_CONTEXT} -n ${NS} wait --for=condition=PodScheduled pod/bitdex-${i} --timeout=60s`,
+      { ignoreError: true });
+  }
+  const pending = kubectl('get pods --no-headers', { ignoreError: true })
+    .split('\n').filter(l => /^bitdex-\d+\s/.test(l.trim()) && l.includes('Pending'));
+  if (pending.length) {
+    warn('Still Pending — the PVC pins each pod to one node, so it waits for headroom there:');
+    pending.forEach(l => warn(`  ${l.trim()}`));
+    warn('Check with: kubectl describe node <node> | sed -n "/Allocated resources/,/Events/p"');
+  }
 
-  log('Pod scheduled. The pg-sync sidecar will now run autonomously:');
+  log('Pod(s) scheduled. The pg-sync sidecar will now run autonomously:');
   log('  1. Wait for bitdex server health');
   log('  2. setup_v2: install triggers + create BitdexOps/bitdex_cursors');
   log('  3. Capture pre_dump_cursor from BitdexOps (will be 0 — clean slate)');
@@ -292,7 +393,8 @@ function step5_start() {
 function step6_monitor() {
   heading('Step 6: Monitor bulk-load progress');
 
-  console.log('Tailing pg-sync logs (Ctrl-C to detach; load continues regardless)...');
+  const rm = requireReplica();
+  console.log(`Tailing ${rm.pod} pg-sync logs (Ctrl-C to detach; load continues regardless)...`);
   console.log('Look for: "All dump phases complete" and "transitioning to steady-state".');
   console.log('Stats endpoint: GET /api/indexes/civitai/stats — watch alive_count climb.');
   console.log('Tasks endpoint: GET /api/indexes/civitai/tasks — per-phase progress.');
@@ -301,7 +403,7 @@ function step6_monitor() {
   // Stream logs (this blocks until user interrupts or pod restarts)
   try {
     execSync(
-      `kubectl --context ${K8S_CONTEXT} -n ${NS} logs -f bitdex-0 -c pg-sync --tail=200`,
+      `kubectl --context ${K8S_CONTEXT} -n ${NS} logs -f ${rm.pod} -c pg-sync --tail=200`,
       { stdio: 'inherit', timeout: 0 },
     );
   } catch (e) {
@@ -321,6 +423,7 @@ function step6_monitor() {
 const step = process.argv[2];
 const steps = {
   'preflight': step1_preflight,
+  'pin-cursor': stepPinCursor,
   'suspend': step2_suspend,
   'nuke-pg': step3_nukePg,
   'wipe': step4_wipe,
@@ -331,15 +434,24 @@ const steps = {
 if (!step || !steps[step]) {
   console.log('BitDex Hard-Nuke Orchestrator (sync-v2 autonomous boot)');
   console.log('');
-  console.log('Usage: node .claude/skills/deploy/reload.mjs <step>');
+  console.log('Usage: node .claude/skills/deploy/reload.mjs <step> [--replica=N]');
   console.log('');
   console.log('Steps (run in order):');
-  console.log('  1. preflight  — verify shadow OFF, Flux suspended, note image');
-  console.log('  2. suspend    — scale StatefulSet to 0');
-  console.log('  3. nuke-pg    — drop triggers + truncate BitdexOps/bitdex_cursors');
-  console.log('  4. wipe       — full PVC wipe (rm -rf /data/*); init container restores configs');
-  console.log('  5. start      — scale up; bitdex-sync auto-runs setup + dump + load');
-  console.log('  6. monitor    — tail pg-sync logs until load completes');
+  console.log('  1. preflight   — verify shadow OFF, Flux suspended, note image');
+  console.log('  2. suspend     — scale StatefulSet to 0 (fleet-wide)');
+  console.log('  3. nuke-pg     — drop triggers + truncate BitdexOps/bitdex_cursors');
+  console.log('  4. wipe        — full PVC wipe for ONE replica  (--replica=N required)');
+  console.log('  5. start       — scale up (--replicas=N, default 2); sidecar does setup+dump+load');
+  console.log("  6. monitor     — tail one pod's pg-sync logs   (--replica=N required)");
+  console.log('');
+  console.log("     pin-cursor  — pin a replica's cursor to MAX(BitdexOps.id) (--replica=N)");
+  console.log('                   REQUIRED for every replica you are not rebuilding first —');
+  console.log("                   otherwise the healthy pod's cursor lets cleanup delete the");
+  console.log('                   ops the rebuilding pod needs. Rebuild SEQUENTIALLY.');
+  console.log('');
+  console.log('Prod is TWO pods / TWO node-pinned PVCs:');
+  console.log('  bitdex-0 / data-bitdex-0 on talos-wjh-tgy  (HAProxy ACTIVE)');
+  console.log('  bitdex-1 / data-bitdex-1 on talos-48r-b3a  (warm failover)');
   console.log('');
   console.log('Post-flow: docstore compact, smoke tests, re-enable shadow.');
   console.log('See docs/guide/deploy-nukes.md.');

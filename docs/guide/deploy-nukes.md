@@ -23,7 +23,22 @@ This is the canonical reference. Pre-flight, commands, what each preserves, when
 
 ## Layout reminder
 
-Production runs a single-replica StatefulSet on `talos-wjh-tgy` with `data-bitdex-0` (RWO, openebs-hostpath, locally pinned). PVC mounted at `/data` inside the pod. Inside `/data/indexes/civitai/`:
+Production runs a **two-replica** StatefulSet. Each pod has its own RWO `openebs-hostpath` PVC, hard-pinned to one node by PV `nodeAffinity` — a pod cannot move without a PVC migration:
+
+| Pod | PVC | Node | Role |
+|---|---|---|---|
+| `bitdex-0` | `data-bitdex-0` | `talos-wjh-tgy` | HAProxy **active** — serves all query traffic |
+| `bitdex-1` | `data-bitdex-1` | `talos-48r-b3a` | warm **failover only** |
+
+Verify a replica's node before wiping it:
+
+```bash
+kubectl --context civit-datapacket get pv \
+  $(kubectl --context civit-datapacket -n bitdex get pvc data-bitdex-1 -o jsonpath='{.spec.volumeName}') \
+  -o jsonpath='{.spec.nodeAffinity}'
+```
+
+PVC mounted at `/data` inside the pod. Inside `/data/indexes/civitai/`:
 
 ```
 bitmaps/        roaring index shards     ← always wiped
@@ -43,7 +58,43 @@ PG-side state (only relevant to hard nuke):
 - `BitdexOps` outbox table (rows accumulated from triggers; consumed by `bitdex-sync` ops poller).
 - `bitdex_cursors` table — replica row-id checkpoints.
 
-> **Note:** the older two-replica layout (`data-bitdex-1`) is documented in archived runbooks. Only `data-bitdex-0` is bound and used in current prod. References to `bitdex-1` / `data-bitdex-1` in older docs are stale.
+> **This doc used to say prod was single-replica.** It was wrong, and the tooling was written to match. Both PVCs are bound and both pods run. Anything that scales the StatefulSet or wipes "the PVC" without naming a replica is a bug.
+
+---
+
+## The cursor-pin trap — read this before wiping anything
+
+**Rebuilding both pods concurrently destroys the second one.**
+
+`cleanup_bitdex_ops` deletes every `BitdexOps` row below `MIN(last_outbox_id)` across all rows in `bitdex_cursors`. A freshly-wiped pod has **no cursor row yet** — it seeds one only *after* its dump finishes, which is 60–90 min later. So while it rebuilds, `MIN` is the *other* pod's cursor, and the healthy pod's normal forward progress trims away exactly the ops the rebuilding pod will need when it finally starts polling.
+
+Observed 2026-08-18: bitdex-1 came up at cursor 5,502 against an ops table that started at 171,697 — `ALERT — hole above id 5502 exceeds 100000 ids` — and had to be rebuilt a second time.
+
+**Fix: pin the cursor row of every replica you are not rebuilding first, to the current head of the ops table, before you wipe anything.**
+
+```bash
+node .claude/skills/deploy/reload.mjs pin-cursor --replica=1
+```
+
+which is:
+
+```sql
+INSERT INTO bitdex_cursors (replica_id, last_outbox_id, updated_at)
+VALUES ('pg-sync-bitdex-1', (SELECT max(id) FROM "BitdexOps"), now())
+ON CONFLICT (replica_id) DO UPDATE
+  SET last_outbox_id = excluded.last_outbox_id, updated_at = now();
+```
+
+The pin holds the retention floor down until that pod has caught up on its own. The ops table grows while the pin is held — that is the point, and it drains once the pod catches up. Check it:
+
+```sql
+SELECT replica_id, last_outbox_id FROM bitdex_cursors ORDER BY replica_id;
+SELECT min(id), max(id), count(*) FROM "BitdexOps";
+```
+
+`min(id)` should sit at or below the lowest cursor.
+
+**And rebuild the pods sequentially, never concurrently.** Rebuild bitdex-0 (the pod serving traffic) first, verify it, then bitdex-1.
 
 ---
 
@@ -70,11 +121,26 @@ Before doing anything destructive:
    # must print: true
    ```
 
-3. **Verify pod is on the expected node**
+3. **Verify each pod is on the expected node**
    ```bash
-   kubectl --context civit-datapacket get pv $(kubectl --context civit-datapacket -n bitdex get pvc data-bitdex-0 -o jsonpath='{.spec.volumeName}') -o jsonpath='{.spec.nodeAffinity}'
+   for r in 0 1; do
+     kubectl --context civit-datapacket get pv \
+       $(kubectl --context civit-datapacket -n bitdex get pvc data-bitdex-$r -o jsonpath='{.spec.volumeName}') \
+       -o jsonpath="{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}{'\n'}"
+   done
    ```
-   Should reference `talos-wjh-tgy`. PVC is hard-pinned via NodeAffinity; the pod can't move without PVC migration.
+   Expect `talos-wjh-tgy` then `talos-48r-b3a`. PVCs are hard-pinned via NodeAffinity; a pod can't move without a PVC migration.
+
+3b. **Check node headroom before you scale down.** Each pod requests 8 CPU / 32Gi. The moment a pod terminates, other tenants can take the freed capacity, and the pod cannot reschedule anywhere else — its PVC pins it. Observed 2026-08-18: Tekton build pods took bitdex-1's slot on `talos-48r-b3a` and it sat `Pending` for over an hour.
+   ```bash
+   kubectl --context civit-datapacket describe node talos-48r-b3a | sed -n '/Allocated resources/,/Events/p'
+   ```
+   If the node is tight, reserve the capacity *before* scaling down (for `talos-48r-b3a`, that meant a required `nodeAffinity` excluding it from the Tekton build pool — talos-infra #1096). Note that already-running PipelineRuns keep spawning task pods with the podTemplate captured at *their* creation, so an exclusion only takes full effect once in-flight builds drain.
+
+3c. **Pin the cursor of every replica you are not rebuilding first** — see §The cursor-pin trap.
+   ```bash
+   node .claude/skills/deploy/reload.mjs pin-cursor --replica=1
+   ```
 
 4. **Note current image tag** for awareness (the rollback-to-old-image path is mostly theoretical post-wipe — see Caution).
 
@@ -93,7 +159,9 @@ Wipes bitmaps + docstore + bounds + slot arena + snapshot meta. **Keeps `load_st
 node .claude/skills/deploy/cli.mjs wipe
 ```
 
-What that runs internally (ephemeral pod, hostpath mount on PVC 0):
+**This wipes BOTH PVCs** — it loops replicas 0 and 1 — so it is a full outage for the duration of the reload, not a rolling one. That is safe from the cursor-pin trap (§above): a soft nuke keeps `bitdex_cursors` intact and no pod is advancing, so the retention floor holds. It is *not* safe for availability. To reload one replica at a time, wipe its PVC alone — but note `reload.mjs wipe --replica=N` is the **hard** wipe (`rm -rf /data/*`, CSVs included), so for a per-replica *soft* wipe run the `rm -rf` below against that replica's PVC yourself.
+
+What `cli.mjs wipe` runs internally, per PVC (ephemeral pod, hostpath mount):
 
 ```bash
 rm -rf /data/indexes/civitai/bitmaps \
@@ -105,12 +173,12 @@ rm -rf /data/indexes/civitai/bitmaps \
 
 Then:
 
-1. **Scale back up:**
+1. **Scale back up (both replicas):**
    ```bash
-   kubectl --context civit-datapacket -n bitdex scale statefulset bitdex --replicas=1
+   kubectl --context civit-datapacket -n bitdex scale statefulset bitdex --replicas=2
    ```
 2. **Pod boots → bitdex-sync sidecar runs `run_boot_sequence` → finds existing CSVs in `load_stage` → loads bitmaps + docstore from scratch.** ~5–15 min.
-3. **Watch logs:**
+3. **Watch logs** (per replica):
    ```bash
    kubectl --context civit-datapacket -n bitdex logs -f bitdex-0 -c pg-sync
    kubectl --context civit-datapacket -n bitdex logs -f bitdex-0 -c bitdex
@@ -134,25 +202,31 @@ When NOT to use:
 
 Wipes everything soft nuke wipes, **plus** `load_stage/*.csv`, **plus** PG-side state (triggers + BitdexOps + bitdex_cursors). Then bitdex-sync's autonomous boot drives re-install of triggers, fresh dump, transfer, and load.
 
-The orchestration is now 6 steps. Each step is verifiable on its own. **Run them sequentially** — don't pipe them.
+The orchestration is now 6 steps plus a pin. Each step is verifiable on its own. **Run them sequentially** — don't pipe them. Steps that touch one pod's disk or cursor require `--replica=N`; there is no default.
 
 ```bash
-node .claude/skills/deploy/reload.mjs preflight     # verify shadow OFF, Flux suspended
-node .claude/skills/deploy/reload.mjs suspend       # scale StatefulSet to 0
-node .claude/skills/deploy/reload.mjs nuke-pg       # drop triggers + truncate BitdexOps/bitdex_cursors
-node .claude/skills/deploy/reload.mjs wipe          # wipe bitmaps/docs/bounds/load_stage on PVC
-node .claude/skills/deploy/reload.mjs start         # scale up — bitdex-sync drives the rest
-node .claude/skills/deploy/reload.mjs monitor       # tail pg-sync logs until load completes
+node .claude/skills/deploy/reload.mjs preflight              # verify shadow OFF, Flux suspended
+node .claude/skills/deploy/reload.mjs pin-cursor --replica=1 # hold the retention floor for the pod you rebuild SECOND
+node .claude/skills/deploy/reload.mjs suspend                # scale StatefulSet to 0 (fleet-wide)
+node .claude/skills/deploy/reload.mjs nuke-pg                # drop triggers + truncate BitdexOps/bitdex_cursors
+node .claude/skills/deploy/reload.mjs wipe --replica=0       # wipe ONE replica's PVC
+node .claude/skills/deploy/reload.mjs start --replicas=2     # scale up — bitdex-sync drives the rest
+node .claude/skills/deploy/reload.mjs monitor --replica=0    # tail that pod's pg-sync logs
 ```
+
+Then, only once replica 0 is verified serving, wipe and rebuild replica 1 the same way.
+
+> **On a full hard nuke**, `nuke-pg` truncates `bitdex_cursors`, so the pin is gone and the ops table restarts from empty — no retention floor to protect. The pin matters when you rebuild **one** pod against a live ops table, which is the common case and the one that bit us.
 
 | # | Step | What it does |
 |---|------|---|
 | 1 | `preflight` | Verify shadow OFF, Flux suspended, note current image. Read-only — does not mutate cluster state. |
-| 2 | `suspend` | Scale StatefulSet to 0, force-delete `bitdex-0` pod, verify pod count = 0. |
+| — | `pin-cursor` | `--replica=N` required. Upserts that replica's `bitdex_cursors` row to `MAX(BitdexOps.id)` so `cleanup_bitdex_ops` cannot trim ops it will need. See §The cursor-pin trap. |
+| 2 | `suspend` | Scale StatefulSet to 0, force-delete **every** `bitdex-N` pod, verify no `bitdex-N` pod remains. (The old check grepped `^bitdex-0` only and reported "Pods: 0" while `bitdex-1` was still Terminating.) |
 | 3 | `nuke-pg` | Run `sql/nuke-pg-state.sql` (pass 1, lock_timeout=5s) + `sql/nuke-pg-state-retry.sql` (pass 2, retry up to 8x) against the PG primary writer. Drops every `bitdex_*` trigger + function, truncates `BitdexOps` + `bitdex_cursors`. |
-| 4 | `wipe` | Mount PVC via ephemeral busybox; `rm -rf /data/*` (full PVC wipe). The `init-config` init container restores `config.yaml` + `ui-config.yaml` from the configmap and recreates `/data/{indexes/civitai,wal,indexes/civitai/load_stage}` on next pod boot, so the wipe leaves no stale shards, WAL bytes, or unknown future files. |
-| 5 | `start` | `scale --replicas=1`. The bitdex-sync sidecar runs `run_boot_sequence` autonomously: setup_v2 (re-installs triggers from sync config + creates `BitdexOps`/`bitdex_cursors`) → captures pre-dump cursor → streams CSVs from PG → registers each phase via `PUT /dumps` + `POST /dumps/{name}/loaded` → polls completion → seeds cursor → transitions to ops poller. |
-| 6 | `monitor` | `kubectl logs -f bitdex-0 -c pg-sync`. Detach with Ctrl-C; load continues regardless. Re-run `monitor` to reattach. |
+| 4 | `wipe` | `--replica=N` required. Mounts **that replica's** PVC via an ephemeral busybox pinned to that replica's node; `rm -rf /data/*` (full PVC wipe). The `init-config` init container restores `config.yaml` + `ui-config.yaml` from the configmap and recreates `/data/{indexes/civitai,wal,indexes/civitai/load_stage}` on next pod boot, so the wipe leaves no stale shards, WAL bytes, or unknown future files. |
+| 5 | `start` | `scale --replicas=N` (`--replicas=` flag, default 2). Warns if any pod stays `Pending` — its PVC pins it to one node, so it waits for headroom *there*. The bitdex-sync sidecar runs `run_boot_sequence` autonomously: setup_v2 (re-installs triggers from sync config + creates `BitdexOps`/`bitdex_cursors`) → captures pre-dump cursor → streams CSVs from PG → registers each phase via `PUT /dumps` + `POST /dumps/{name}/loaded` → polls completion → seeds cursor → transitions to ops poller. |
+| 6 | `monitor` | `--replica=N` required. `kubectl logs -f bitdex-N -c pg-sync`. Detach with Ctrl-C; load continues regardless. Re-run `monitor` to reattach. |
 
 ### Why no manual cursor-reset / dump / transfer / load steps?
 
@@ -174,11 +248,11 @@ The `reload.mjs nuke-pg` step automates both passes and reports the final count.
 ```bash
 node .claude/skills/deploy/cli.mjs nuke-pg
 # or run the SQL files directly:
-kubectl --context civit-datapacket exec -i -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -i -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai < .claude/skills/deploy/sql/nuke-pg-state.sql
 ```
 
-The writer pod name (`cnpg-cluster-nvme0-3` at time of writing) can shift across CNPG failovers. Verify before running:
+The writer pod name (`cnpg-cluster-nvme0-5` at time of writing — it has been `nvme0-3` and `nvme0-2` before) shifts across CNPG failovers. Verify before running:
 ```bash
 kubectl --context civit-datapacket get pod -n cnpg-database -l role=primary
 ```
@@ -223,12 +297,28 @@ After `monitor` reports "All dump phases complete" and `alive_count` is climbing
    ```
    Should return `{"ids":[129087101],...}`.
 
-4. **Re-enable shadow flag** via flipt-state once smoke tests pass:
+4. **Verify scheduled-publish health (post-#339).** Read stored documents, not bitmaps — `postId` is `per_value_lazy`, so `postId eq X` returns a partial set and is not a membership instrument. Take a sample of images PG says were scheduled-then-published, plus a control sample of immediately-published ones, and read each doc:
+
+   ```bash
+   curl -s -X POST http://127.0.0.1:4099/api/indexes/civitai/document \
+     -H 'content-type: application/json' \
+     -d '{"slot_id":<imageId>,"fields":["publishedAt","isPublished","sortAt","postId"]}'
+   ```
+
+   The stuck signature is `publishedAt == 0` on a doc PG says published in the past — no repair op can heal it, because arming requires a *future* timestamp. Expect **0** in both samples. Pre-#339 the scheduled group ran ~1.2%; the control group was always 0, which is what makes it a control.
+
+5. **Re-enable shadow flag** via flipt-state once smoke tests pass:
    ```bash
    node .claude/skills/deploy/flipt/flipt.mjs shadow on
    ```
 
-5. **Resume Flux** by reverting the `suspend: true` commit in talos-infra `clusters/production/flux-system/apps/bitdex/bitdex.yaml`.
+6. **Resume Flux** by reverting the `suspend: true` commit in talos-infra `clusters/production/flux-system/apps/bitdex/bitdex.yaml`. **Nothing bitdex-side reconciles until you do** — image pins, config, replica count all sit frozen. Verify:
+   ```bash
+   kubectl --context civit-datapacket get kustomization bitdex -n flux-system -o jsonpath='{.spec.suspend}'
+   # must print: false (or be unset)
+   ```
+
+7. **Undo any temporary capacity reservation** you made in pre-flight step 3b (e.g. revert the Tekton node exclusion), so the spare compute goes back to its normal tenant.
 
 ---
 
@@ -281,7 +371,7 @@ If a phase fails partway, the sidecar retries on next pod restart but does NOT a
 
 If the retry pass leaves >4 triggers, manual escalation:
 ```bash
-kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai -c "
     SELECT pg_blocking_pids(pid), pid, query, state
     FROM pg_stat_activity
@@ -293,19 +383,41 @@ This shows which civitai app queries are blocking the drop. Either wait for them
 
 If the seeded cursor is too low, the ops poller reprocesses old ops harmlessly (LIFO dedup). If too high, ops are lost. To force a re-seed at a specific value:
 ```bash
-kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-3 -c postgres -- \
+kubectl --context civit-datapacket exec -n cnpg-database cnpg-cluster-nvme0-5 -c postgres -- \
   psql -U postgres -d civitai -c "
     UPDATE bitdex_cursors SET last_outbox_id = <value>, updated_at = now()
     WHERE replica_id = 'pg-sync-bitdex-0';"
 ```
 Then bounce the pod.
 
-### "Pod stuck Pending" (not nuke-related but easy to confuse)
+### Ops-poller reports a hole above the cursor
 
-Check node memory; another tenant may have packed onto the node:
-```bash
-kubectl --context civit-datapacket describe node talos-wjh-tgy | grep -A 20 "Allocated resources"
 ```
+ALERT — hole above id 5502 exceeds 100000 ids
+```
+
+The pod's cursor is below `MIN(BitdexOps.id)` — the ops it needs were deleted by `cleanup_bitdex_ops` while it was rebuilding. This is the cursor-pin trap; see §The cursor-pin trap. There is no incremental recovery: the pod has a gap in its op stream and must be rebuilt again, this time with its cursor pinned first.
+
+```sql
+SELECT replica_id, last_outbox_id FROM bitdex_cursors ORDER BY replica_id;
+SELECT min(id), max(id) FROM "BitdexOps";
+```
+
+### "Pod stuck Pending"
+
+Each pod requests 8 CPU / 32Gi and its PVC pins it to exactly one node, so "Pending" always means *that node* lacks headroom — there is no second placement to fall back to.
+
+```bash
+kubectl --context civit-datapacket describe pod bitdex-1 -n bitdex | tail -20
+kubectl --context civit-datapacket describe node talos-48r-b3a | sed -n '/Allocated resources/,/Events/p'
+```
+
+To see who took the capacity:
+```bash
+kubectl --context civit-datapacket get pods -A --field-selector spec.nodeName=talos-48r-b3a
+```
+
+`talos-48r-b3a` is shared with the Tekton build pool, which is the usual culprit. Excluding it from that pool (talos-infra #1096) stops *new* PipelineRuns from landing, but in-flight PipelineRuns keep spawning task pods using the podTemplate captured when they were created — so expect a drain delay, not an immediate eviction. This is why pre-flight step 3b reserves capacity *before* the pod goes down.
 
 ---
 
@@ -314,14 +426,16 @@ kubectl --context civit-datapacket describe node talos-wjh-tgy | grep -A 20 "All
 - **Never** wipe while shadow is ON. Mirrored prod traffic will see hard errors.
 - **Never** skip the suspend step. Without `suspend: true` in talos-infra git, Flux will reconcile your scale-to-0 back to scale-to-1 within ~5 min.
 - **Verify the writer pod** before running `nuke-pg`. CNPG failovers shift the primary; targeting a replica fails the truncates.
+- **Never rebuild both replicas concurrently.** See §The cursor-pin trap — the healthy pod's progress deletes the rebuilding pod's ops.
+- **Never scale down without checking node headroom first.** The PVC pins each pod to one node; if another tenant takes the freed capacity while the pod is down, it cannot reschedule anywhere.
 - **Rollback after wipe is a re-run, not a revert.** If v1.0.201 misbehaves post-nuke, rolling back to v1.0.200 means re-running the hard nuke against v1.0.200 — the bug recurs because the broken state is gone. Only worth doing if v1.0.201 is fundamentally broken (panic loop, OOM).
 
 ---
 
 ## Related
 
-- `.claude/skills/deploy/reload.mjs` — orchestrated 6-step hard nuke
-- `.claude/skills/deploy/cli.mjs` — `wipe`, `nuke-pg`, `cursor-read`, `cleanup`, `csv-dump-*`, `metrics-now`
+- `.claude/skills/deploy/reload.mjs` — orchestrated hard nuke; replica-aware (`--replica=N`), plus `pin-cursor`
+- `.claude/skills/deploy/cli.mjs` — `wipe` (soft, **both** PVCs), `nuke-pg`, `cursor-read`, `cursor-set` (writes both replica rows), `cleanup`, `csv-dump-*`, `metrics-now`
 - `.claude/skills/deploy/sql/nuke-pg-state.sql` + `nuke-pg-state-retry.sql` — bundled SQL assets
 - `config/sync-civitai.yaml` — source of truth for dump phases + trigger configs
 - `src/bin/pg_sync.rs` — sidecar autonomous boot sequence (read this if the boot phase is doing something unexpected)
