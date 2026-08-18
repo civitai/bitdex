@@ -97,3 +97,12 @@ $$ LANGUAGE plpgsql;
 --       RETURN NEW;
 --   END;
 --   $$ LANGUAGE plpgsql;
+
+-- Applied alongside the floor (approved separately): pin autovacuum to a fixed
+-- dead-tuple threshold instead of 20% of a table that just grew ~20x. Keeps the
+-- dead index entries at the PK head — which this function's first statement
+-- walks on every firing — bounded regardless of how long the window gets.
+--   ALTER TABLE "BitdexOps" SET (autovacuum_vacuum_scale_factor = 0,
+--                                autovacuum_vacuum_threshold = 2000);
+-- Undo: ALTER TABLE "BitdexOps" RESET (autovacuum_vacuum_scale_factor,
+--                                      autovacuum_vacuum_threshold);

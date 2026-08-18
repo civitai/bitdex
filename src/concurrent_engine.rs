@@ -15269,19 +15269,23 @@ mod tests {
         // At least bit 8 should be set for slot 1. Flush appends sort ops to
         // the PACKED per-field shard — the file `load_sort_layers` reads at
         // boot (fix 2026-07-10: legacy per-layer appends were dead writes).
+        // Wait for the BIT, not merely for the file. The shard existing and the
+        // shard containing this insert are two different events: the flush
+        // thread can create the packed shard and land bit 8 in separate writes,
+        // so a wait that stops at `Ok(Some(_))` and then asserts on the contents
+        // reads whatever happened to be on disk in between. That is a
+        // read-before-ready race living in the assertion rather than the diff,
+        // and it is what turned this test red on CI (green in isolation, green
+        // on re-run) while looking like a correct wait-then-assert.
         assert!(
             wait_until(60000, || {
-                matches!(sort_store.load_sort_layers("reactionCount", 32), Ok(Some(_)))
+                matches!(
+                    sort_store.load_sort_layers("reactionCount", 32),
+                    Ok(Some(layers)) if layers[8].contains(1)
+                )
             }),
-            "timed out waiting for the flush thread to write the packed sort shard to disk",
-        );
-        let layers = sort_store
-            .load_sort_layers("reactionCount", 32)
-            .unwrap()
-            .expect("packed sort shard should exist after insert");
-        assert!(
-            layers[8].contains(1),
-            "sort layer bit8 should contain slot 1 for reactionCount=500",
+            "timed out waiting for the flush thread to write sort layer bit8 \
+             (slot 1, reactionCount=500) to the packed shard on disk",
         );
         // Insert more docs to accumulate ops, then verify compaction works
         for i in 2..=5u32 {
