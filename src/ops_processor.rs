@@ -744,12 +744,7 @@ fn accum_set_sort(
         }
     }
 }
-/// Check if an entity's ops contain a deferred alive condition (future publishedAt).
-fn check_deferred_alive(meta: &FieldMeta, ops: &[Op]) -> bool {
-    check_deferred_alive_secs(meta, ops).is_some()
-}
-
-/// Same as `check_deferred_alive` but returns the activation timestamp (seconds
+/// Returns the deferred-alive activation timestamp (seconds
 /// since epoch) when deferral applies. Used by `apply_query_op_set` to register
 /// deferred fan-out slots without a second scan of the ops.
 fn check_deferred_alive_secs(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
@@ -1231,20 +1226,47 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // If creates_slot=true and publishedAt is in the future, skip ALL bitmaps
         // (alive + filter + sort). Only write docstore so activate_due() can
         // rebuild bitmaps later.
-        let is_deferred = if creates_slot {
-            check_deferred_alive(meta, &entry.ops)
+        //
+        // Resolved with `get_future_schedule`, NOT the Set-only
+        // `check_deferred_alive`: the schedule can arrive as a value-bearing
+        // Remove (the trigger's future guard), and it can arrive that way even
+        // on an insert. An image uploaded into a scheduled post carries
+        // `Set{publishedAt, Tf}` from its own INSERT row; if the post is
+        // rescheduled in the same batch, the fan-out's `Remove{publishedAt, Tf'}`
+        // supersedes that Set and dedup drops it — leaving a Set-only gate
+        // blind, the slot inserted ALIVE, and its future `sortAt` written
+        // straight into the live sort layers. That is the 2026-07-18 leak class.
+        //
+        // `get_future_schedule` is last-op-wins across BOTH Sets and Removes, so
+        // it also resolves the ordinary Set-only insert identically.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let deferred_at = if creates_slot {
+            get_future_schedule(meta, &entry.ops, now_secs)
         } else {
-            false
+            None
         };
-        if is_deferred {
+        if let Some(da_secs) = deferred_at {
             // Schedule deferred alive + write docstore only (no bitmap ops)
-            let da_secs = get_deferred_timestamp(meta, &entry.ops).unwrap_or(0);
+            let da_field_name = meta
+                .deferred_alive_field
+                .as_ref()
+                .map(|(f, _)| f.to_string())
+                .unwrap_or_default();
             sink.deferred_alive(slot, da_secs);
             if let Some(ref mut dw) = doc_writer {
                 for op in &entry.ops {
                     match op {
                         Op::Set { field, value } => dw.write_set(slot, field, value),
                         Op::Add { field, value } => dw.write_add(slot, field, value),
+                        // A remove carrying the schedule stores the SCHEDULE —
+                        // activation replays this doc, and a doc with no
+                        // publishedAt activates as a draft that never publishes.
+                        Op::Remove { field, value } if *field == da_field_name => {
+                            dw.write_set(slot, field, value)
+                        }
                         _ => {}
                     }
                 }
@@ -3927,6 +3949,83 @@ mod tests {
         );
     }
 
+    /// An INSERT whose schedule is superseded by a Remove in the same batch must
+    /// still DEFER — the insert-time deferral gate cannot be Set-only.
+    ///
+    /// Concrete arrival: a user uploads an image into a post scheduled for Tf,
+    /// then changes the schedule to Tf'. The image's own INSERT row carries
+    /// `Set{publishedAt, Tf}` and `Set{sortAt, Tf}` (both future); the post
+    /// fan-out's UPDATE row carries the guarded `Remove{publishedAt, Tf'}`. Both
+    /// land in one batch, dedup drops the superseded Set, and a Set-only gate
+    /// then sees no schedule at all: the slot is inserted ALIVE with a FUTURE
+    /// sortAt written into the live sort layers — the 2026-07-18 leak class —
+    /// with publishedAt stripped from its doc, so neither the overdue sweep nor
+    /// the drained-map re-arm can recover it.
+    #[test]
+    fn test_creates_slot_defers_when_schedule_arrives_as_remove() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 21;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let tf = now + 3_600; // schedule the image was inserted with
+        let tf_prime = now + 9_000; // schedule the post was moved to
+
+        let mut rec = RecordingSink::new();
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(900) },
+                Op::Set { field: "existedAt".into(), value: json!(now - 60) },
+                Op::Set { field: "publishedAt".into(), value: json!(tf) },
+                Op::Set { field: "sortAt".into(), value: json!(tf) },
+                Op::Remove { field: "publishedAt".into(), value: json!(tf_prime) },
+            ],
+        }];
+        // Dedup first — this is what the WAL reader does, and dropping the
+        // superseded Set is the whole point of the arrival-order rule.
+        crate::pg_sync::op_dedup::dedup_ops(&mut batch);
+        assert!(
+            !batch[0].ops.iter().any(
+                |op| matches!(op, Op::Set { field, .. } if field == "publishedAt")
+            ),
+            "precondition: dedup drops the superseded publishedAt Set — without \
+             that this test proves nothing: {:?}",
+            batch[0].ops
+        );
+
+        apply_ops_batch(&mut rec, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        dw.flush();
+
+        assert_eq!(
+            rec.deferred_alive,
+            vec![(slot, tf_prime as u64)],
+            "the insert must defer at the SUPERSEDING schedule"
+        );
+        assert!(
+            rec.alive_inserts.is_empty(),
+            "a scheduled image must not be inserted alive: {:?}",
+            rec.alive_inserts
+        );
+        assert!(
+            rec.sort_sets.is_empty() && rec.filter_inserts.is_empty(),
+            "a deferred insert writes NO bitmaps — a future sortAt in the live \
+             layers is the 2026-07-18 leak. sorts: {:?} filters: {:?}",
+            rec.sort_sets,
+            rec.filter_inserts
+        );
+        assert_eq!(
+            doc_int_field(&engine, slot, "publishedAt"),
+            Some(tf_prime),
+            "the doc must carry the schedule for activation replay"
+        );
+    }
+
     /// The old-side remove is what clears the previous timestamp out of the
     /// sort layers on an ALIVE slot.
     ///
@@ -5639,7 +5738,12 @@ mod tests {
         assert_eq!(rec.deferred_alive.len(), 1, "unpublish must activate as draft");
         let (s, at) = rec.deferred_alive[0];
         assert_eq!(s, slot);
-        assert!((at as i64) <= now + 5, "activation must be immediate, got {at}");
+        // Bounded on BOTH sides: an upper bound alone also passes for a wrong
+        // reschedule into the past.
+        assert!(
+            (at as i64) >= now - 5 && (at as i64) <= now + 5,
+            "activation must be immediate (~now), got {at}"
+        );
     }
 
     /// The drained-map class (2026-08-07): a slot that is not alive, NOT in

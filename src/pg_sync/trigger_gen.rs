@@ -1937,7 +1937,13 @@ sync_sources:
         let sql = generate_trigger_sql(&source);
 
         let insert_at = sql.find("IF TG_OP = 'INSERT' THEN").expect("INSERT branch");
-        let update_at = sql.find("  ELSE\n").expect("UPDATE branch");
+        // Anchor on the UPDATE branch's own first statement rather than a bare
+        // `ELSE`, which would silently split on the wrong boundary if the
+        // codegen ever grows an earlier one.
+        let update_at = sql[insert_at..]
+            .find("  ELSE\n    _ops := '[]'::jsonb;\n")
+            .map(|i| i + insert_at)
+            .expect("UPDATE branch");
         assert!(insert_at < update_at, "unexpected branch order:\n{sql}");
         let insert_branch = &sql[insert_at..update_at];
         let update_branch = &sql[update_at..];
