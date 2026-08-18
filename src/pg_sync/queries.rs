@@ -170,6 +170,8 @@ CREATE TABLE IF NOT EXISTS "BitdexOps" (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_bitdex_ops_id ON "BitdexOps" (id);
+-- Supports the retention floor's ceiling lookup in cleanup_bitdex_ops().
+CREATE INDEX IF NOT EXISTS idx_bitdex_ops_created_at ON "BitdexOps" (created_at);
 
 -- Cursor tracking table for multi-replica ops consumption
 CREATE TABLE IF NOT EXISTS bitdex_cursors (
@@ -179,11 +181,42 @@ CREATE TABLE IF NOT EXISTS bitdex_cursors (
 );
 
 -- Auto-cleanup trigger: when any replica reports its cursor, delete old ops
--- that ALL replicas have already consumed.
+-- that ALL replicas have already consumed AND that are older than the
+-- retention floor.
+--
+-- The consumed-by-all condition alone gives ~48s of retention in prod (rows die
+-- as soon as both pods ack them), which makes every write-path defect
+-- unobservable after the fact: by the time a bad document is noticed, the ops
+-- that produced it are gone and the mechanism can only be inferred from
+-- document state. The floor keeps a bounded window of consumed ops readable.
+-- At the measured ~117 rows/s that is ~840k rows resident for 2h.
+--
+-- The floor is applied as an id CEILING rather than as a `created_at` predicate
+-- on the DELETE: this trigger fires on every cursor report (once per poll per
+-- replica), so the DELETE must stay a bounded index range on id and must not
+-- re-scan the retained window each time. id and created_at are both monotonic
+-- in insert order, so the newest row older than the cutoff is a valid ceiling.
 CREATE OR REPLACE FUNCTION cleanup_bitdex_ops() RETURNS trigger AS $$
+DECLARE
+    _consumed_below BIGINT;
+    _retained_below BIGINT;
 BEGIN
+    SELECT MIN(last_outbox_id) INTO _consumed_below FROM bitdex_cursors;
+    IF _consumed_below IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT id INTO _retained_below
+    FROM "BitdexOps"
+    WHERE created_at < now() - interval '2 hours'
+    ORDER BY created_at DESC
+    LIMIT 1;
+    IF _retained_below IS NULL THEN
+        RETURN NEW;
+    END IF;
+
     DELETE FROM "BitdexOps"
-    WHERE id < (SELECT MIN(last_outbox_id) FROM bitdex_cursors);
+    WHERE id < LEAST(_consumed_below, _retained_below);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
