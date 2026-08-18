@@ -77,9 +77,27 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
     let mut last_set: HashMap<String, serde_json::Value> = HashMap::new();
     let mut last_remove: HashMap<String, serde_json::Value> = HashMap::new();
 
+    // Which op ARRIVED last for each scalar field, and the order fields were
+    // first seen. Both exist so the rebuilt vec is a function of arrival order
+    // only — never of hash iteration order.
+    //
+    // The kind matters on its own: a field can end on a Remove even though the
+    // batch also contains a Set for it (publish at T, then reschedule to T+n
+    // inside one batch). Emitting the Set regardless would apply the superseded
+    // op — deterministically wrong rather than randomly wrong. The last op is
+    // the state PG ended in, so it is the one that survives.
+    let mut last_scalar_is_set: HashMap<String, bool> = HashMap::new();
+    let mut scalar_field_order: Vec<String> = Vec::new();
+
     // Track add/remove for multi-value fields (net operations)
     // Key: (field, value_as_string), Value: net count (+1 for add, -1 for remove)
+    // `multi_value_order` keeps first-arrival order for the rebuild: the net
+    // counts are order-independent, but the ops emitted from them are not.
+    // A schedule field carrying two value-bearing removes lands here (no Set on
+    // the field ⇒ classified multi-value), and the engine reads the LAST one —
+    // so hash order used to decide which schedule won.
     let mut multi_value_net: HashMap<(String, String), i64> = HashMap::new();
+    let mut multi_value_order: Vec<(String, String)> = Vec::new();
 
     // Track queryOpSet by query string — MERGE nested ops, never last-wins.
     //
@@ -96,27 +114,47 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
     // LIFO rules as entity ops, so same-field conflicts still resolve
     // last-wins per FIELD — never per fan-out.
     let mut query_ops: HashMap<Option<String>, Vec<Op>> = HashMap::new();
+    let mut query_order: Vec<Option<String>> = Vec::new();
 
     for op in all_ops {
         match op {
             Op::Set { ref field, ref value } => {
-                last_set.insert(field.clone(), value.clone());
+                if last_set.insert(field.clone(), value.clone()).is_none()
+                    && !last_remove.contains_key(field)
+                {
+                    scalar_field_order.push(field.clone());
+                }
+                last_scalar_is_set.insert(field.clone(), true);
             }
             Op::Remove { ref field, ref value } => {
                 if set_fields.contains(field) {
                     // Scalar field: this remove is paired with a set (old value cleanup)
-                    last_remove.insert(field.clone(), value.clone());
+                    if last_remove.insert(field.clone(), value.clone()).is_none()
+                        && !last_set.contains_key(field)
+                    {
+                        scalar_field_order.push(field.clone());
+                    }
+                    last_scalar_is_set.insert(field.clone(), false);
                 } else {
                     // Multi-value field: track net operations
                     let key = (field.clone(), value.to_string());
+                    if !multi_value_net.contains_key(&key) {
+                        multi_value_order.push(key.clone());
+                    }
                     *multi_value_net.entry(key).or_insert(0) -= 1;
                 }
             }
             Op::Add { ref field, ref value } => {
                 let key = (field.clone(), value.to_string());
+                if !multi_value_net.contains_key(&key) {
+                    multi_value_order.push(key.clone());
+                }
                 *multi_value_net.entry(key).or_insert(0) += 1;
             }
             Op::QueryOpSet { ref query, ops: ref nested_ops } => {
+                if !query_ops.contains_key(query) {
+                    query_order.push(query.clone());
+                }
                 query_ops
                     .entry(query.clone())
                     .or_default()
@@ -127,23 +165,38 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
         }
     }
 
-    // Rebuild: remove ops first, then set ops (order matters for bitmap updates)
-    for (field, value) in &last_remove {
-        ops.push(Op::Remove {
-            field: field.clone(),
-            value: value.clone(),
-        });
+    // Rebuild: remove ops first, then set ops (order matters for bitmap
+    // updates), each in first-arrival field order.
+    for field in &scalar_field_order {
+        if let Some(value) = last_remove.get(field) {
+            ops.push(Op::Remove {
+                field: field.clone(),
+                value: value.clone(),
+            });
+        }
     }
 
-    for (field, value) in last_set {
-        ops.push(Op::Set { field, value });
+    for field in &scalar_field_order {
+        // A field whose LAST arriving op was a Remove keeps only that remove:
+        // its Set was superseded within this batch.
+        if !last_scalar_is_set.get(field).copied().unwrap_or(false) {
+            continue;
+        }
+        if let Some(value) = last_set.get(field) {
+            ops.push(Op::Set {
+                field: field.clone(),
+                value: value.clone(),
+            });
+        }
     }
 
-    // Multi-value: emit net operations
-    for ((field, value_str), net) in multi_value_net {
+    // Multi-value: emit net operations, in first-arrival order
+    for key in multi_value_order {
+        let net = multi_value_net.get(&key).copied().unwrap_or(0);
         if net == 0 {
             continue; // Cancelled out
         }
+        let (field, value_str) = key;
         let value: serde_json::Value = serde_json::from_str(&value_str)
             .unwrap_or(serde_json::Value::String(value_str));
         if net > 0 {
@@ -153,8 +206,12 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
         }
     }
 
-    // QueryOpSets: one per query string, nested ops merged + field-deduped.
-    for (query, mut nested) in query_ops {
+    // QueryOpSets: one per query string, nested ops merged + field-deduped,
+    // emitted in first-arrival order.
+    for query in query_order {
+        let Some(mut nested) = query_ops.remove(&query) else {
+            continue;
+        };
         dedup_entity_ops(&mut nested);
         if !nested.is_empty() {
             ops.push(Op::QueryOpSet { query, ops: nested });
@@ -367,5 +424,103 @@ mod tests {
             .filter(|op| matches!(op, Op::Add { field, .. } if field == "tagIds"))
             .collect();
         assert_eq!(adds.len(), 1);
+    }
+
+    /// Value-bearing removes on a field with no Set are classified as
+    /// multi-value ops and ALL survive — so the order they are re-emitted in is
+    /// the order a last-op-wins consumer reads. It must be arrival order, never
+    /// hash order.
+    ///
+    /// This is the second half of the 2026-08-18 scheduled-publish defect: the
+    /// engine reads the last remove on the schedule field to decide when to
+    /// activate a slot. With hash ordering it took an arbitrary one of them.
+    /// The emission fix stops a single ROW carrying two; a batch that merges two
+    /// rows (schedule, then reschedule) still delivers both, and the later one
+    /// has to win.
+    #[test]
+    fn test_multi_value_removes_keep_arrival_order() {
+        // Enough distinct values that landing in arrival order by luck is not a
+        // plausible explanation for a pass.
+        let values: Vec<i64> = (1..=20).map(|i| 1_800_000_000 + i).collect();
+        let mut batch = vec![entity(
+            1,
+            values
+                .iter()
+                .map(|v| Op::Remove { field: "publishedAt".into(), value: json!(v) })
+                .collect(),
+        )];
+        dedup_ops(&mut batch);
+
+        let seen: Vec<i64> = batch[0]
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Remove { field, value } if field == "publishedAt" => value.as_i64(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen, values,
+            "value-bearing removes must be re-emitted in arrival order — a \
+             last-op-wins consumer reads the last one as the current value"
+        );
+    }
+
+    /// A Set superseded by a later Remove on the same field must NOT be
+    /// re-emitted: within one batch the last arriving op is the state PG ended
+    /// in. Publish-then-reschedule produces exactly this shape (set publishedAt
+    /// = now, then remove publishedAt = future schedule), and re-emitting the
+    /// Set publishes content PG considers scheduled.
+    #[test]
+    fn test_later_remove_supersedes_earlier_set() {
+        let future = 1_900_000_000_i64;
+        let mut batch = vec![entity(
+            1,
+            vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(1_700_000_000_i64) },
+                Op::Set { field: "publishedAt".into(), value: json!(1_800_000_000_i64) },
+                Op::Remove { field: "publishedAt".into(), value: json!(future) },
+            ],
+        )];
+        dedup_ops(&mut batch);
+
+        let ops = &batch[0].ops;
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::Set { field, .. } if field == "publishedAt")),
+            "the superseded Set must not survive: {ops:?}"
+        );
+        let removes: Vec<i64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Remove { field, value } if field == "publishedAt" => value.as_i64(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            removes,
+            vec![future],
+            "only the last arriving op survives, carrying its value: {ops:?}"
+        );
+    }
+
+    /// The ordinary scalar shape is unaffected: a remove of the OLD value
+    /// followed by a set of the NEW one still yields both, remove first.
+    #[test]
+    fn test_remove_then_set_keeps_both_remove_first() {
+        let mut batch = vec![entity(
+            1,
+            vec![
+                Op::Remove { field: "availability".into(), value: json!("Private") },
+                Op::Set { field: "availability".into(), value: json!("Public") },
+            ],
+        )];
+        dedup_ops(&mut batch);
+        assert_eq!(
+            batch[0].ops,
+            vec![
+                Op::Remove { field: "availability".into(), value: json!("Private") },
+                Op::Set { field: "availability".into(), value: json!("Public") },
+            ]
+        );
     }
 }
