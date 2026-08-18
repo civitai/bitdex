@@ -5,51 +5,53 @@
 -- to be diagnosed from resulting document state rather than from the ops that
 -- produced it. This keeps a bounded 2h window of consumed ops readable.
 --
--- Cost: ~117 rows/s measured => ~840k rows resident.
+-- NO new index. The table takes ~117 inserts/s and this trigger fires on every
+-- cursor report, so neither extra write amplification nor an unbounded scan is
+-- acceptable. The DELETE instead walks the PRIMARY KEY over a fixed-width id
+-- window starting at the oldest surviving row: ids are assigned in insert
+-- order, so "oldest by id" is "oldest by created_at". Work per firing is capped
+-- at ~5,000 index entries and is LESS than the previous unbounded
+-- `DELETE ... WHERE id < MIN(last_outbox_id)`.
 --
--- The floor is an id CEILING, not a created_at predicate on the DELETE: the
--- trigger fires on every cursor report, so the DELETE must stay a bounded
--- index range on id. id and created_at are both monotonic in insert order.
+-- The window is bounded by id arithmetic, not by a match count: `LIMIT n` on a
+-- created_at predicate would, once the floor has caught up, walk every retained
+-- row looking for matches it will not find.
 --
--- Step 1 runs OUTSIDE a transaction (CONCURRENTLY). Step 2 is a plain
--- CREATE OR REPLACE and is safe to run while the pipeline is live.
+-- Cost: ~117 rows/s => ~840k rows resident instead of a few thousand. That is
+-- the whole price of the change — a larger live table for autovacuum to keep
+-- up with, and no new index to maintain on the insert path.
+--
+-- Single CREATE OR REPLACE, safe to run while the pipeline is live.
 
--- 1) index backing the ceiling lookup
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bitdex_ops_created_at
-    ON "BitdexOps" (created_at);
-
--- 2) cleanup function with the retention floor
 CREATE OR REPLACE FUNCTION cleanup_bitdex_ops() RETURNS trigger AS $$
 DECLARE
     _consumed_below BIGINT;
-    _retained_below BIGINT;
+    _oldest BIGINT;
+    _chunk BIGINT := 5000;
 BEGIN
     SELECT MIN(last_outbox_id) INTO _consumed_below FROM bitdex_cursors;
     IF _consumed_below IS NULL THEN
         RETURN NEW;
     END IF;
 
-    SELECT id INTO _retained_below
-    FROM "BitdexOps"
-    WHERE created_at < now() - interval '2 hours'
-    ORDER BY created_at DESC
-    LIMIT 1;
-    IF _retained_below IS NULL THEN
+    SELECT id INTO _oldest FROM "BitdexOps" ORDER BY id LIMIT 1;
+    IF _oldest IS NULL THEN
         RETURN NEW;
     END IF;
 
     DELETE FROM "BitdexOps"
-    WHERE id < LEAST(_consumed_below, _retained_below);
+    WHERE id >= _oldest
+      AND id < LEAST(_consumed_below, _oldest + _chunk)
+      AND created_at < now() - interval '2 hours';
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- Verify (expect a spread of ~2h once it has been running that long, and a
--- count on the order of 840k rather than a few thousand):
+-- Verify, a few minutes apart (expect the spread to grow towards 2h and the
+-- count towards ~840k, then hold):
 --   SELECT count(*), min(created_at), max(created_at) FROM "BitdexOps";
 --
--- Rollback: re-apply the pre-floor body from src/pg_sync/queries.rs history,
--- or simply
+-- Rollback — restore the pre-floor body:
 --   CREATE OR REPLACE FUNCTION cleanup_bitdex_ops() RETURNS trigger AS $$
 --   BEGIN
 --       DELETE FROM "BitdexOps"
