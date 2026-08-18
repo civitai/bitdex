@@ -66,6 +66,20 @@ pub fn dedup_ops(batch: &mut Vec<EntityOps>) {
         .collect();
 }
 
+/// Record a multi-value key at the BACK of the emission order, moving it there
+/// if it is already present.
+///
+/// Emission order is what a last-op-wins consumer reads as the current value,
+/// so a key that arrives again must move — otherwise a value that is set, then
+/// abandoned, then set again is emitted at its first position and something
+/// else lands last. Linear, over a handful of keys per entity.
+fn touch_multi_value_key(order: &mut Vec<(String, String)>, key: &(String, String)) {
+    if let Some(pos) = order.iter().position(|k| k == key) {
+        order.remove(pos);
+    }
+    order.push(key.clone());
+}
+
 /// Dedup ops for a single entity. Mutates the vec in place.
 fn dedup_entity_ops(ops: &mut Vec<Op>) {
     if ops.is_empty() {
@@ -106,11 +120,20 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
 
     // Track add/remove for multi-value fields (net operations)
     // Key: (field, value_as_string), Value: net count (+1 for add, -1 for remove)
-    // `multi_value_order` keeps first-arrival order for the rebuild: the net
+    //
+    // `multi_value_order` keeps LAST-arrival order for the rebuild: the net
     // counts are order-independent, but the ops emitted from them are not.
     // A schedule field carrying two value-bearing removes lands here (no Set on
     // the field ⇒ classified multi-value), and the engine reads the LAST one —
     // so hash order used to decide which schedule won.
+    //
+    // Last-arrival, not first: a key that arrives AGAIN moves to the back. When
+    // a schedule is moved and moved back inside one batch (Tf → null → Tf, or
+    // Tf1 → Tf2 → Tf1) first-arrival order emits the abandoned value last and
+    // the engine arms at the wrong one — deterministically, where hash order at
+    // least got it right half the time. Reordering is harmless for genuine
+    // multi-value fields: their nets are per-key and their semantics are set-
+    // like, so only a last-op-wins consumer can tell the difference.
     let mut multi_value_net: HashMap<(String, String), i64> = HashMap::new();
     let mut multi_value_order: Vec<(String, String)> = Vec::new();
 
@@ -153,17 +176,13 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
                 } else {
                     // Multi-value field: track net operations
                     let key = (field.clone(), value.to_string());
-                    if !multi_value_net.contains_key(&key) {
-                        multi_value_order.push(key.clone());
-                    }
+                    touch_multi_value_key(&mut multi_value_order, &key);
                     *multi_value_net.entry(key).or_insert(0) -= 1;
                 }
             }
             Op::Add { ref field, ref value } => {
                 let key = (field.clone(), value.to_string());
-                if !multi_value_net.contains_key(&key) {
-                    multi_value_order.push(key.clone());
-                }
+                touch_multi_value_key(&mut multi_value_order, &key);
                 *multi_value_net.entry(key).or_insert(0) += 1;
             }
             Op::QueryOpSet { ref query, ops: ref nested_ops } => {
@@ -515,6 +534,55 @@ mod tests {
             removes,
             vec![future],
             "only the last arriving op survives, carrying its value: {ops:?}"
+        );
+    }
+
+    /// A value that arrives AGAIN moves to the back of the emission order.
+    ///
+    /// Both adversarial reviewers found this independently: keying emission
+    /// order on FIRST arrival is only the same as last arrival while the values
+    /// are distinct. A schedule moved and moved back inside one batch —
+    /// Tf → null → Tf, which is one user reverting a post to draft and
+    /// re-scheduling it to the same time — emits the abandoned `null` last, and
+    /// the engine reads that as an unschedule: the slot activates immediately as
+    /// a draft with its schedule stripped, so it is neither hidden until Tf nor
+    /// ever published. Deterministically wrong, where hash order at least got it
+    /// right half the time.
+    #[test]
+    fn test_repeated_value_moves_to_back_of_order() {
+        let tf = 1_900_000_000_i64;
+        let mut batch = vec![
+            // Tf → null (reverted to draft)
+            entity(
+                1,
+                vec![
+                    Op::Remove { field: "publishedAt".into(), value: json!(tf) },
+                    Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+                ],
+            ),
+            // null → Tf (re-scheduled to the same time)
+            entity(
+                1,
+                vec![
+                    Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+                    Op::Remove { field: "publishedAt".into(), value: json!(tf) },
+                ],
+            ),
+        ];
+        dedup_ops(&mut batch);
+
+        let last_pub = batch[0]
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Remove { field, .. } if field == "publishedAt"))
+            .next_back()
+            .expect("a publishedAt remove must survive");
+        assert_eq!(
+            last_pub,
+            &Op::Remove { field: "publishedAt".into(), value: json!(tf) },
+            "the LAST arriving value must be emitted last — the engine reads it \
+             as the current schedule: {:?}",
+            batch[0].ops
         );
     }
 

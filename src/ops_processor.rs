@@ -2813,11 +2813,23 @@ fn apply_query_op_set<S: BitmapSink>(
     // immediately writes publishedAt sort layers and flips the isPublished
     // shadow on already-alive image slots, leaking scheduled posts into queries.
     //
-    // Detection mirrors check_deferred_alive: if any nested Set targets the
-    // configured deferred_alive source field with a value > now, route every
-    // matched slot through the deferred path (write doc, skip bitmap, schedule
-    // activation). activate_due replays from the docstore at activation time —
-    // the doc already carries the future field values from the writes below.
+    // Detection is Set-only: if any nested Set targets the configured
+    // deferred_alive source field with a value > now, route every matched slot
+    // through the deferred path (write doc, skip bitmap, schedule activation).
+    // activate_due replays from the docstore at activation time — the doc
+    // already carries the future field values from the writes below.
+    //
+    // NOTE — this is the last Set-only schedule gate in the file, and it is
+    // blind to a schedule carried by the trigger's future-guarded REMOVE the
+    // same way the insert gate used to be (see `apply_ops_batch`, which now
+    // resolves with `get_future_schedule`). It is safe TODAY only because no
+    // `queryOpSet` source emits the guarded field: Post is `fan_out_per_row`
+    // (per-image direct ops), and the only `type: fan_out` sources track
+    // `baseModel`/`poi`. Adding the deferred-alive source field to a `fan_out`
+    // source makes this live, and it must switch to `get_future_schedule` at
+    // that point. Not switched here because on this path the matched slots are
+    // ALIVE, and deferring an already-alive slot is a behaviour change that
+    // wants its own proof — see the alive-slot limitation on PR #339.
     let deferred_at = check_deferred_alive_secs(meta, ops);
     // Apply nested ops to each matching slot. Seed with the deferred-slot reach
     // count so the caller's applied/skipped accounting includes rescheduled
@@ -4040,6 +4052,69 @@ mod tests {
     /// This is the alive-slot half of the guarded field, which the deferred
     /// tests above cannot see: deferred slots take a doc-only path and write no
     /// bitmaps at all.
+    #[test]
+    fn test_alive_slot_unpublish_clears_old_sort_bits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = deferred_reach_engine(&dir);
+        let meta = FieldMeta::from_config(engine.config());
+        let slot: u32 = 31;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let old_past = now - 86_400;
+
+        let mut sink = crate::ingester::CoalescerSink::new(engine.mutation_sender());
+        let mut dw = DocWriter::new(engine.docstore_arc());
+        let mut batch = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(700) },
+                Op::Set { field: "existedAt".into(), value: json!(old_past) },
+                Op::Set { field: "publishedAt".into(), value: json!(old_past) },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, Some(&engine), Some(&mut dw));
+        crate::ingester::BitmapSink::flush(&mut sink).unwrap();
+        dw.flush();
+        engine.force_publish_blocking(std::time::Duration::from_secs(5));
+        assert!(engine.is_slot_alive(slot), "setup: slot must be alive");
+
+        // Unpublish: the guarded new side carries NULL.
+        let mut rec = RecordingSink::new();
+        let mut dw2 = DocWriter::new(engine.docstore_arc());
+        let mut batch2 = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: false,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(old_past) },
+                Op::Remove { field: "publishedAt".into(), value: serde_json::Value::Null },
+            ],
+        }];
+        apply_ops_batch(&mut rec, &meta, &mut batch2, Some(&engine), Some(&mut dw2));
+        dw2.flush();
+
+        // EVERY old bit, not just the ones the new value happens to miss: a null
+        // remove clears nothing at all (`value_to_sort_u32` yields None), so the
+        // old-side remove is the whole cleanup here — and unlike a reschedule,
+        // no later Set ever arrives to heal it.
+        let old_bits: Vec<usize> = (0..32)
+            .filter(|b| (old_past as u32 >> b) & 1 == 1)
+            .collect();
+        assert!(!old_bits.is_empty(), "sanity: the old timestamp has set bits");
+        for bit in old_bits {
+            assert!(
+                rec.sort_clears
+                    .iter()
+                    .any(|(f, b, s)| f == "publishedAt" && *b == bit && *s == slot),
+                "bit {bit} of the old publishedAt survived an unpublish — nothing \
+                 later heals this. clears: {:?}",
+                rec.sort_clears
+            );
+        }
+    }
+
     #[test]
     fn test_alive_slot_reschedule_clears_old_sort_bits() {
         let dir = tempfile::TempDir::new().unwrap();

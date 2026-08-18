@@ -36,6 +36,7 @@ CREATE OR REPLACE FUNCTION cleanup_bitdex_ops() RETURNS trigger AS $$
 DECLARE
     _consumed_below BIGINT;
     _oldest BIGINT;
+    _oldest_at TIMESTAMPTZ;
     _floor BIGINT;
     _chunk BIGINT := 5000;
 BEGIN
@@ -44,8 +45,26 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    SELECT id INTO _oldest FROM "BitdexOps" ORDER BY id LIMIT 1;
+    SELECT id, created_at INTO _oldest, _oldest_at
+    FROM "BitdexOps" ORDER BY id LIMIT 1;
     IF _oldest IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Two O(1) early exits before the probe. MEASURED, not assumed: an
+    -- EXPLAIN (ANALYZE, BUFFERS) of the probe against prod in the caught-up
+    -- state scanned the full 5,000-row window and removed every row by filter —
+    -- 10.6ms, 989 buffers, to delete nothing. At several firings a second that
+    -- is not noise.
+    --
+    --   1. the oldest row is itself still inside the window ⇒ nothing has
+    --      expired yet (the caught-up steady state);
+    --   2. nothing below the replicas' cursor ⇒ nothing is deletable even if it
+    --      has expired (a stalled or restarted replica).
+    IF _oldest_at >= now() - interval '15 minutes' THEN
+        RETURN NEW;
+    END IF;
+    IF _consumed_below <= _oldest THEN
         RETURN NEW;
     END IF;
 

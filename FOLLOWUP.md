@@ -1,5 +1,35 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## Four copies of the "store a schedule-carrying Remove as a Set" rule (2026-08-18)
+
+A `Remove` of the deferred-alive source field carries the publish time as its value, so where a
+future schedule has been established the doc write stores it as a **Set** — otherwise activation
+replays a doc with no `publishedAt` and the slot activates as a draft that never publishes.
+
+That rule now appears at four sites in `src/ops_processor.rs`, and the guard is spelled three
+different ways:
+
+| site | guard |
+|---|---|
+| deferred branch (`apply_ops_batch`) | `future_sched.is_some() && *field == da_field_name` |
+| drained-map re-arm branch | `*field == da_field_name` — correct only because the enclosing `else if let Some(arm_at)` already proved a future schedule |
+| insert deferral gate | match guard on `Op::Remove` — correct only because the enclosing `if let Some(da_secs)` already proved it |
+| `apply_fanout_to_deferred_slots` | `future_sched.is_some() && field == da_field` |
+
+All four are correct as written (each enclosing branch was traced under review). The hazard is the
+**fifth**: two of the four are correct only positionally, so someone adding a branch by copying the
+nearest neighbour has a coin flip on whether they copy one that carries its own guard.
+
+Fix when convenient: extract `fn write_ops_to_doc(dw, slot, ops, schedule_field: Option<&str>)`
+where `Some(f)` means "store a remove of `f` as a set", making the invariant explicit rather than
+positional. Also removes four `da_field_name` `.to_string()` allocations, one on the insert path.
+
+Stronger variant worth considering at the same time: write the already-resolved schedule once after
+the loop (`dw.write_set(slot, da_field, json!(resolved))`) instead of rewriting every Remove on the
+field. That makes the stored schedule independent of op order entirely, rather than relying on the
+dedup ordering guarantee reaching this far.
+
+
 ## The 2026-07-03 activation safety net is inert in prod (found 2026-08-18)
 
 `recompute_computed_sorts_for_slot` (`src/ops_processor.rs:1416`) carries the safety net added on
