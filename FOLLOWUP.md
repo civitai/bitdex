@@ -1,5 +1,31 @@
 # FOLLOWUP — non-urgent issues & idle-time work
 
+## The 2026-07-03 activation safety net is inert in prod (found 2026-08-18)
+
+`recompute_computed_sorts_for_slot` (`src/ops_processor.rs:1416`) carries the safety net added on
+2026-07-03 for the ~49.7k-slot lost-activation class: whenever a recompute touches a slot whose
+stored `publishedAt` is past, it writes the `publishedAt` source sort layer and flips the
+`isPublished` shadow true, so live-but-unflipped slots self-correct on their next source-field op.
+
+That function returns at its first line when `meta.computed_deps` is empty (`:1425`), and
+`computed_deps` is built ONLY from sort fields carrying a `computed:` block (`:504-520`).
+**PR-M5 made `sortAt` ingested and deleted the last `computed:` block** from
+`deploy/configs/civitai-index.yaml`. So in prod the map is empty, the function returns immediately,
+and the safety net has not run since that deploy. Nothing announced it: the heal simply stopped.
+
+Found while testing the alive-slot path of PR #339 — the net still fires under the *test* config
+(which does declare a computed `sortAt`), which is why it showed up at all.
+
+Two things to decide:
+- Is the heal still wanted? If yes it needs to live somewhere that does not depend on a computed
+  sort field existing — it is a deferred-alive concern, not a computed-sort concern.
+- If it is not wanted, delete it, because right now the comment block describes a guarantee the
+  binary does not provide, and the next person to read it will believe it.
+
+Worth checking the same way: any other behaviour parked inside `recompute_computed_sorts_for_slot`
+past that early return.
+
+
 ## Scheduled-publish effort — residuals & follow-ups (2026-07-17)
 
 Filed during the scheduled-publish / ingested-`sortAt` wrap-up. All non-blocking; the effort's core
