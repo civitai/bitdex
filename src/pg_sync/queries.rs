@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS bitdex_cursors (
 -- unobservable after the fact: by the time a bad document is noticed, the ops
 -- that produced it are gone and the mechanism can only be inferred from
 -- document state. The floor keeps a bounded window of consumed ops readable.
--- At the measured ~117 rows/s that is ~840k rows resident for 2h.
+-- At the measured ~117 rows/s that is ~105k rows resident for 15 minutes.
 --
 -- Deliberately NO index on created_at. This trigger fires on every cursor
 -- report and the table takes ~117 inserts/s, so neither the extra write
@@ -224,7 +224,7 @@ BEGIN
     DELETE FROM "BitdexOps"
     WHERE id >= _oldest
       AND id < LEAST(_consumed_below, _oldest + _chunk)
-      AND created_at < now() - interval '2 hours';
+      AND created_at < now() - interval '15 minutes';
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

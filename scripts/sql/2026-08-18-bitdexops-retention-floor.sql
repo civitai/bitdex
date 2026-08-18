@@ -3,7 +3,7 @@
 -- Why: cleanup_bitdex_ops() deletes every op the moment all replicas have
 -- acked it, which in prod is ~48 seconds. Any write-path defect therefore has
 -- to be diagnosed from resulting document state rather than from the ops that
--- produced it. This keeps a bounded 2h window of consumed ops readable.
+-- produced it. This keeps a bounded 15-minute window of consumed ops readable.
 --
 -- NO new index. The table takes ~117 inserts/s and this trigger fires on every
 -- cursor report, so neither extra write amplification nor an unbounded scan is
@@ -17,7 +17,7 @@
 -- created_at predicate would, once the floor has caught up, walk every retained
 -- row looking for matches it will not find.
 --
--- Cost: ~117 rows/s => ~840k rows resident instead of a few thousand. That is
+-- Cost: ~117 rows/s => ~105k rows resident instead of a few thousand. That is
 -- the whole price of the change — a larger live table for autovacuum to keep
 -- up with, and no new index to maintain on the insert path.
 --
@@ -42,13 +42,13 @@ BEGIN
     DELETE FROM "BitdexOps"
     WHERE id >= _oldest
       AND id < LEAST(_consumed_below, _oldest + _chunk)
-      AND created_at < now() - interval '2 hours';
+      AND created_at < now() - interval '15 minutes';
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- Verify, a few minutes apart (expect the spread to grow towards 2h and the
--- count towards ~840k, then hold):
+-- Verify, a few minutes apart (expect the spread to grow towards 15 minutes and the
+-- count towards ~105k, then hold):
 --   SELECT count(*), min(created_at), max(created_at) FROM "BitdexOps";
 --
 -- Rollback — restore the pre-floor body:
