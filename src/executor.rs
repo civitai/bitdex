@@ -815,10 +815,19 @@ impl<'a> QueryExecutor<'a> {
                 field: field.to_string(),
                 reason: "cannot convert to bitmap key for range filter".to_string(),
             })?;
-        // Range scan: hold the read lock for the duration via for_each_versioned
-        // to avoid the per-VB clone cost on potentially-millions of entries.
+        // Range scan via chunked iteration so the apply path's write lock
+        // can interleave between chunks. The previous for_each_versioned
+        // call held the read lock for the entire scan — at postId's 22.5 M
+        // entries that's ~2 s of lock-held, which blocks every queued
+        // writer (apply path + auto-promotion + the merge thread itself).
+        // Same lesson as the merge_dirty side-set: avoid long lock-holds
+        // in any direction on the FilterField bitmaps map.
+        //
+        // Chunk size 16 K matches save_snapshot's. Per-chunk hold time is
+        // ~1-2 ms at the per-entry predicate + bitmap-OR cost; writers
+        // queue at most one chunk before the next acquire.
         let mut result = RoaringBitmap::new();
-        filter_field.for_each_versioned(|key, vb| {
+        filter_field.for_each_versioned_chunked(16_384, |key, vb| {
             // Skip the null sentinel key — null is not a real value for range comparisons
             if key == crate::filter::NULL_BITMAP_KEY { return; }
             if predicate(key, target) {

@@ -360,6 +360,44 @@ impl FilterField {
             f(*k, vb);
         }
     }
+    /// Like `for_each_versioned` but releases the read lock between chunks
+    /// of `chunk_size` keys, letting any waiting writer make progress.
+    ///
+    /// Trade-off vs `for_each_versioned`: total wall-clock is similar (the
+    /// same number of HashMap lookups happen), but the maximum continuous
+    /// lock-hold drops from O(N entries) to O(chunk_size). For postId at
+    /// 22.5M values, that takes a write-blocker from ~2 s to a few ms per
+    /// chunk.
+    ///
+    /// Snapshot semantics differ subtly from `for_each_versioned`: each
+    /// chunk reads the *current* HashMap state, so an entry written
+    /// between chunks may be observed mid-iteration with its updated
+    /// state, while the same entry processed in an earlier chunk shows
+    /// its older state. Acceptable for save_snapshot — that path already
+    /// produces an "approximate" snapshot under the existing single-lock
+    /// design (writers can mutate diff layers via interior mutability
+    /// while the iteration runs).
+    ///
+    /// Per-key keys-snapshot itself runs under one brief read lock (~5–10 ms
+    /// for 22.5M entries — Vec<u64> copy of `r.keys()`).
+    pub fn for_each_versioned_chunked<F: FnMut(u64, &VersionedBitmap)>(
+        &self,
+        chunk_size: usize,
+        mut f: F,
+    ) {
+        let keys: Vec<u64> = {
+            let r = self.bitmaps.read();
+            r.keys().copied().collect()
+        };
+        for chunk in keys.chunks(chunk_size.max(1)) {
+            let r = self.bitmaps.read();
+            for &k in chunk {
+                if let Some(vb) = r.get(&k) {
+                    f(k, vb);
+                }
+            }
+        }
+    }
     /// Snapshot all (value, VersionedBitmap) pairs into an owned Vec under
     /// the read lock. The cloned VBs share inner `Arc<RoaringBitmap>`
     /// data with the originals (refcount bumps only) — cheap.
