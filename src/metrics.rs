@@ -2001,7 +2001,6 @@ mod bucket_resolution_tests {
         );
     }
 }
-
 #[cfg(test)]
 mod verifier_counter_zero_init_tests {
     use super::*;
@@ -2013,26 +2012,41 @@ mod verifier_counter_zero_init_tests {
         "bitdex_activation_verify_inconclusive_total",
     ];
 
+    /// Deliberately NOT the real index name. A fixture of "civitai" would let a
+    /// zero-init that hardcodes the label pass every test in this module, because
+    /// the fixture and the hardcode would be the same string.
+    const FIXTURE: &str = "zero-init-fixture";
+
+    fn bridge_counters(
+        b: &crate::concurrent_engine::MetricsBridge,
+    ) -> [&prometheus::IntCounterVec; 4] {
+        [
+            &b.activation_verify_checked_total,
+            &b.activation_verify_redriven_total,
+            &b.activation_verify_publish_lag_total,
+            &b.activation_verify_inconclusive_total,
+        ]
+    }
+
     /// The four post-activation verifier counters must publish a zero series as soon
     /// as a bridge exists, before anything increments them.
     ///
     /// Do not "simplify" this by dropping the zero-init in `engine_bridge` — the
     /// increment sites are all guarded by `if n > 0`, so without it a registered
-    /// IntCounterVec exposes NO series until its first event. `inconclusive_total`
-    /// is the rarest of the four, so the blind window after every deploy restart is
-    /// long, and an alert over an absent series renders "No data" — which looks
-    /// exactly like a healthy zero.
+    /// IntCounterVec exposes NO series until its first event, and an alert over an
+    /// absent series renders "No data", which looks exactly like a healthy zero.
     ///
-    /// Measured 2026-08-24 on v1.1.53: publish_lag_total and inconclusive_total
-    /// published no series at all until their first event.
+    /// Measured 2026-08-24 by running the reverted and fixed binaries side by side
+    /// against identical indexes: the two rarest counters were absent from the
+    /// reverted scrape and present at 0 in the fixed one.
     #[test]
     fn verifier_counters_publish_zero_before_any_event() {
         let m = Metrics::new();
-        let _bridge = m.engine_bridge("civitai".to_string());
+        let _bridge = m.engine_bridge(FIXTURE.to_string());
 
         let scrape = m.gather();
         for name in VERIFIER_COUNTERS {
-            let expected = format!("{name}{{index=\"civitai\"}} 0");
+            let expected = format!("{name}{{index=\"{FIXTURE}\"}} 0\n");
             assert!(
                 scrape.contains(&expected),
                 "{name} publishes no zero series after engine_bridge(); a scrape shows \
@@ -2057,30 +2071,40 @@ mod verifier_counter_zero_init_tests {
         }
     }
 
-    /// A reload must not reset a counter that has already recorded events.
+    /// A reload must not reset a counter that has already recorded events, and the
+    /// zero-init must write the SAME label the increments write.
     ///
     /// `engine_bridge` runs on the reload path as well as at boot, so the zero-init
-    /// above executes again against counters that may already hold real values.
-    /// prometheus returns the EXISTING child for a label set it has seen before, so
-    /// re-touching is a no-op — but that is a property of the metrics crate, not of
-    /// this file, and nothing else here would notice if it changed.
+    /// re-touches counters that may already hold real values. prometheus returns the
+    /// existing child for a label set it has seen before, so that is a no-op — but
+    /// that is a property of the metrics crate, not of this file.
+    ///
+    /// The increments deliberately go through the BRIDGE (`bridge.index_name`, the
+    /// same field `ops_processor` increments through) rather than through the
+    /// registry directly. That is what makes this fail if the zero-init and the
+    /// increment sites ever disagree about the label value — which would publish a
+    /// permanent 0 beside the real counter instead of on top of it.
     #[test]
     fn rebuilding_the_bridge_does_not_reset_a_live_counter() {
         let m = Metrics::new();
-        let _first = m.engine_bridge("civitai".to_string());
+        let first = m.engine_bridge(FIXTURE.to_string());
 
-        m.activation_verify_inconclusive_total
-            .with_label_values(&["civitai"])
-            .inc_by(7);
+        for counter in bridge_counters(&first) {
+            counter.with_label_values(&[&first.index_name]).inc_by(7);
+        }
 
-        let _reload = m.engine_bridge("civitai".to_string());
+        let _reload = m.engine_bridge(FIXTURE.to_string());
 
         let scrape = m.gather();
-        let expected = "bitdex_activation_verify_inconclusive_total{index=\"civitai\"} 7";
-        assert!(
-            scrape.contains(expected),
-            "rebuilding the bridge reset a live counter; a reload would silently discard \
-             the incident it was meant to report. Expected line: {expected}"
-        );
+        for name in VERIFIER_COUNTERS {
+            let expected = format!("{name}{{index=\"{FIXTURE}\"}} 7\n");
+            assert!(
+                scrape.contains(&expected),
+                "{name}: rebuilding the bridge lost a live count, or the zero-init and \
+                 the increment sites disagree about the label — either way a reload \
+                 silently discards the incident it was meant to report. Expected line: \
+                 {expected}"
+            );
+        }
     }
 }
