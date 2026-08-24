@@ -1794,6 +1794,12 @@ impl Metrics {
         // whose label set has never been touched publishes no series at all. An alert
         // over an absent series reads "No data" — indistinguishable from a healthy
         // zero, so the watch silently never engages. Touch them here to publish 0.
+        //
+        // A NEW verifier counter must be added to this list AND to VERIFIER_COUNTERS
+        // in the tests below. Wiring only its increment site reproduces the original
+        // bug with every test still green: the tests enumerate names by hand, and the
+        // registry cannot be used to derive them because `Registry::gather` drops
+        // families that have no children — which is precisely the state being tested.
         for counter in [
             &self.activation_verify_checked_total,
             &self.activation_verify_redriven_total,
@@ -2074,10 +2080,12 @@ mod verifier_counter_zero_init_tests {
     /// A reload must not reset a counter that has already recorded events, and the
     /// zero-init must write the SAME label the increments write.
     ///
-    /// `engine_bridge` runs on the reload path as well as at boot, so the zero-init
-    /// re-touches counters that may already hold real values. prometheus returns the
+    /// `engine_bridge` runs again whenever an index is (re)created as well as at
+    /// boot, so the zero-init re-touches counters that may already hold real values. prometheus returns the
     /// existing child for a label set it has seen before, so that is a no-op — but
-    /// that is a property of the metrics crate, not of this file.
+    /// that is a property of the metrics crate, not of this file, so what this really
+    /// guards is a prometheus version bump changing `get_metric_with_label_values`
+    /// semantics -- Cargo.toml pins a caret range, so that is reachable.
     ///
     /// The increments deliberately go through the BRIDGE (`bridge.index_name`, the
     /// same field `ops_processor` increments through) rather than through the
