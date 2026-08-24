@@ -1790,6 +1790,18 @@ impl Metrics {
     /// Single construction point for the boot path, the reload path, and tests —
     /// a bridge field added here is wired everywhere at once.
     pub fn engine_bridge(&self, index_name: String) -> crate::concurrent_engine::MetricsBridge {
+        // Every verifier increment site is guarded by `if n > 0`, and an IntCounterVec
+        // whose label set has never been touched publishes no series at all. An alert
+        // over an absent series reads "No data" — indistinguishable from a healthy
+        // zero, so the watch silently never engages. Touch them here to publish 0.
+        for counter in [
+            &self.activation_verify_checked_total,
+            &self.activation_verify_redriven_total,
+            &self.activation_verify_publish_lag_total,
+            &self.activation_verify_inconclusive_total,
+        ] {
+            counter.with_label_values(&[index_name.as_str()]);
+        }
         crate::concurrent_engine::MetricsBridge {
             lazy_load_duration: self.lazy_load_duration_seconds.clone(),
             compaction_total: self.compaction_total.clone(),
@@ -1986,6 +1998,58 @@ mod bucket_resolution_tests {
         assert!(
             low.len() >= 4,
             "expected >=4 bounds in 0<b<=10 (observed prod mean ~1.9), found {low:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod verifier_counter_zero_init_tests {
+    use super::*;
+
+    /// The four post-activation verifier counters must publish a zero series as soon
+    /// as a bridge exists, before anything increments them.
+    ///
+    /// Do not "simplify" this by dropping the zero-init in `engine_bridge` — the
+    /// increment sites are all guarded by `if n > 0`, so without it a registered
+    /// IntCounterVec exposes NO series until its first event. `inconclusive_total`
+    /// is the rarest of the four (prod ratio ~1 per 6000 checked), so the blind
+    /// window after every deploy restart is long, and an alert over an absent series
+    /// renders "No data" — which looks exactly like a healthy zero.
+    ///
+    /// Measured 2026-08-24 on v1.1.53: publish_lag_total and inconclusive_total
+    /// published no series at all until their first event.
+    #[test]
+    fn verifier_counters_publish_zero_before_any_event() {
+        let m = Metrics::new();
+        let _bridge = m.engine_bridge("civitai".to_string());
+
+        let scrape = m.gather();
+        for name in [
+            "bitdex_activation_verify_checked_total",
+            "bitdex_activation_verify_redriven_total",
+            "bitdex_activation_verify_publish_lag_total",
+            "bitdex_activation_verify_inconclusive_total",
+        ] {
+            let expected = format!("{name}{{index=\"civitai\"}} 0");
+            assert!(
+                scrape.contains(&expected),
+                "{name} publishes no zero series after engine_bridge(); a scrape shows \
+                 nothing and an alert over it reads \"No data\". Expected line: {expected}"
+            );
+        }
+    }
+
+    /// Guards the control for the test above: an untouched registry must NOT expose
+    /// these series. Without this, the assertion above would still pass if something
+    /// else started zero-initialising them, and it would stop testing `engine_bridge`.
+    #[test]
+    fn verifier_counters_are_absent_until_a_bridge_is_built() {
+        let m = Metrics::new();
+        let scrape = m.gather();
+        assert!(
+            !scrape.contains("bitdex_activation_verify_inconclusive_total{"),
+            "inconclusive_total already publishes a series with no bridge built — the \
+             zero-init test above no longer proves engine_bridge is what does it"
         );
     }
 }
