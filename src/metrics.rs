@@ -2006,15 +2006,22 @@ mod bucket_resolution_tests {
 mod verifier_counter_zero_init_tests {
     use super::*;
 
+    const VERIFIER_COUNTERS: [&str; 4] = [
+        "bitdex_activation_verify_checked_total",
+        "bitdex_activation_verify_redriven_total",
+        "bitdex_activation_verify_publish_lag_total",
+        "bitdex_activation_verify_inconclusive_total",
+    ];
+
     /// The four post-activation verifier counters must publish a zero series as soon
     /// as a bridge exists, before anything increments them.
     ///
     /// Do not "simplify" this by dropping the zero-init in `engine_bridge` — the
     /// increment sites are all guarded by `if n > 0`, so without it a registered
     /// IntCounterVec exposes NO series until its first event. `inconclusive_total`
-    /// is the rarest of the four (prod ratio ~1 per 6000 checked), so the blind
-    /// window after every deploy restart is long, and an alert over an absent series
-    /// renders "No data" — which looks exactly like a healthy zero.
+    /// is the rarest of the four, so the blind window after every deploy restart is
+    /// long, and an alert over an absent series renders "No data" — which looks
+    /// exactly like a healthy zero.
     ///
     /// Measured 2026-08-24 on v1.1.53: publish_lag_total and inconclusive_total
     /// published no series at all until their first event.
@@ -2024,12 +2031,7 @@ mod verifier_counter_zero_init_tests {
         let _bridge = m.engine_bridge("civitai".to_string());
 
         let scrape = m.gather();
-        for name in [
-            "bitdex_activation_verify_checked_total",
-            "bitdex_activation_verify_redriven_total",
-            "bitdex_activation_verify_publish_lag_total",
-            "bitdex_activation_verify_inconclusive_total",
-        ] {
+        for name in VERIFIER_COUNTERS {
             let expected = format!("{name}{{index=\"civitai\"}} 0");
             assert!(
                 scrape.contains(&expected),
@@ -2046,10 +2048,39 @@ mod verifier_counter_zero_init_tests {
     fn verifier_counters_are_absent_until_a_bridge_is_built() {
         let m = Metrics::new();
         let scrape = m.gather();
+        for name in VERIFIER_COUNTERS {
+            assert!(
+                !scrape.contains(&format!("{name}{{")),
+                "{name} already publishes a series with no bridge built; the zero-init \
+                 test above no longer proves engine_bridge is what does it"
+            );
+        }
+    }
+
+    /// A reload must not reset a counter that has already recorded events.
+    ///
+    /// `engine_bridge` runs on the reload path as well as at boot, so the zero-init
+    /// above executes again against counters that may already hold real values.
+    /// prometheus returns the EXISTING child for a label set it has seen before, so
+    /// re-touching is a no-op — but that is a property of the metrics crate, not of
+    /// this file, and nothing else here would notice if it changed.
+    #[test]
+    fn rebuilding_the_bridge_does_not_reset_a_live_counter() {
+        let m = Metrics::new();
+        let _first = m.engine_bridge("civitai".to_string());
+
+        m.activation_verify_inconclusive_total
+            .with_label_values(&["civitai"])
+            .inc_by(7);
+
+        let _reload = m.engine_bridge("civitai".to_string());
+
+        let scrape = m.gather();
+        let expected = "bitdex_activation_verify_inconclusive_total{index=\"civitai\"} 7";
         assert!(
-            !scrape.contains("bitdex_activation_verify_inconclusive_total{"),
-            "inconclusive_total already publishes a series with no bridge built — the \
-             zero-init test above no longer proves engine_bridge is what does it"
+            scrape.contains(expected),
+            "rebuilding the bridge reset a live counter; a reload would silently discard \
+             the incident it was meant to report. Expected line: {expected}"
         );
     }
 }
