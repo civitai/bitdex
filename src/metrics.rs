@@ -1790,6 +1790,24 @@ impl Metrics {
     /// Single construction point for the boot path, the reload path, and tests —
     /// a bridge field added here is wired everywhere at once.
     pub fn engine_bridge(&self, index_name: String) -> crate::concurrent_engine::MetricsBridge {
+        // Every verifier increment site is guarded by `if n > 0`, and an IntCounterVec
+        // whose label set has never been touched publishes no series at all. An alert
+        // over an absent series reads "No data" — indistinguishable from a healthy
+        // zero, so the watch silently never engages. Touch them here to publish 0.
+        //
+        // A NEW verifier counter must be added to this list AND to VERIFIER_COUNTERS
+        // in the tests below. Wiring only its increment site reproduces the original
+        // bug with every test still green: the tests enumerate names by hand, and the
+        // registry cannot be used to derive them because `Registry::gather` drops
+        // families that have no children — which is precisely the state being tested.
+        for counter in [
+            &self.activation_verify_checked_total,
+            &self.activation_verify_redriven_total,
+            &self.activation_verify_publish_lag_total,
+            &self.activation_verify_inconclusive_total,
+        ] {
+            counter.with_label_values(&[index_name.as_str()]);
+        }
         crate::concurrent_engine::MetricsBridge {
             lazy_load_duration: self.lazy_load_duration_seconds.clone(),
             compaction_total: self.compaction_total.clone(),
@@ -1987,5 +2005,114 @@ mod bucket_resolution_tests {
             low.len() >= 4,
             "expected >=4 bounds in 0<b<=10 (observed prod mean ~1.9), found {low:?}"
         );
+    }
+}
+#[cfg(test)]
+mod verifier_counter_zero_init_tests {
+    use super::*;
+
+    const VERIFIER_COUNTERS: [&str; 4] = [
+        "bitdex_activation_verify_checked_total",
+        "bitdex_activation_verify_redriven_total",
+        "bitdex_activation_verify_publish_lag_total",
+        "bitdex_activation_verify_inconclusive_total",
+    ];
+
+    /// Deliberately NOT the real index name. A fixture of "civitai" would let a
+    /// zero-init that hardcodes the label pass every test in this module, because
+    /// the fixture and the hardcode would be the same string.
+    const FIXTURE: &str = "zero-init-fixture";
+
+    fn bridge_counters(
+        b: &crate::concurrent_engine::MetricsBridge,
+    ) -> [&prometheus::IntCounterVec; 4] {
+        [
+            &b.activation_verify_checked_total,
+            &b.activation_verify_redriven_total,
+            &b.activation_verify_publish_lag_total,
+            &b.activation_verify_inconclusive_total,
+        ]
+    }
+
+    /// The four post-activation verifier counters must publish a zero series as soon
+    /// as a bridge exists, before anything increments them.
+    ///
+    /// Do not "simplify" this by dropping the zero-init in `engine_bridge` — the
+    /// increment sites are all guarded by `if n > 0`, so without it a registered
+    /// IntCounterVec exposes NO series until its first event, and an alert over an
+    /// absent series renders "No data", which looks exactly like a healthy zero.
+    ///
+    /// Measured 2026-08-24 by running the reverted and fixed binaries side by side
+    /// against identical indexes: the two rarest counters were absent from the
+    /// reverted scrape and present at 0 in the fixed one.
+    #[test]
+    fn verifier_counters_publish_zero_before_any_event() {
+        let m = Metrics::new();
+        let _bridge = m.engine_bridge(FIXTURE.to_string());
+
+        let scrape = m.gather();
+        for name in VERIFIER_COUNTERS {
+            let expected = format!("{name}{{index=\"{FIXTURE}\"}} 0\n");
+            assert!(
+                scrape.contains(&expected),
+                "{name} publishes no zero series after engine_bridge(); a scrape shows \
+                 nothing and an alert over it reads \"No data\". Expected line: {expected}"
+            );
+        }
+    }
+
+    /// Guards the control for the test above: an untouched registry must NOT expose
+    /// these series. Without this, the assertion above would still pass if something
+    /// else started zero-initialising them, and it would stop testing `engine_bridge`.
+    #[test]
+    fn verifier_counters_are_absent_until_a_bridge_is_built() {
+        let m = Metrics::new();
+        let scrape = m.gather();
+        for name in VERIFIER_COUNTERS {
+            assert!(
+                !scrape.contains(&format!("{name}{{")),
+                "{name} already publishes a series with no bridge built; the zero-init \
+                 test above no longer proves engine_bridge is what does it"
+            );
+        }
+    }
+
+    /// A reload must not reset a counter that has already recorded events, and the
+    /// zero-init must write the SAME label the increments write.
+    ///
+    /// `engine_bridge` runs again whenever an index is (re)created as well as at
+    /// boot, so the zero-init re-touches counters that may already hold real values. prometheus returns the
+    /// existing child for a label set it has seen before, so that is a no-op — but
+    /// that is a property of the metrics crate, not of this file, so what this really
+    /// guards is a prometheus version bump changing `get_metric_with_label_values`
+    /// semantics -- Cargo.toml pins a caret range, so that is reachable.
+    ///
+    /// The increments deliberately go through the BRIDGE (`bridge.index_name`, the
+    /// same field `ops_processor` increments through) rather than through the
+    /// registry directly. That is what makes this fail if the zero-init and the
+    /// increment sites ever disagree about the label value — which would publish a
+    /// permanent 0 beside the real counter instead of on top of it.
+    #[test]
+    fn rebuilding_the_bridge_does_not_reset_a_live_counter() {
+        let m = Metrics::new();
+        let first = m.engine_bridge(FIXTURE.to_string());
+
+        for counter in bridge_counters(&first) {
+            counter.with_label_values(&[&first.index_name]).inc_by(7);
+        }
+
+        let _reload = m.engine_bridge(FIXTURE.to_string());
+
+        let scrape = m.gather();
+        for name in VERIFIER_COUNTERS {
+            let expected = format!("{name}{{index=\"{FIXTURE}\"}} 7\n");
+            assert!(
+                scrape.contains(&expected),
+                "{name}: rebuilding the bridge lost a live count, or the zero-init and \
+                 the increment sites disagree about the label — either way a reload \
+                 silently discards the incident it was meant to report. Expected line: \
+                 {expected}"
+            );
+        }
     }
 }
